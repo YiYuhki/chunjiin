@@ -5,6 +5,8 @@
 //! 새 문서에 애초에 존재하지 않는다.
 
 pub mod audit;
+pub mod batch;
+pub mod config;
 pub mod detect;
 pub mod engine;
 pub mod error;
@@ -16,6 +18,7 @@ pub mod pdf;
 pub mod policy;
 pub mod report;
 pub mod server;
+pub mod watch;
 pub mod xml;
 pub mod zipsafe;
 

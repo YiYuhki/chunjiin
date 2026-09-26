@@ -45,7 +45,8 @@ fn namespace_allowed(ns: &str) -> bool {
 
 enum Kind {
     Xml,
-    Image(ImageKind),
+    /// 이미 재인코딩된 이미지 바이트
+    Image(Vec<u8>),
     Text,
 }
 
@@ -119,7 +120,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         }
         if let Some(k) = ImageKind::sniff(data) {
             match imaging::reencode(data, k, policy) {
-                Ok((_, out_kind)) => {
+                Ok((bytes, out_kind)) => {
                     let out = if out_kind != k {
                         replace_ext(&name, out_kind.extension())
                     } else {
@@ -128,7 +129,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                     if out != name {
                         renamed.insert(name.clone(), out.clone());
                     }
-                    keep.insert(name.clone(), (out, Kind::Image(k)));
+                    keep.insert(name.clone(), (out, Kind::Image(bytes)));
                 }
                 Err(e) => {
                     findings.add(
@@ -180,10 +181,16 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             if lower.ends_with(".txt") {
                 keep.insert(e.name.clone(), (e.name.clone(), Kind::Text));
             } else if let Some(k) = ImageKind::sniff(&e.data) {
-                keep.insert(
-                    e.name.clone(),
-                    (replace_ext(&e.name, k.extension()), Kind::Image(k)),
-                );
+                // 재인코딩 결과 형식(BMP → PNG 등)에 맞춰 확장자를 정한다
+                if let Ok((bytes, out_kind)) = imaging::reencode(&e.data, k, policy) {
+                    keep.insert(
+                        e.name.clone(),
+                        (
+                            replace_ext(&e.name, out_kind.extension()),
+                            Kind::Image(bytes),
+                        ),
+                    );
+                }
             }
         }
     }
@@ -245,13 +252,10 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     for (name, (out_name, kind)) in &keep {
         let data = &files[&name.to_ascii_lowercase()].data;
         let bytes = match kind {
-            Kind::Image(k) => match imaging::reencode(data, *k, policy) {
-                Ok((b, _)) => {
-                    findings.count("images_reencoded", 1);
-                    b
-                }
-                Err(_) => continue,
-            },
+            Kind::Image(bytes) => {
+                findings.count("images_reencoded", 1);
+                bytes.clone()
+            }
             Kind::Text => {
                 let text = String::from_utf8_lossy(data);
                 text.chars()

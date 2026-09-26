@@ -152,6 +152,7 @@ impl Engine {
         // 재검증은 구조 재조합만 수행한다(래스터화 결과를 다시 렌더링할 필요는 없음)
         let verifier = Engine::new(Policy {
             pdf_rasterize: false,
+            media_passthrough: true,
             ..self.policy.clone()
         });
         let mut f = Findings::default();

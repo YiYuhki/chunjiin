@@ -122,6 +122,8 @@ cdr scan 의심문서.docm
 
 | 옵션 | 설명 |
 |---|---|
+| `--config <FILE>` | 정책 파일(TOML). 명시한 명령행 옵션이 파일 값보다 우선 |
+| `-j, --jobs <N>` | 동시 처리 수(기본: CPU 수). 결과·보고서 순서는 입력 순서 유지 |
 | `--remove-links` | 허용 스킴(http/https/mailto)의 하이퍼링크까지 모두 제외 |
 | `--keep-metadata` | 작성자 등 메타데이터 유지 |
 | `--no-flatten` | PDF 주석/폼 외형을 평면화하지 않고 버림 |
@@ -135,6 +137,34 @@ cdr scan 의심문서.docm
 | `--quarantine-clean` | 정상 파일의 원본도 격리 보관 |
 
 종료 코드: `0` 모두 처리됨, `2` 차단된 파일 있음, `3` 감사 기록 실패(해당 결과물은 저장하지 않음), `1` 입력 오류
+
+### 정책 파일
+
+```bash
+cdr policy > cdr.toml          # 기본값과 설명이 들어간 정책 파일 생성
+cdr sanitize inbox/ -o clean/ --config cdr.toml
+```
+
+`[limits]`(크기·압축·XML·이미지·PDF 제한), `[links]`(허용 스킴, 링크 제거), `[content]`(메타데이터, 평면화, OLE 대체), `[pdf]`(이미지화·해상도·품질) 네 부분으로 구성됩니다.
+- 정책 누락을 막기 위해 **알 수 없는 키(오타)는 오류로 거부**합니다.
+- `file`, `javascript` 같은 위험 스킴은 허용 목록에 넣을 수 없습니다.
+- 정책은 기본값 → 정책 파일 → 명시한 명령행 옵션 순으로 적용됩니다.
+
+### 감시 폴더 모드 (망연계·메일 게이트웨이용)
+
+```bash
+cdr watch --inbox /data/수신 --outbox /data/송신 --blocked /data/차단 \
+          --quarantine /data/격리 --audit-log /var/log/cdr/audit.jsonl --config cdr.toml
+```
+
+수신 폴더에 들어온 문서를 자동으로 재조합해 송신 폴더로 넘깁니다. "들어온 문서는 반드시 CDR을 거쳐서만 나간다"는 흐름을 한 명령으로 구성합니다.
+- 크기와 수정 시각이 `--settle`초(기본 3) 동안 변하지 않은 파일만 처리합니다. 복사 중인 파일은 건드리지 않습니다.
+- 숨김 파일과 `.part`, `.tmp`, `.crdownload` 등 쓰는 중인 파일은 건너뜁니다.
+- 결과물은 숨김 임시 파일에 쓴 뒤 이름을 바꿉니다. 송신 측이 쓰는 도중의 파일을 가져가지 않습니다.
+- 하위 폴더 구조를 유지합니다. 차단된 문서는 결과물 대신 `<이름>.blocked.json` 보고서만 `--blocked`에 남깁니다.
+- 감사 기록과 결과물 쓰기가 **모두 성공했을 때만** 원본을 수신 폴더에서 지웁니다. 실패한 파일은 내용이 바뀌기 전까지 다시 시도하지 않습니다.
+- 수신 폴더와 송신·차단 폴더가 서로 포함 관계이면 시작을 거부합니다. 무한 재처리를 막기 위해서입니다.
+- Ctrl+C와 SIGTERM을 받으면 진행 중인 주기를 마치고 종료합니다. `--once`로 현재 파일만 처리하고 끝낼 수도 있습니다(cron용).
 
 ### 감사 로그와 격리 보관
 
@@ -163,7 +193,7 @@ cdr sanitize inbox/ -o clean/ --audit-log /var/log/cdr/audit.jsonl --quarantine 
 ### REST API 서버
 
 ```bash
-cdr serve --bind 0.0.0.0:8080 [--concurrency 4] [--timeout 120] [--max-size 100] \
+cdr serve --bind 0.0.0.0:8080 [--jobs 4] [--timeout 120] [--max-size 100] [--config cdr.toml] \
           [--audit-log audit.jsonl] [--quarantine quarantine/]
 ```
 
@@ -248,6 +278,9 @@ src/
 │   └── ppt.rs         PowerPoint 97-2003 (동작·링크 제자리 무력화)
 ├── server.rs          REST API (axum)
 ├── audit.rs           감사 로그(JSONL)·원본 격리 보관
+├── config.rs          정책 파일(TOML)
+├── batch.rs           순서 보존 병렬 처리·원자적 결과물 쓰기
+├── watch.rs           감시 폴더 모드
 ├── ooxml/
 │   ├── mod.rs         관계 그래프 탐색 → 파트 재구성 → 새 패키지 조립
 │   ├── rules.rs       관계 유형·콘텐츠 형식·네임스페이스 허용 목록

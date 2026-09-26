@@ -42,6 +42,11 @@ pub struct Policy {
     /// 레거시 PPT/XLS 의 임베디드 OLE 개체(와 PPT VBA 저장소)를 차단하지 않고
     /// 빈 개체로 대체한다. 미리보기 그림은 유지된다. (Office 에서의 동작은 문서에 따라 다를 수 있음)
     pub neutralize_embedded_ole: bool,
+
+    /// 재검증 단계 전용: 이미 재인코딩된 이미지를 다시 인코딩하지 않고 헤더(크기)만 검사한다.
+    /// 일반 사용에서는 false 여야 한다.
+    #[doc(hidden)]
+    pub media_passthrough: bool,
 }
 
 impl Default for Policy {
@@ -64,6 +69,7 @@ impl Default for Policy {
             raster_dpi: 150.0,
             raster_jpeg_quality: 85,
             neutralize_embedded_ole: false,
+            media_passthrough: false,
         }
     }
 }

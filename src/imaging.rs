@@ -83,6 +83,10 @@ pub fn decode(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<DynamicIm
 
 /// 이미지를 같은 형식으로 재인코딩한다. BMP 는 PNG 로 변환한다.
 pub fn reencode(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<(Vec<u8>, ImageKind)> {
+    if policy.media_passthrough {
+        check_header(data, kind, policy)?;
+        return Ok((data.to_vec(), kind));
+    }
     let img = decode(data, kind, policy)?;
     let (img, target) = match kind {
         ImageKind::Jpeg => (DynamicImage::ImageRgb8(img.to_rgb8()), ImageKind::Jpeg),
@@ -106,6 +110,10 @@ pub fn reencode(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<(Vec<u8
 /// 이미지를 원래 형식 그대로(BMP 포함) 재인코딩한다. 형식 정보가 문서 안에 따로
 /// 기록되는 레거시 문서(HWP 등)에서 사용한다.
 pub fn reencode_same(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<Vec<u8>> {
+    if policy.media_passthrough {
+        check_header(data, kind, policy)?;
+        return Ok(data.to_vec());
+    }
     if kind != ImageKind::Bmp {
         let (bytes, out) = reencode(data, kind, policy)?;
         if out == kind {
@@ -117,5 +125,14 @@ pub fn reencode_same(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<Ve
     match img.write_to(&mut out, kind.format()) {
         Ok(()) => Ok(out.into_inner()),
         Err(e) => blocked("reconstruct", format!("이미지 재인코딩 실패: {e}")),
+    }
+}
+
+/// 헤더만 읽어 크기 제한을 검사한다 (재검증 단계용)
+fn check_header(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<()> {
+    match ImageReader::with_format(Cursor::new(data), kind.format()).into_dimensions() {
+        Ok((w, h)) if (w as u64) * (h as u64) <= policy.max_image_pixels => Ok(()),
+        Ok((w, h)) => blocked("image-bomb", format!("이미지 크기 초과 ({w}x{h})")),
+        Err(e) => blocked("image", format!("이미지 헤더 해석 실패: {e}")),
     }
 }
