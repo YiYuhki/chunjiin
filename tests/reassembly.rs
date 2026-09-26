@@ -313,7 +313,19 @@ fn unsupported_inputs_are_blocked() {
             .status,
         Status::Blocked
     );
-    assert_eq!(e.process(b"just text", "a.txt").status, Status::Blocked);
+    // 텍스트여도 허용 확장자(txt/log/csv/tsv)가 아니면 차단 (스크립트 등)
+    assert_eq!(
+        e.process(b"@echo off\r\ndel *", "run.bat").status,
+        Status::Blocked
+    );
+    assert_eq!(
+        e.process(b"WScript.Echo 1", "a.vbs").status,
+        Status::Blocked
+    );
+    assert_eq!(
+        e.process(b"MZ\x90\x00 text-like", "a.txt").status,
+        Status::Blocked
+    );
     assert_eq!(
         e.process(b"%PDF-1.7\n garbage", "broken.pdf").status,
         Status::Blocked

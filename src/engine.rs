@@ -5,7 +5,7 @@ use crate::error::{CdrError, Result};
 use crate::imaging::{self, ImageKind};
 use crate::policy::Policy;
 use crate::report::{sha256_hex, CdrResult, Findings, Severity, Status};
-use crate::{archive, hwpx, legacy, ooxml, pdf};
+use crate::{archive, hwpx, legacy, ooxml, pdf, text};
 
 #[derive(Default)]
 pub struct Engine {
@@ -26,7 +26,7 @@ impl Engine {
 
     pub fn process(&self, data: &[u8], filename: &str) -> CdrResult {
         let mut findings = Findings::default();
-        let ftype = detect::detect(data);
+        let ftype = detect::detect_named(data, filename, self.policy.allow_text);
         let mut result = CdrResult {
             filename: filename.to_string(),
             detected_type: ftype.name().to_string(),
@@ -104,7 +104,13 @@ impl Engine {
             );
         }
 
-        result.output_filename = Some(output_name(filename, ftype));
+        result.output_filename = Some(match ftype {
+            // 텍스트는 원래 이름(허용된 확장자)을 그대로 쓴다
+            FileType::Text | FileType::Csv | FileType::Tsv => {
+                output_name(filename, FileType::Unknown) + "." + &detect::extension_of(filename)
+            }
+            _ => output_name(filename, ftype),
+        });
         result.output_sha256 = Some(sha256_hex(&output));
         result.output_size = output.len();
         result.output = Some(output);
@@ -152,11 +158,14 @@ impl Engine {
                 findings.count("images_reencoded", 1);
                 Ok(bytes)
             }
+            FileType::Text => text::reassemble(data, text::Kind::Text, findings),
+            FileType::Csv => text::reassemble(data, text::Kind::Delimited(','), findings),
+            FileType::Tsv => text::reassemble(data, text::Kind::Delimited('\t'), findings),
             FileType::Unknown => {
                 let reason = if data.starts_with(b"MZ") || data.starts_with(b"\x7fELF") {
                     "실행 파일은 허용되지 않음"
                 } else {
-                    "지원하지 않는 파일 형식 (오피스·한글·PDF·이미지·ZIP 만 지원)"
+                    "지원하지 않는 파일 형식 (오피스·한글·PDF·이미지·ZIP·텍스트 만 지원)"
                 };
                 Err(CdrError::Blocked {
                     category: "unsupported",
@@ -167,7 +176,11 @@ impl Engine {
     }
 
     fn verify(&self, output: &[u8], ftype: FileType) -> Option<String> {
-        let out_type = detect::detect(output);
+        // 텍스트는 내용만으로 판별되지 않으므로 같은 형식으로 다시 해석한다
+        let out_type = match ftype {
+            FileType::Text | FileType::Csv | FileType::Tsv => ftype,
+            _ => detect::detect(output),
+        };
         if out_type != ftype.output_type() {
             return Some(format!("재조합 결과 형식 불일치({})", out_type.name()));
         }

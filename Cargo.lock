@@ -291,6 +291,7 @@ dependencies = [
  "axum",
  "cfb",
  "clap",
+ "encoding_rs",
  "flate2",
  "hayro",
  "http-body-util",

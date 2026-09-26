@@ -46,6 +46,8 @@ pub struct Policy {
 
     /// 단독 이미지 파일(PNG/JPEG/GIF/BMP)을 픽셀 재인코딩으로 재조합한다 (false 면 차단)
     pub allow_images: bool,
+    /// 텍스트·CSV(txt, log, csv, tsv)를 재조합한다 (false 면 차단)
+    pub allow_text: bool,
     /// 일반 ZIP 압축 파일을 항목별로 재조합한다 (false 면 차단)
     pub allow_archives: bool,
     /// 압축 파일 안의 항목이 하나라도 차단되면 압축 파일 전체를 차단한다
@@ -79,6 +81,7 @@ impl Default for Policy {
             raster_jpeg_quality: 85,
             neutralize_embedded_ole: false,
             allow_images: true,
+            allow_text: true,
             allow_archives: true,
             strict_archives: false,
             media_passthrough: false,

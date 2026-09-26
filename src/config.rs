@@ -61,6 +61,7 @@ pub struct Content {
     pub flatten_pdf_annotations: Option<bool>,
     pub neutralize_embedded_ole: Option<bool>,
     pub allow_images: Option<bool>,
+    pub allow_text: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -148,6 +149,9 @@ impl PolicyFile {
         if let Some(v) = self.content.allow_images {
             p.allow_images = v;
         }
+        if let Some(v) = self.content.allow_text {
+            p.allow_text = v;
+        }
         if let Some(v) = self.archive.enabled {
             p.allow_archives = v;
         }
@@ -204,6 +208,7 @@ strip_metadata = {}             # 작성자 등 메타데이터 제거
 flatten_pdf_annotations = {}    # PDF 주석·폼 외형을 본문에 평면화하여 보존
 neutralize_embedded_ole = {}   # 레거시 PPT/XLS 임베디드 OLE 를 차단 대신 빈 개체로 대체
 allow_images = {}               # 단독 이미지(PNG/JPEG/GIF/BMP)를 픽셀 재인코딩으로 재조합
+allow_text = {}                 # 텍스트·CSV(txt/log/csv/tsv) 재조합(CSV 수식 주입 무력화)
 
 [pdf]
 rasterize = {}                 # 최고 보안 모드: 페이지를 이미지로 재구성
@@ -229,6 +234,7 @@ strict = {}                    # 항목이 하나라도 차단되면 압축 파�
         p.flatten_pdf_annotations,
         p.neutralize_embedded_ole,
         p.allow_images,
+        p.allow_text,
         p.pdf_rasterize,
         p.raster_dpi,
         p.raster_jpeg_quality,

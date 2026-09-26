@@ -26,6 +26,10 @@ pub enum FileType {
     Jpeg,
     Gif,
     Bmp,
+    /// 텍스트 (허용 확장자일 때만, 엔진이 확장자로 결정)
+    Text,
+    Csv,
+    Tsv,
     Unknown,
 }
 
@@ -47,6 +51,9 @@ impl FileType {
             FileType::Jpeg => "jpeg",
             FileType::Gif => "gif",
             FileType::Bmp => "bmp",
+            FileType::Text => "text",
+            FileType::Csv => "csv",
+            FileType::Tsv => "tsv",
             FileType::Unknown => "unknown",
         }
     }
@@ -99,6 +106,9 @@ impl FileType {
             FileType::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             FileType::Gif => &["gif"],
             FileType::Bmp => &["bmp", "dib"],
+            FileType::Text => &["txt", "log"],
+            FileType::Csv => &["csv"],
+            FileType::Tsv => &["tsv", "tab"],
             FileType::Unknown => &[],
         };
         list.contains(&ext)
@@ -110,6 +120,23 @@ pub fn extension_of(filename: &str) -> String {
     match base.rsplit_once('.') {
         Some((_, ext)) => ext.to_ascii_lowercase(),
         None => String::new(),
+    }
+}
+
+/// 내용으로 판별하고, 판별되지 않으면 허용된 텍스트 확장자인 경우에만 텍스트로 본다
+pub fn detect_named(data: &[u8], filename: &str, allow_text: bool) -> FileType {
+    match detect(data) {
+        FileType::Unknown
+            if allow_text && !data.starts_with(b"MZ") && !data.starts_with(b"\x7fELF") =>
+        {
+            match crate::text::kind_for_extension(&extension_of(filename)) {
+                Some(crate::text::Kind::Text) => FileType::Text,
+                Some(crate::text::Kind::Delimited('\t')) => FileType::Tsv,
+                Some(_) => FileType::Csv,
+                None => FileType::Unknown,
+            }
+        }
+        t => t,
     }
 }
 

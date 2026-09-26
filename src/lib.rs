@@ -19,6 +19,7 @@ pub mod pdf;
 pub mod policy;
 pub mod report;
 pub mod server;
+pub mod text;
 pub mod watch;
 pub mod xml;
 pub mod zipsafe;

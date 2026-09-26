@@ -163,3 +163,44 @@ fn standalone_images_are_reencoded() {
         Status::Blocked
     );
 }
+
+#[test]
+fn text_and_csv_files_are_reassembled() {
+    let e = Engine::default();
+    let r = e.process("제목\u{202E}fdp.exe\n본문\u{0000}".as_bytes(), "메모.txt");
+    // NUL 이 섞이면 이진 데이터로 보고 차단
+    assert_eq!(r.status, Status::Blocked);
+
+    let r = e.process("제목\u{202E}fdp.exe\n본문\n".as_bytes(), "메모.txt");
+    assert_eq!(r.status, Status::Sanitized, "{}", r.reason);
+    assert_eq!(r.output_filename.as_deref(), Some("메모.txt"));
+    assert_eq!(r.output.as_deref(), Some("제목fdp.exe\n본문\n".as_bytes()));
+
+    let r = e.process(b"a,b\n1,=cmd|' /C calc'!A0\n", "data.csv");
+    assert_eq!(r.status, Status::Sanitized);
+    assert!(r.findings.iter().any(|f| f.category == "formula-injection"));
+    assert_eq!(
+        r.output.as_deref(),
+        Some(&b"a,b\n1,'=cmd|' /C calc'!A0\n"[..])
+    );
+
+    // 압축 안의 텍스트도 같은 방식으로
+    let zip = make_zip(&[
+        ("readme.txt", b"hello"),
+        ("x.csv", b"=1+1"),
+        ("run.bat", b"del *"),
+    ]);
+    let r = e.process(&zip, "a.zip");
+    let parts = unzip(r.output.as_ref().unwrap());
+    assert_eq!(
+        names(r.output.as_ref().unwrap()),
+        vec!["readme.txt", "x.csv"]
+    );
+    assert_eq!(member(&parts, "x.csv"), b"'=1+1");
+
+    let off = Engine::new(Policy {
+        allow_text: false,
+        ..Policy::default()
+    });
+    assert_eq!(off.process(b"hello", "a.txt").status, Status::Blocked);
+}

@@ -261,6 +261,10 @@ fn fuzz_archive_and_images() {
     run("a.zip", 19, archive.clone(), mutate_zip);
     run("r.zip", 20, archive, mutate_bytes);
     run("a.png", 21, common::png_with_payload(), mutate_bytes);
+    let csv = "이름,값,비고\n홍길동,=1+2,\"a,\"\"b\"\"\"\n-,+82-10,@x\r\n"
+        .as_bytes()
+        .to_vec();
+    run("a.csv", 22, csv, mutate_bytes);
 }
 
 #[test]
