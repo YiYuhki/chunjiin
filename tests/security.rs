@@ -513,3 +513,85 @@ fn ppt_ole_storage_without_zlib_header_is_still_replaced() {
         .to_vec();
     assert!(!contains(&doc, b"payload"));
 }
+
+#[test]
+fn pdf_type1_font_program_is_validated() {
+    // /FontFile(Type 1) 도 검증 없이 옮기지 않는다
+    let pdf = page_with(
+        "<< /Font << /F1 5 0 R >> >>",
+        b"BT /F1 12 Tf (a) Tj ET",
+        vec![
+            b"<< /Type /Font /Subtype /Type1 /BaseFont /X /FontDescriptor 6 0 R >>".to_vec(),
+            b"<< /Type /FontDescriptor /FontName /X /Flags 4 /FontBBox [0 0 1 1] /ItalicAngle 0 /Ascent 1 /Descent 0 /CapHeight 1 /StemV 1 /FontFile 7 0 R /Evil 7 0 R >>".to_vec(),
+            pdf_stream("/Length1 20 /Length2 0 /Length3 0", b"%!PS-AdobeFont-1.0: X\nEXPLOIT-BYTES"),
+        ],
+    );
+    let r = Engine::default().process(&pdf, "a.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.category == "font" && f.description.contains("Type 1")),
+        "{:#?}",
+        r.findings
+    );
+    // 글꼴 기술자의 알 수 없는 키(/Evil)로도 옮겨지지 않는다
+    let s = all_streams(r.output.as_ref().unwrap());
+    assert!(!contains(&s, b"EXPLOIT-BYTES"));
+}
+
+#[test]
+fn csv_injection_bypasses_are_closed() {
+    let e = Engine::default();
+    let cases: &[(&str, &[u8])] = &[
+        // 첫 줄로 구분자를 세미콜론으로 속이고 쉼표 셀에 수식
+        ("a.csv", b"a;b;c\nx,=cmd|' /C calc'!A0\n"),
+        // 앞 공백, 전각 등호, 탭 구분
+        ("b.csv", " =1+1,x\n".as_bytes()),
+        ("c.csv", "\u{FF1D}HYPERLINK(\"http://x\")\n".as_bytes()),
+        ("d.csv", b"a\t=cmd|' /C calc'!A0\n"),
+    ];
+    for (name, data) in cases {
+        let r = e.process(data, name);
+        assert!(
+            r.findings.iter().any(|f| f.category == "formula-injection"),
+            "{name}: {:#?}",
+            r.findings
+        );
+    }
+}
+
+#[test]
+fn spoofing_characters_are_removed_from_output_names() {
+    let zip = make_zip(&[("docs/보고서\u{202E}fdp.exe.pdf", &clean_pdf())]);
+    let r = Engine::default().process(&zip, "첨부\u{202E}piz.zip");
+    assert!(!r.output_filename.as_ref().unwrap().contains('\u{202E}'));
+    let names: Vec<String> = unzip(r.output.as_ref().unwrap())
+        .into_iter()
+        .map(|(n, _)| n)
+        .collect();
+    assert!(names.iter().all(|n| !n.contains('\u{202E}')), "{names:?}");
+}
+
+#[test]
+fn archive_budget_counts_office_containers() {
+    // 작은 docx 여러 개의 해제량을 합해 한도를 넘기면 이후 항목은 들어가지 않는다
+    let docx = malicious_docm();
+    let unpacked: usize = unzip(&docx).iter().map(|(_, d)| d.len()).sum();
+    let names: Vec<String> = (0..6).map(|i| format!("d{i}.docx")).collect();
+    let files: Vec<(&str, &[u8])> = names
+        .iter()
+        .map(|n| (n.as_str(), docx.as_slice()))
+        .collect();
+    let small = Engine::new(Policy {
+        max_zip_total: (docx.len() * 6 + unpacked * 3) as u64,
+        ..Policy::default()
+    });
+    let r = small.process(&make_zip(&files), "a.zip");
+    let kept = r.output.as_ref().map_or(0, |o| unzip(o).len());
+    assert!(
+        r.status == Status::Blocked || kept < 6,
+        "{} {kept}",
+        r.reason
+    );
+}

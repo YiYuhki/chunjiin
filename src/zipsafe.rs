@@ -85,6 +85,8 @@ pub fn read_entries(data: &[u8], policy: &Policy, findings: &mut Findings) -> Re
         }
         entries.push(Entry { name, data: buf });
     }
+    // 압축 파일(ZIP) 안에 든 OOXML/HWPX 등의 해제량까지 합산할 수 있게 보고한다
+    findings.count("unpacked_bytes", total);
     Ok(entries)
 }
 

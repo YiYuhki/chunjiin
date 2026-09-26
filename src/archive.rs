@@ -2,7 +2,8 @@
 //! 새 압축 파일을 만든다. 차단된 항목은 빼고 보고한다(엄격 모드에서는 압축 파일 전체 차단).
 //!
 //! - 압축 안의 압축은 한 단계까지만 허용한다
-//! - 압축 해제 총량 제한은 중첩된 압축까지 합산한 예산으로 적용한다(중첩 Zip bomb 방어)
+//! - 압축 해제 총량 제한은 항목 안의 모든 압축 컨테이너(OOXML/HWPX/중첩 ZIP)까지 합산한
+//!   예산으로 적용한다(중첩 Zip bomb 방어)
 //! - 항목 이름은 경로 조작을 거부한 상대 경로만 받고, 결과물 이름은 재조합된 형식에 맞춘다
 
 use std::collections::HashSet;
@@ -27,7 +28,10 @@ pub fn reassemble(
     if !policy.allow_archives {
         return blocked("unsupported", "일반 압축 파일 처리가 비활성화되어 있음");
     }
-    let entries = zipsafe::read_entries(data, policy, findings)?;
+    let mut own = Findings::default();
+    let entries = zipsafe::read_entries(data, policy, &mut own)?;
+    findings.items.extend(own.items);
+    // 해제 총량: 이 압축 파일 + 항목 안의 모든 압축 컨테이너(OOXML/HWPX/중첩 ZIP)
     let mut expanded: u64 = entries.iter().map(|e| e.data.len() as u64).sum();
     let mut out: Vec<Entry> = Vec::new();
     let mut names = HashSet::new();
@@ -56,10 +60,13 @@ pub fn reassemble(
             depth + 1,
         );
         let r = child.process(&e.data, &e.name);
-        let nested = r.stats.get("archive_bytes").copied().unwrap_or(0);
+        let nested = r.stats.get("unpacked_bytes").copied().unwrap_or(0);
         expanded = expanded.saturating_add(nested);
         if expanded > policy.max_zip_total {
-            return blocked("zip-bomb", "중첩 압축까지 합한 해제 총량 초과");
+            return blocked(
+                "zip-bomb",
+                "항목 안의 압축 컨테이너까지 합한 해제 총량 초과",
+            );
         }
 
         if r.status == Status::Blocked {
@@ -87,7 +94,7 @@ pub fn reassemble(
             findings.add(&f.category, f.severity, f.description, at);
         }
         for (k, v) in r.stats {
-            if k != "archive_bytes" {
+            if k != "unpacked_bytes" {
                 findings.count(&k, v);
             }
         }
@@ -97,7 +104,7 @@ pub fn reassemble(
         let dir = e
             .name
             .rsplit_once('/')
-            .map(|(d, _)| format!("{d}/"))
+            .map(|(d, _)| format!("{}/", crate::text::strip_spoofing(d)))
             .unwrap_or_default();
         let name = unique_name(&mut names, &format!("{dir}{out_name}"));
         if name != e.name {
@@ -109,7 +116,7 @@ pub fn reassemble(
     if blocked_members > 0 {
         findings.count("archive_members_blocked", blocked_members);
     }
-    findings.count("archive_bytes", expanded);
+    findings.count("unpacked_bytes", expanded);
     if out.is_empty() {
         return blocked("archive", "압축 파일 안에 재조합할 수 있는 항목이 없음");
     }

@@ -242,6 +242,7 @@ fn finish_blocked(
 }
 
 pub fn output_name(filename: &str, ftype: FileType) -> String {
+    let filename = text::strip_spoofing(filename);
     let base = filename
         .rsplit(['/', '\\'])
         .next()

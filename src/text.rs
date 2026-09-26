@@ -90,9 +90,19 @@ fn encode(s: &str, enc: Encoding) -> Vec<u8> {
     }
 }
 
-/// 양방향 텍스트 재정의·격리 문자 (RLO 등)
-fn is_bidi_control(c: char) -> bool {
-    matches!(c, '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+/// 양방향 텍스트 재정의·격리·방향 표시 문자 (RLO, LRM, RLM, ALM 등)
+pub fn is_bidi_control(c: char) -> bool {
+    matches!(
+        c,
+        '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{200E}' | '\u{200F}' | '\u{061C}'
+    )
+}
+
+/// 파일 이름에서 표시 순서를 바꾸는 문자와 제어 문자를 뺀다 (`exe.pdf` 위장 방지)
+pub fn strip_spoofing(name: &str) -> String {
+    name.chars()
+        .filter(|&c| !is_bidi_control(c) && !c.is_control())
+        .collect()
 }
 
 fn clean(s: &str, findings: &mut Findings) -> String {
@@ -140,9 +150,8 @@ pub fn reassemble(data: &[u8], kind: Kind, findings: &mut Findings) -> Result<Ve
     let text = clean(&text, findings);
     let text = match kind {
         Kind::Text => text,
-        Kind::Delimited(d) => {
-            let d = if d == ',' { guess_delimiter(&text) } else { d };
-            let (out, neutralized) = neutralize_csv(&text, d);
+        Kind::Delimited(_) => {
+            let (out, neutralized) = neutralize_csv(&text);
             if neutralized > 0 {
                 findings.add(
                     "formula-injection",
@@ -156,16 +165,6 @@ pub fn reassemble(data: &[u8], kind: Kind, findings: &mut Findings) -> Result<Ve
     };
     findings.count("text_chars", text.chars().count() as u64);
     Ok(encode(&text, enc))
-}
-
-/// 유럽식 CSV(세미콜론 구분)를 첫 줄로 추정한다
-fn guess_delimiter(text: &str) -> char {
-    let first = text.lines().next().unwrap_or("");
-    if first.matches(';').count() > first.matches(',').count() {
-        ';'
-    } else {
-        ','
-    }
 }
 
 fn is_plain_number(s: &str) -> bool {
@@ -182,8 +181,22 @@ fn is_plain_number(s: &str) -> bool {
             .all(|(a, b)| !matches!(b, '+' | '-') || matches!(a, 'e' | 'E'))
 }
 
+/// 셀 경계로 보는 문자. 스프레드시트는 로케일·인코딩에 따라 쉼표, 세미콜론, 탭 중 무엇으로도
+/// 나눌 수 있으므로(첫 줄로 구분자를 추정하면 공격자가 정할 수 있다) 모두 경계로 보고 검사한다.
+const BOUNDARIES: [char; 3] = [',', ';', '\t'];
+
 fn dangerous_cell(value: &str) -> bool {
-    match value.chars().next() {
+    // 가져올 때 앞 공백을 지우는 프로그램이 있으므로 공백 뒤 첫 글자로 판정하고,
+    // 전각 기호(＝＋－＠)는 반각으로 본다
+    let value = value.trim_start_matches([' ', '\u{3000}', '\u{00A0}']);
+    let first = value.chars().next().map(|c| match c {
+        '\u{FF1D}' => '=',
+        '\u{FF0B}' => '+',
+        '\u{FF0D}' => '-',
+        '\u{FF20}' => '@',
+        c => c,
+    });
+    match first {
         Some('=') | Some('@') | Some('\t') | Some('\r') => true,
         // 부호만 있는 셀(보고서의 "-" 표시 등)은 수식이 될 수 없다
         Some('+') | Some('-') => {
@@ -195,7 +208,7 @@ fn dangerous_cell(value: &str) -> bool {
 }
 
 /// RFC 4180 방식으로 셀을 나눠 위험한 셀만 고친다. 따옴표·구분자·줄바꿈 구조는 그대로 둔다.
-fn neutralize_csv(text: &str, delim: char) -> (String, u64) {
+fn neutralize_csv(text: &str) -> (String, u64) {
     let mut out = String::with_capacity(text.len() + 16);
     let mut count = 0u64;
     let chars: Vec<char> = text.chars().collect();
@@ -235,7 +248,7 @@ fn neutralize_csv(text: &str, delim: char) -> (String, u64) {
             // 따옴표 없는 셀
             let end = chars[i..]
                 .iter()
-                .position(|&c| c == delim || c == '\n' || c == '\r')
+                .position(|&c| BOUNDARIES.contains(&c) || c == '\n' || c == '\r')
                 .map_or(chars.len(), |p| i + p);
             let value: String = chars[i..end].iter().collect();
             if dangerous_cell(&value) {
@@ -249,7 +262,7 @@ fn neutralize_csv(text: &str, delim: char) -> (String, u64) {
         let c = chars[i];
         out.push(c);
         // 구분자·줄바꿈(단독 CR 포함) 다음은 새 셀
-        if c == delim || c == '\n' || (c == '\r' && chars.get(i + 1) != Some(&'\n')) {
+        if BOUNDARIES.contains(&c) || c == '\n' || (c == '\r' && chars.get(i + 1) != Some(&'\n')) {
             at_cell_start = true;
         }
         i += 1;

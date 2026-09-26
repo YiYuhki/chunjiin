@@ -1,20 +1,32 @@
-//! 내장 TrueType 글꼴 프로그램 재조합.
+//! 내장 글꼴 프로그램 재조합·검증.
 //!
-//! 원본 sfnt 를 그대로 옮기지 않고 렌더링에 필요한 테이블만 골라 새 글꼴 파일을 만든다.
-//! - 힌팅 바이트코드(fpgm/prep/cvt 테이블과 글리프마다 붙은 명령어)는 TrueType 가상 머신에서
-//!   실행되는 코드로, 과거 글꼴 엔진 취약점 공격에 쓰였기 때문에 모두 제거한다.
-//! - glyf/loca 를 다시 쓰고(긴 형식), 체크섬을 새로 계산한다.
-//! - 결과물은 독립 파서(ttf-parser)로 모든 글리프 외곽선을 해석해 검증한다.
+//! TrueType(FontFile2, TrueType 외곽선 OpenType)과 CFF 기반 OpenType 은 원본 sfnt 를 옮기지 않고
+//! 렌더링에 필요한 테이블만 **다시 만들어** 새 글꼴 파일을 조립한다.
+//! - 힌팅 바이트코드(fpgm/prep/cvt 와 글리프별 명령어)는 TrueType 가상 머신에서 실행되는 코드라 제거
+//! - glyf 는 글리프마다 구조(플래그·좌표·복합 구성 요소)를 해석한 길이만 옮기고 loca 를 새로 씀
+//! - cmap 은 해석한 문자→글리프 대응으로 새로 만들고(형식 4/12), post 는 이름 없는 형식 3 으로,
+//!   나머지 테이블은 규격 길이로 잘라 옮긴다. name 등 그 밖의 테이블은 버린다
+//! - 결과물은 독립 파서(ttf-parser)로 모든 글리프 외곽선을 해석해 검증한다
+//!
+//! CFF(Type1C/CIDFontType0C)와 Type 1(FontFile) 글꼴은 모든 글리프 프로그램(charstring)을
+//! 독립 해석기로 끝까지 실행해 보고, 하나라도 비정상이면 거부한다.
 
 use std::collections::BTreeMap;
 
-/// 새 글꼴에 옮기는 테이블. 그 밖의 테이블(힌팅, 레이아웃, 서명, 비표준 테이블)은 버린다.
+/// TrueType 글꼴에 옮기는 테이블
 const KEEP_TABLES: &[&[u8; 4]] = &[
-    b"cmap", b"glyf", b"head", b"hhea", b"hmtx", b"loca", b"maxp", b"name", b"OS/2", b"post",
-    b"vhea", b"vmtx",
+    b"cmap", b"glyf", b"head", b"hhea", b"hmtx", b"loca", b"maxp", b"OS/2", b"post", b"vhea",
+    b"vmtx",
+];
+/// CFF 기반 OpenType 에 옮기는 테이블
+const KEEP_TABLES_CFF: &[&[u8; 4]] = &[
+    b"CFF ", b"cmap", b"head", b"hhea", b"hmtx", b"maxp", b"OS/2", b"post", b"vhea", b"vmtx",
 ];
 const REQUIRED_TABLES: &[&[u8; 4]] = &[b"glyf", b"head", b"hhea", b"hmtx", b"loca", b"maxp"];
+/// cmap 에서 옮길 수 있는 최대 대응 수
+const MAX_CMAP_MAPPINGS: usize = 1_200_000;
 
+#[derive(Debug)]
 pub struct Rebuilt {
     pub data: Vec<u8>,
     /// 제거한 테이블 태그
@@ -36,12 +48,13 @@ pub fn is_truetype(data: &[u8]) -> bool {
     matches!(data.get(..4), Some([0, 1, 0, 0]) | Some(b"true"))
 }
 
-pub fn rebuild_truetype(data: &[u8]) -> Result<Rebuilt, String> {
-    if !is_truetype(data) {
-        return Err("TrueType 형식이 아님".into());
-    }
+/// 태그 → 테이블 본문
+type Tables<'a> = BTreeMap<[u8; 4], &'a [u8]>;
+
+/// sfnt 테이블 목록을 읽어 허용 테이블만 돌려준다
+fn read_tables<'a>(data: &'a [u8], keep: &[&[u8; 4]]) -> Result<(Tables<'a>, Vec<String>), String> {
     let num_tables = u16_at(data, 4).ok_or("헤더 손상")? as usize;
-    let mut tables: BTreeMap<[u8; 4], &[u8]> = BTreeMap::new();
+    let mut tables = BTreeMap::new();
     let mut dropped = Vec::new();
     for i in 0..num_tables {
         let rec = 12 + i * 16;
@@ -52,7 +65,7 @@ pub fn rebuild_truetype(data: &[u8]) -> Result<Rebuilt, String> {
             .unwrap();
         let off = u32_at(data, rec + 8).ok_or("테이블 목록 손상")? as usize;
         let len = u32_at(data, rec + 12).ok_or("테이블 목록 손상")? as usize;
-        if !KEEP_TABLES.contains(&&tag) {
+        if !keep.contains(&&tag) {
             dropped.push(String::from_utf8_lossy(&tag).trim().to_string());
             continue;
         }
@@ -64,74 +77,320 @@ pub fn rebuild_truetype(data: &[u8]) -> Result<Rebuilt, String> {
             return Err("중복 테이블".into());
         }
     }
+    Ok((tables, dropped))
+}
+
+/// 글리프 공통 테이블(head, hhea, hmtx, maxp, OS/2, post, vhea/vmtx, cmap)을 규격대로 다시 만든다
+fn rebuild_common(
+    tables: &BTreeMap<[u8; 4], &[u8]>,
+    num_glyphs: usize,
+    maxp_v1: bool,
+    out: &mut BTreeMap<[u8; 4], Vec<u8>>,
+) -> Result<(), String> {
+    let head = tables.get(b"head").ok_or("head 없음")?;
+    let hhea = tables.get(b"hhea").ok_or("hhea 없음")?;
+    let hmtx = tables.get(b"hmtx").ok_or("hmtx 없음")?;
+    if head.len() < 54 || hhea.len() < 36 {
+        return Err("head/hhea 손상".into());
+    }
+    let mut new_head = head[..54].to_vec();
+    new_head[8..12].fill(0); // checkSumAdjustment: 전체 계산 후 기록
+    out.insert(*b"head", new_head);
+    out.insert(*b"hhea", hhea[..36].to_vec());
+    out.insert(
+        *b"hmtx",
+        metrics(hmtx, u16_at(hhea, 34).unwrap() as usize, num_glyphs).ok_or("hmtx 손상")?,
+    );
+
+    let maxp = tables.get(b"maxp").ok_or("maxp 없음")?;
+    let new_maxp = if maxp_v1 {
+        if maxp.len() < 32 || u32_at(maxp, 0) != Some(0x0001_0000) {
+            return Err("maxp 손상".into());
+        }
+        let mut m = maxp[..32].to_vec();
+        // 힌팅이 없으므로 명령어 관련 최대값을 0 으로
+        for at in [16usize, 18, 20, 22, 24, 26] {
+            m[at..at + 2].fill(0);
+        }
+        m
+    } else {
+        let mut m = 0x0000_5000u32.to_be_bytes().to_vec();
+        m.extend((num_glyphs as u16).to_be_bytes());
+        m
+    };
+    out.insert(*b"maxp", new_maxp);
+
+    if let Some(os2) = tables.get(b"OS/2") {
+        let need = match u16_at(os2, 0) {
+            Some(0) => 78,
+            Some(1) => 86,
+            Some(2..=4) => 96,
+            Some(5) => 100,
+            _ => usize::MAX,
+        };
+        if os2.len() >= need {
+            out.insert(*b"OS/2", os2[..need].to_vec());
+        }
+    }
+    // post: 글리프 이름 없는 형식 3 (기울기·밑줄·고정폭 값만 유지)
+    let mut post = 0x0003_0000u32.to_be_bytes().to_vec();
+    match tables.get(b"post").filter(|p| p.len() >= 32) {
+        Some(p) => post.extend(&p[4..16]),
+        None => post.extend([0u8; 12]),
+    }
+    post.extend([0u8; 16]);
+    out.insert(*b"post", post);
+
+    if let (Some(vhea), Some(vmtx)) = (tables.get(b"vhea"), tables.get(b"vmtx")) {
+        if vhea.len() >= 36 {
+            if let Some(v) = metrics(vmtx, u16_at(vhea, 34).unwrap() as usize, num_glyphs) {
+                out.insert(*b"vhea", vhea[..36].to_vec());
+                out.insert(*b"vmtx", v);
+            }
+        }
+    }
+    if let Some(cmap) = tables.get(b"cmap") {
+        out.insert(*b"cmap", rebuild_cmap(cmap, num_glyphs)?);
+    }
+    Ok(())
+}
+
+/// hmtx/vmtx: 긴 항목 n 개 + 짧은 항목 (글리프 수 - n) 개 길이로 자른다
+fn metrics(table: &[u8], long: usize, num_glyphs: usize) -> Option<Vec<u8>> {
+    if long == 0 || long > num_glyphs {
+        return None;
+    }
+    let len = long * 4 + (num_glyphs - long) * 2;
+    table.get(..len).map(<[u8]>::to_vec)
+}
+
+/// cmap 의 하위 테이블마다 문자→글리프 대응을 해석해 형식 4(BMP) 또는 12 로 새로 만든다.
+/// 이체자 선택(형식 14) 등 대응으로 표현되지 않는 하위 테이블은 버린다.
+fn rebuild_cmap(cmap: &[u8], num_glyphs: usize) -> Result<Vec<u8>, String> {
+    let table = ttf_parser::cmap::Table::parse(cmap).ok_or("cmap 해석 실패")?;
+    let mut subtables: BTreeMap<(u16, u16), Vec<(u32, u16)>> = BTreeMap::new();
+    let mut total = 0usize;
+    for sub in table.subtables {
+        if matches!(
+            sub.format,
+            ttf_parser::cmap::Format::UnicodeVariationSequences(_)
+        ) {
+            continue;
+        }
+        let key = (sub.platform_id as u16, sub.encoding_id);
+        if subtables.contains_key(&key) {
+            continue;
+        }
+        let mut codes = Vec::new();
+        let mut too_many = false;
+        sub.codepoints(|cp| {
+            if codes.len() < MAX_CMAP_MAPPINGS {
+                codes.push(cp);
+            } else {
+                too_many = true;
+            }
+        });
+        if too_many {
+            return Err("cmap 대응 수 초과".into());
+        }
+        let mut map: Vec<(u32, u16)> = codes
+            .into_iter()
+            .filter_map(|cp| sub.glyph_index(cp).map(|g| (cp, g.0)))
+            .filter(|&(_, g)| g != 0 && (g as usize) < num_glyphs)
+            .collect();
+        map.sort_unstable();
+        map.dedup_by_key(|m| m.0);
+        total += map.len();
+        if total > MAX_CMAP_MAPPINGS {
+            return Err("cmap 대응 수 초과".into());
+        }
+        subtables.insert(key, map);
+    }
+    let mut records = Vec::new();
+    let mut bodies: Vec<u8> = Vec::new();
+    let header = 4 + subtables.len() * 8;
+    for ((platform, encoding), map) in &subtables {
+        let body = if map.last().is_none_or(|m| m.0 <= 0xFFFF) {
+            cmap_format4(map)
+        } else {
+            // 연속 증가 구간(12)과 같은 글리프 구간(13) 중 작은 쪽
+            let (a, b) = (cmap_groups(map, 12), cmap_groups(map, 13));
+            if a.len() <= b.len() {
+                a
+            } else {
+                b
+            }
+        };
+        records.push((*platform, *encoding, (header + bodies.len()) as u32));
+        bodies.extend(body);
+    }
+    let mut out = 0u16.to_be_bytes().to_vec();
+    out.extend((records.len() as u16).to_be_bytes());
+    for (p, e, off) in records {
+        out.extend(p.to_be_bytes());
+        out.extend(e.to_be_bytes());
+        out.extend(off.to_be_bytes());
+    }
+    out.extend(bodies);
+    // 작은 cmap 을 거대하게 풀어내는 증폭 방지
+    if out.len() > cmap.len().saturating_mul(4).max(1 << 20) {
+        return Err("재조합한 cmap 이 비정상적으로 큼".into());
+    }
+    Ok(out)
+}
+
+fn cmap_format4(map: &[(u32, u16)]) -> Vec<u8> {
+    // 코드와 글리프가 함께 1씩 늘어나는 구간을 한 세그먼트로 (idDelta 사용)
+    let mut segs: Vec<(u16, u16, u16)> = Vec::new(); // (start, end, delta)
+    for &(cp, g) in map {
+        let cp = cp as u16;
+        let delta = g.wrapping_sub(cp);
+        match segs.last_mut() {
+            Some(last) if last.1.wrapping_add(1) == cp && last.2 == delta && cp != 0xFFFF => {
+                last.1 = cp
+            }
+            _ if cp == 0xFFFF => {}
+            _ => segs.push((cp, cp, delta)),
+        }
+    }
+    segs.push((0xFFFF, 0xFFFF, 1));
+    let n = segs.len() as u16;
+    let entry_selector = 15 - n.leading_zeros() as u16;
+    let search_range = 2 * (1u16 << entry_selector);
+    let len = 16 + segs.len() * 8;
+    let mut out = Vec::with_capacity(len);
+    out.extend(4u16.to_be_bytes());
+    out.extend((len as u16).to_be_bytes());
+    out.extend(0u16.to_be_bytes());
+    out.extend((n * 2).to_be_bytes());
+    out.extend(search_range.to_be_bytes());
+    out.extend(entry_selector.to_be_bytes());
+    out.extend((n * 2 - search_range).to_be_bytes());
+    segs.iter().for_each(|s| out.extend(s.1.to_be_bytes()));
+    out.extend(0u16.to_be_bytes());
+    segs.iter().for_each(|s| out.extend(s.0.to_be_bytes()));
+    segs.iter().for_each(|s| out.extend(s.2.to_be_bytes()));
+    segs.iter().for_each(|_| out.extend(0u16.to_be_bytes()));
+    out
+}
+
+/// 형식 12(코드·글리프가 함께 증가하는 구간) 또는 13(같은 글리프로 대응하는 구간)
+fn cmap_groups(map: &[(u32, u16)], format: u16) -> Vec<u8> {
+    let mut groups: Vec<(u32, u32, u32)> = Vec::new(); // (start, end, glyph)
+    for &(cp, g) in map {
+        let g = g as u32;
+        match groups.last_mut() {
+            Some(last)
+                if last.1 + 1 == cp
+                    && if format == 12 {
+                        last.2 + (cp - last.0) == g
+                    } else {
+                        last.2 == g
+                    } =>
+            {
+                last.1 = cp
+            }
+            _ => groups.push((cp, cp, g)),
+        }
+    }
+    let mut out = format.to_be_bytes().to_vec();
+    out.extend(0u16.to_be_bytes());
+    out.extend(((16 + groups.len() * 12) as u32).to_be_bytes());
+    out.extend(0u32.to_be_bytes());
+    out.extend((groups.len() as u32).to_be_bytes());
+    for (a, b, g) in groups {
+        out.extend(a.to_be_bytes());
+        out.extend(b.to_be_bytes());
+        out.extend(g.to_be_bytes());
+    }
+    out
+}
+
+pub fn rebuild_truetype(data: &[u8]) -> Result<Rebuilt, String> {
+    if !is_truetype(data) {
+        return Err("TrueType 형식이 아님".into());
+    }
+    let (tables, dropped) = read_tables(data, KEEP_TABLES)?;
     for t in REQUIRED_TABLES {
         if !tables.contains_key(*t) {
             return Err(format!("필수 테이블 없음: {}", String::from_utf8_lossy(*t)));
         }
     }
-
     let head = tables[b"head"];
     let maxp = tables[b"maxp"];
     if head.len() < 54 || maxp.len() < 6 {
         return Err("head/maxp 손상".into());
     }
     let num_glyphs = u16_at(maxp, 4).unwrap() as usize;
+    if num_glyphs == 0 {
+        return Err("글리프가 없음".into());
+    }
     let long_loca = u16_at(head, 50).unwrap() == 1;
     let loca = tables[b"loca"];
     let glyf = tables[b"glyf"];
-    let offset = |i: usize| -> Option<usize> {
-        if long_loca {
+
+    // loca 는 단조 증가해야 한다 (겹치는 구간으로 같은 데이터를 여러 번 부풀리는 공격 방지).
+    // 테이블 끝을 넘는 마지막 오프셋은 끝으로 맞춘다.
+    let mut offsets = Vec::with_capacity(num_glyphs + 1);
+    for i in 0..=num_glyphs {
+        let o = if long_loca {
             u32_at(loca, i * 4).map(|v| v as usize)
         } else {
             u16_at(loca, i * 2).map(|v| v as usize * 2)
         }
-    };
+        .ok_or("loca 손상")?;
+        if offsets.last().is_some_and(|&prev| o < prev) {
+            return Err(format!("loca 가 단조 증가하지 않음 (글리프 {i})"));
+        }
+        offsets.push(o);
+    }
+    let offsets: Vec<usize> = offsets.into_iter().map(|o| o.min(glyf.len())).collect();
 
     let mut new_glyf = Vec::with_capacity(glyf.len());
     let mut new_loca = Vec::with_capacity((num_glyphs + 1) * 4);
+    let mut components: Vec<Vec<u16>> = vec![Vec::new(); num_glyphs];
+    let mut has_outline = vec![false; num_glyphs];
     let mut stripped = 0;
     for gid in 0..num_glyphs {
-        let (start, end) = match (offset(gid), offset(gid + 1)) {
-            (Some(s), Some(e)) if s <= e && e <= glyf.len() => (s, e),
-            // 일부 글꼴은 마지막 오프셋이 테이블 끝을 약간 넘는다: 빈 글리프로 처리
-            (Some(s), Some(_)) if s >= glyf.len() => (0, 0),
-            _ => return Err(format!("loca 손상 (글리프 {gid})")),
-        };
         new_loca.extend((new_glyf.len() as u32).to_be_bytes());
-        let (g, had_code) = strip_glyph(&glyf[start..end], num_glyphs)
+        let parsed = strip_glyph(&glyf[offsets[gid]..offsets[gid + 1]], num_glyphs)
             .ok_or_else(|| format!("글리프 {gid} 구조 오류"))?;
-        stripped += had_code as usize;
-        new_glyf.extend(g);
+        stripped += parsed.had_code as usize;
+        has_outline[gid] = parsed.has_outline;
+        components[gid] = parsed.components;
+        new_glyf.extend(parsed.data);
         while new_glyf.len() % 4 != 0 {
             new_glyf.push(0);
         }
     }
     new_loca.extend((new_glyf.len() as u32).to_be_bytes());
-
-    let mut new_head = head[..54].to_vec();
-    new_head[8..12].fill(0); // checkSumAdjustment: 전체 계산 후 기록
-    new_head[50..52].copy_from_slice(&1u16.to_be_bytes()); // 긴 loca
-    let mut new_maxp = maxp.to_vec();
-    if u32_at(&new_maxp, 0) == Some(0x0001_0000) && new_maxp.len() >= 32 {
-        // 힌팅이 없으므로 명령어 관련 최대값을 0 으로
-        for at in [18usize, 20, 22, 26] {
-            new_maxp[at..at + 2].fill(0);
+    check_components(&components)?;
+    // 복합 글리프는 구성 요소 중 외곽선이 있는 것이 있을 때만 외곽선이 있어야 한다
+    // (예: 공백으로만 된 줄바꿈 없는 공백). 순환이 없음을 확인했으므로 반복해서 전파한다.
+    let simple_outline = has_outline.clone();
+    let mut has_outline: Vec<bool> = (0..num_glyphs)
+        .map(|g| components[g].is_empty() && simple_outline[g])
+        .collect();
+    for _ in 0..=16 {
+        let mut changed = false;
+        for g in 0..num_glyphs {
+            if !has_outline[g] && components[g].iter().any(|&c| has_outline[c as usize]) {
+                has_outline[g] = true;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
         }
     }
 
-    let mut out_tables: BTreeMap<[u8; 4], Vec<u8>> = BTreeMap::new();
-    for (tag, body) in &tables {
-        let body = match tag {
-            b"glyf" => std::mem::take(&mut new_glyf),
-            b"loca" => std::mem::take(&mut new_loca),
-            b"head" => new_head.clone(),
-            b"maxp" => new_maxp.clone(),
-            _ => body.to_vec(),
-        };
-        out_tables.insert(*tag, body);
-    }
-    let data = write_sfnt(&out_tables);
-    validate(&data, num_glyphs)?;
+    let mut out: BTreeMap<[u8; 4], Vec<u8>> = BTreeMap::new();
+    rebuild_common(&tables, num_glyphs, true, &mut out)?;
+    out.get_mut(b"head").unwrap()[50..52].copy_from_slice(&1u16.to_be_bytes()); // 긴 loca
+    out.insert(*b"glyf", new_glyf);
+    out.insert(*b"loca", new_loca);
+    let data = write_sfnt(&out, 0x0001_0000);
+    validate(&data, &has_outline)?;
     Ok(Rebuilt {
         data,
         dropped_tables: dropped,
@@ -139,21 +398,86 @@ pub fn rebuild_truetype(data: &[u8]) -> Result<Rebuilt, String> {
     })
 }
 
-/// 글리프 하나에서 명령어를 제거한다. (새 글리프, 명령어가 있었는지)
-fn strip_glyph(g: &[u8], num_glyphs: usize) -> Option<(Vec<u8>, bool)> {
+struct Glyph {
+    data: Vec<u8>,
+    had_code: bool,
+    /// 외곽선이 있어야 하는 글리프 (윤곽선 1개 이상 또는 복합)
+    has_outline: bool,
+    components: Vec<u16>,
+}
+
+/// 글리프 하나를 구조대로 해석해 명령어를 뺀 새 글리프를 만든다. 해석한 길이 뒤의 바이트는 버린다.
+fn strip_glyph(g: &[u8], num_glyphs: usize) -> Option<Glyph> {
     if g.is_empty() {
-        return Some((Vec::new(), false));
+        return Some(Glyph {
+            data: Vec::new(),
+            had_code: false,
+            has_outline: false,
+            components: Vec::new(),
+        });
     }
     let contours = i16::from_be_bytes(g.get(0..2)?.try_into().ok()?);
     if contours >= 0 {
         let n = contours as usize;
         let ilen_at = 10 + n * 2;
         let ilen = u16_at(g, ilen_at)? as usize;
-        let rest = g.get(ilen_at + 2 + ilen..)?;
-        let mut out = g[..ilen_at].to_vec();
-        out.extend([0, 0]);
-        out.extend(rest);
-        return Some((out, ilen > 0));
+        let points = if n == 0 {
+            0
+        } else {
+            let mut prev: Option<u16> = None;
+            for i in 0..n {
+                let e = u16_at(g, 10 + i * 2)?;
+                if prev.is_some_and(|p| e <= p) {
+                    return None;
+                }
+                prev = Some(e);
+            }
+            prev? as usize + 1
+        };
+        // 플래그(반복 포함)와 좌표 길이를 계산해 정확히 그만큼만 옮긴다
+        let mut p = ilen_at + 2 + ilen;
+        let flags_at = p;
+        let (mut xs, mut ys, mut count) = (0usize, 0usize, 0usize);
+        while count < points {
+            let f = *g.get(p)?;
+            p += 1;
+            let repeat = if f & 0x08 != 0 {
+                p += 1;
+                *g.get(p - 1)? as usize
+            } else {
+                0
+            };
+            let k = repeat + 1;
+            if count + k > points {
+                return None;
+            }
+            count += k;
+            xs += k * if f & 0x02 != 0 {
+                1
+            } else if f & 0x10 != 0 {
+                0
+            } else {
+                2
+            };
+            ys += k * if f & 0x04 != 0 {
+                1
+            } else if f & 0x20 != 0 {
+                0
+            } else {
+                2
+            };
+        }
+        let end = p + xs + ys;
+        let body = g.get(flags_at..end)?;
+        let mut data = g[..ilen_at].to_vec();
+        data.extend([0, 0]);
+        data.extend(body);
+        return Some(Glyph {
+            data,
+            had_code: ilen > 0,
+            has_outline: n > 0,
+            components: Vec::new(),
+        });
     }
     // 복합 글리프: 구성 요소를 순회하며 WE_HAVE_INSTRUCTIONS 를 끄고 뒤의 명령어를 버린다
     const ARG_WORDS: u16 = 0x0001;
@@ -162,15 +486,17 @@ fn strip_glyph(g: &[u8], num_glyphs: usize) -> Option<(Vec<u8>, bool)> {
     const XY_SCALE: u16 = 0x0040;
     const TWO_BY_TWO: u16 = 0x0080;
     const INSTRUCTIONS: u16 = 0x0100;
-    let mut out = g.get(..10)?.to_vec();
+    let mut data = g.get(..10)?.to_vec();
     let mut p = 10;
     let mut had = false;
-    for _ in 0..num_glyphs.max(1) {
+    let mut components = Vec::new();
+    for _ in 0..num_glyphs.clamp(1, 4096) {
         let flags = u16_at(g, p)?;
-        let glyph = u16_at(g, p + 2)? as usize;
-        if glyph >= num_glyphs {
+        let glyph = u16_at(g, p + 2)?;
+        if glyph as usize >= num_glyphs {
             return None;
         }
+        components.push(glyph);
         let mut len = 4 + if flags & ARG_WORDS != 0 { 4 } else { 2 };
         len += if flags & SCALE != 0 {
             2
@@ -183,14 +509,60 @@ fn strip_glyph(g: &[u8], num_glyphs: usize) -> Option<(Vec<u8>, bool)> {
         };
         let comp = g.get(p..p + len)?;
         had |= flags & INSTRUCTIONS != 0;
-        out.extend((flags & !INSTRUCTIONS).to_be_bytes());
-        out.extend(&comp[2..]);
+        data.extend((flags & !INSTRUCTIONS).to_be_bytes());
+        data.extend(&comp[2..]);
         p += len;
         if flags & MORE == 0 {
-            return Some((out, had));
+            return Some(Glyph {
+                data,
+                had_code: had,
+                has_outline: true,
+                components,
+            });
         }
     }
     None
+}
+
+/// 복합 글리프 참조에 순환이 없고 중첩이 깊지 않은지 확인한다
+fn check_components(components: &[Vec<u16>]) -> Result<(), String> {
+    const MAX_DEPTH: usize = 16;
+    // 0: 미방문, 1: 방문 중, 2: 완료(깊이 확인됨)
+    let mut state = vec![0u8; components.len()];
+    let mut depth = vec![0usize; components.len()];
+    fn visit(
+        g: usize,
+        components: &[Vec<u16>],
+        state: &mut [u8],
+        depth: &mut [usize],
+        level: usize,
+    ) -> Result<usize, String> {
+        if level > MAX_DEPTH {
+            return Err("복합 글리프 중첩이 너무 깊음".into());
+        }
+        match state[g] {
+            1 => return Err(format!("복합 글리프 순환 참조 (글리프 {g})")),
+            2 => return Ok(depth[g]),
+            _ => {}
+        }
+        state[g] = 1;
+        let mut d = 0;
+        for &c in &components[g] {
+            d = d.max(1 + visit(c as usize, components, state, depth, level + 1)?);
+        }
+        state[g] = 2;
+        depth[g] = d;
+        if d > MAX_DEPTH {
+            return Err("복합 글리프 중첩이 너무 깊음".into());
+        }
+        Ok(d)
+    }
+    for g in 0..components.len() {
+        if !components[g].is_empty() {
+            visit(g, components, &mut state, &mut depth, 0)?;
+        }
+    }
+    Ok(())
 }
 
 fn checksum(data: &[u8]) -> u32 {
@@ -203,12 +575,12 @@ fn checksum(data: &[u8]) -> u32 {
     sum
 }
 
-fn write_sfnt(tables: &BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
+fn write_sfnt(tables: &BTreeMap<[u8; 4], Vec<u8>>, version: u32) -> Vec<u8> {
     let n = tables.len() as u16;
     let entry_selector = 15 - n.leading_zeros() as u16;
     let search_range = (1u16 << entry_selector) * 16;
     let mut out = Vec::new();
-    out.extend(0x0001_0000u32.to_be_bytes());
+    out.extend(version.to_be_bytes());
     out.extend(n.to_be_bytes());
     out.extend(search_range.to_be_bytes());
     out.extend(entry_selector.to_be_bytes());
@@ -247,39 +619,58 @@ impl ttf_parser::OutlineBuilder for Sink {
     fn close(&mut self) {}
 }
 
-/// 독립 파서로 새 글꼴을 열고 모든 글리프 외곽선을 해석해 본다
-fn validate(data: &[u8], num_glyphs: usize) -> Result<(), String> {
+/// 독립 파서로 새 글꼴을 열고 외곽선이 있어야 하는 모든 글리프가 해석되는지 확인한다
+fn validate(data: &[u8], has_outline: &[bool]) -> Result<(), String> {
     let face =
         ttf_parser::Face::parse(data, 0).map_err(|e| format!("재조합 글꼴 검증 실패: {e}"))?;
-    if face.number_of_glyphs() as usize != num_glyphs {
+    if face.number_of_glyphs() as usize != has_outline.len() {
         return Err("재조합 글꼴 글리프 수 불일치".into());
     }
-    for gid in 0..num_glyphs {
-        // 빈 글리프(공백 등)는 None 이 정상이다
-        let _ = face.outline_glyph(ttf_parser::GlyphId(gid as u16), &mut Sink);
+    let mut bad = 0usize;
+    let mut first = None;
+    for (gid, &needed) in has_outline.iter().enumerate() {
+        // 외곽선이 없는 글리프(공백 등)는 None 이 정상이다
+        let ok = face
+            .outline_glyph(ttf_parser::GlyphId(gid as u16), &mut Sink)
+            .is_some();
+        if needed && !ok {
+            bad += 1;
+            first.get_or_insert(gid);
+        }
     }
-    Ok(())
+    match first {
+        None => Ok(()),
+        Some(g) => Err(format!("해석되지 않는 글리프 {bad}개 (글리프 {g})")),
+    }
 }
 
-/// CFF 글꼴 프로그램(FontFile3 의 Type1C/CIDFontType0C, 또는 CFF 기반 OpenType)을 검증한다.
+/// CFF 기반 OpenType('OTTO')을 CFF 와 필수 테이블만으로 다시 조립한다 (CFF 는 전 글리프 검증)
+pub fn rebuild_opentype_cff(data: &[u8]) -> Result<Rebuilt, String> {
+    if !data.starts_with(b"OTTO") {
+        return Err("CFF 기반 OpenType 이 아님".into());
+    }
+    let (tables, dropped) = read_tables(data, KEEP_TABLES_CFF)?;
+    let cff = tables
+        .get(b"CFF ")
+        .ok_or("CFF 테이블이 없는 OpenType (CFF2 등 미지원)")?;
+    let glyphs = validate_cff(cff)?;
+    let mut out: BTreeMap<[u8; 4], Vec<u8>> = BTreeMap::new();
+    rebuild_common(&tables, glyphs, false, &mut out)?;
+    out.insert(*b"CFF ", cff.to_vec());
+    let data = write_sfnt(&out, u32::from_be_bytes(*b"OTTO"));
+    ttf_parser::Face::parse(&data, 0).map_err(|e| format!("재조합 글꼴 검증 실패: {e}"))?;
+    Ok(Rebuilt {
+        data,
+        dropped_tables: dropped,
+        stripped_glyphs: 0,
+    })
+}
+
+/// CFF 글꼴 프로그램(FontFile3 의 Type1C/CIDFontType0C, 또는 OpenType 의 CFF 테이블)을 검증한다.
 /// 글리프 프로그램(Type 2 charstring)은 글꼴 엔진이 해석·실행하는 코드이므로, 독립 해석기로
 /// 모든 글리프를 끝까지 해석해 보고 하나라도 비정상(스택·중첩 한도 초과, 잘못된 연산자,
 /// 서브루틴 범위 오류, 범위 밖 읽기 등)이면 거부한다. 반환값: 검증한 글리프 수
-pub fn validate_cff(data: &[u8]) -> Result<usize, String> {
-    let owned;
-    let cff_data: &[u8] = if data.starts_with(b"OTTO") {
-        let face =
-            ttf_parser::RawFace::parse(data, 0).map_err(|e| format!("OpenType 해석 실패: {e}"))?;
-        match face.table(ttf_parser::Tag::from_bytes(b"CFF ")) {
-            Some(t) => {
-                owned = t.to_vec();
-                &owned
-            }
-            None => return Err("CFF 테이블이 없는 OpenType (CFF2 등 미지원)".into()),
-        }
-    } else {
-        data
-    };
+pub fn validate_cff(cff_data: &[u8]) -> Result<usize, String> {
     let table = ttf_parser::cff::Table::parse(cff_data).ok_or("CFF 구조 해석 실패")?;
     let n = table.number_of_glyphs();
     if n == 0 {
@@ -304,12 +695,54 @@ pub fn validate_cff(data: &[u8]) -> Result<usize, String> {
     }
 }
 
+/// Type 1 글꼴 프로그램(FontFile)의 모든 글리프 프로그램(Type 1 charstring)을 독립 해석기로
+/// 끝까지 실행해 본다. 반환값: 검증한 글리프 수
+pub fn validate_type1(data: &[u8]) -> Result<usize, String> {
+    use read_fonts::ps::type1::Type1Font;
+    use read_fonts::types::GlyphId;
+    struct Pen;
+    impl read_fonts::model::pen::OutlinePen for Pen {
+        fn move_to(&mut self, _: f32, _: f32) {}
+        fn line_to(&mut self, _: f32, _: f32) {}
+        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+        fn close(&mut self) {}
+    }
+    let font = Type1Font::new(data).map_err(|_| "Type 1 구조 해석 실패".to_string())?;
+    let n = font.num_glyphs();
+    if n == 0 {
+        return Err("글리프가 없음".into());
+    }
+    if n > 65_535 {
+        return Err("글리프 수 초과".into());
+    }
+    let mut bad = 0usize;
+    let mut first = None;
+    for gid in 0..n {
+        if let Err(e) = font.draw(GlyphId::new(gid), None, &mut Pen) {
+            bad += 1;
+            first.get_or_insert((gid, format!("{e:?}")));
+        }
+    }
+    match first {
+        None => Ok(n as usize),
+        Some((gid, e)) => Err(format!(
+            "비정상 글리프 프로그램 {bad}개 (글리프 {gid}: {e})"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     /// 사각형 글리프 하나(+ 명령어)와 힌팅 테이블을 가진 최소 TrueType 글꼴
     pub(crate) fn sample_font() -> Vec<u8> {
+        write_sfnt(&sample_tables(), 0x0001_0000)
+    }
+
+    /// 샘플 글꼴의 테이블들 (테스트에서 일부를 바꿔 쓰기 위함)
+    pub(crate) fn sample_tables() -> BTreeMap<[u8; 4], Vec<u8>> {
         let mut glyph = Vec::new();
         glyph.extend(1i16.to_be_bytes()); // 윤곽선 1개
         for v in [0i16, 0, 100, 100] {
@@ -375,7 +808,15 @@ mod tests {
         t.insert(*b"prep", vec![0xB0, 0x00]);
         t.insert(*b"cvt ", vec![0, 1, 0, 2]);
         t.insert(*b"EVIL", b"payload".to_vec());
-        write_sfnt(&t)
+        t.insert(*b"name", b"name-payload".to_vec());
+        // cmap: 'A' → 1, 'B' → 2 (형식 4) + 하위 테이블 뒤에 숨긴 데이터
+        let mut cmap = 0u16.to_be_bytes().to_vec();
+        cmap.extend(1u16.to_be_bytes());
+        cmap.extend([0, 3, 0, 1, 0, 0, 0, 12]);
+        cmap.extend(cmap_format4(&[(65, 1), (66, 2)]));
+        cmap.extend(b"cmap-payload");
+        t.insert(*b"cmap", cmap);
+        t
     }
 
     #[test]
@@ -385,7 +826,7 @@ mod tests {
         let r = rebuild_truetype(&src).unwrap();
         let mut dropped = r.dropped_tables.clone();
         dropped.sort();
-        assert_eq!(dropped, vec!["EVIL", "cvt", "fpgm", "prep"]);
+        assert_eq!(dropped, vec!["EVIL", "cvt", "fpgm", "name", "prep"]);
         assert_eq!(r.stripped_glyphs, 3);
         let face = ttf_parser::Face::parse(&r.data, 0).unwrap();
         assert_eq!(face.number_of_glyphs(), 3);
@@ -629,9 +1070,85 @@ mod tests {
         };
         let (f, kept) = build(sample_cff(BOX));
         assert!(kept);
-        assert_eq!(f.stats.get("cff_fonts_validated"), Some(&1));
+        assert_eq!(f.stats.get("fonts_validated"), Some(&1));
         let (f, kept) = build(sample_cff(&[139, 139, 21, 139, 10, 14]));
         assert!(!kept, "검증 실패 글꼴 프로그램이 남아 있음");
         assert!(f.items.iter().any(|x| x.category == "font"));
+    }
+
+    #[test]
+    fn tables_are_regenerated_not_copied() {
+        let r = rebuild_truetype(&sample_font()).unwrap();
+        for junk in [&b"payload"[..], b"name-payload", b"cmap-payload"] {
+            assert!(
+                !r.data.windows(junk.len()).any(|w| w == junk),
+                "{:?}",
+                String::from_utf8_lossy(junk)
+            );
+        }
+        let face = ttf_parser::Face::parse(&r.data, 0).unwrap();
+        assert_eq!(face.glyph_index('A').map(|g| g.0), Some(1));
+        assert_eq!(face.glyph_index('B').map(|g| g.0), Some(2));
+        assert!(face
+            .raw_face()
+            .table(ttf_parser::Tag::from_bytes(b"name"))
+            .is_none());
+    }
+
+    #[test]
+    fn overlapping_loca_and_composite_cycles_are_rejected() {
+        // loca 가 되돌아가며 같은 데이터를 여러 번 가리키는 글꼴 (메모리 증폭 공격)
+        let mut t = sample_tables();
+        let loca: Vec<u8> = [0u16, 20, 0, 20]
+            .iter()
+            .flat_map(|v| v.to_be_bytes())
+            .collect();
+        t.insert(*b"loca", loca);
+        let e = rebuild_truetype(&write_sfnt(&t, 0x0001_0000)).unwrap_err();
+        assert!(e.contains("단조"), "{e}");
+
+        // 자기 자신을 구성 요소로 참조하는 복합 글리프
+        let mut t = sample_tables();
+        let glyf = t.get_mut(b"glyf").unwrap();
+        let comp_at = glyf.len() - 16; // 마지막 글리프(복합)의 구성 요소 글리프 번호 위치
+        let pos = (comp_at..glyf.len() - 1)
+            .find(|&i| glyf[i - 2..i] == (0x0001u16 | 0x0002 | 0x0100).to_be_bytes())
+            .unwrap();
+        glyf[pos..pos + 2].copy_from_slice(&2u16.to_be_bytes());
+        let e = rebuild_truetype(&write_sfnt(&t, 0x0001_0000)).unwrap_err();
+        assert!(e.contains("순환"), "{e}");
+    }
+
+    #[test]
+    fn opentype_cff_is_reassembled_with_needed_tables_only() {
+        let mut t = sample_tables();
+        for k in [b"glyf", b"loca", b"fpgm", b"prep", b"cvt "] {
+            t.remove(k);
+        }
+        t.insert(*b"CFF ", sample_cff(BOX));
+        t.get_mut(b"maxp").unwrap()[4..6].copy_from_slice(&2u16.to_be_bytes());
+        let hhea = t.get_mut(b"hhea").unwrap();
+        hhea[34..36].copy_from_slice(&2u16.to_be_bytes());
+        t.insert(*b"GSUB", b"layout-payload".to_vec());
+        let otf = write_sfnt(&t, u32::from_be_bytes(*b"OTTO"));
+        let r = rebuild_opentype_cff(&otf).unwrap();
+        assert!(r.data.starts_with(b"OTTO"));
+        for junk in [&b"payload"[..], b"layout-payload", b"name-payload"] {
+            assert!(!r.data.windows(junk.len()).any(|w| w == junk));
+        }
+        let face = ttf_parser::Face::parse(&r.data, 0).unwrap();
+        assert_eq!(face.glyph_index('A').map(|g| g.0), Some(1));
+        // 비정상 글리프 프로그램을 가진 CFF 는 거부
+        t.insert(*b"CFF ", sample_cff(&[139, 139, 21, 139, 10, 14]));
+        assert!(rebuild_opentype_cff(&write_sfnt(&t, u32::from_be_bytes(*b"OTTO"))).is_err());
+    }
+
+    #[test]
+    fn type1_programs_are_validated() {
+        assert!(validate_type1(
+            b"%!PS-AdobeFont-1.0: X\n/FontName /X def\ncurrentfile eexec\n\x00\x01"
+        )
+        .is_err());
+        assert!(validate_type1(b"not a font").is_err());
     }
 }

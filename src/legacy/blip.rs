@@ -13,6 +13,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 
+use crate::error::{blocked, Result};
 use crate::imaging::{self, ImageKind};
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
@@ -24,6 +25,47 @@ const RT_BLIP_LAST: u16 = 0xF117;
 const RT_JPEG: u16 = 0xF01D;
 const RT_PNG: u16 = 0xF01E;
 const RT_DIB: u16 = 0xF01F;
+const RT_JPEG_CMYK: u16 = 0xF02A;
+/// 형식 변환 없이 옮기는 메타파일 (EMF, WMF, PICT)
+const METAFILES: [u16; 3] = [0xF01A, 0xF01B, 0xF01C];
+/// FBSE 의 그림 형식 값 (btWin32/btMacOS)
+const BT_JPEG: u8 = 5;
+const BT_PNG: u8 = 6;
+
+/// 문서 하나에서 디코딩하는 그림의 누적 화소 예산 (그림 하나 한도의 몇 배)
+const PIXEL_BUDGET_FACTOR: u64 = 4;
+
+/// 문서 단위 누적 화소 예산
+pub struct PixelBudget {
+    left: u64,
+}
+
+impl PixelBudget {
+    pub fn new(policy: &Policy) -> Self {
+        PixelBudget {
+            left: policy.max_image_pixels.saturating_mul(PIXEL_BUDGET_FACTOR),
+        }
+    }
+
+    /// 디코딩 전에 그림 크기만큼 예산을 쓴다. 헤더를 읽을 수 없으면 0 (디코딩 단계에서 실패)
+    fn charge(&mut self, data: &[u8], kind: ImageKind) -> Result<()> {
+        let format = match kind {
+            ImageKind::Jpeg => image::ImageFormat::Jpeg,
+            ImageKind::Png => image::ImageFormat::Png,
+            ImageKind::Gif => image::ImageFormat::Gif,
+            ImageKind::Bmp => image::ImageFormat::Bmp,
+        };
+        let px = image::ImageReader::with_format(Cursor::new(data), format)
+            .into_dimensions()
+            .map(|(w, h)| w as u64 * h as u64)
+            .unwrap_or(0);
+        if px > self.left {
+            return blocked("resource", "문서 안 그림의 총 화소 수가 한도를 넘음");
+        }
+        self.left -= px;
+        Ok(())
+    }
+}
 
 struct Header {
     ver: u16,
@@ -110,7 +152,7 @@ pub fn rebuild(
     policy: &Policy,
     findings: &mut Findings,
     location: &str,
-) -> Option<Rebuilt> {
+) -> Result<Option<Rebuilt>> {
     let fbse = find_fbse(document);
     let referenced: BTreeMap<u32, ()> = fbse
         .iter()
@@ -118,20 +160,37 @@ pub fn rebuild(
         .map(|f| (f.fo_delay, ()))
         .collect();
 
+    let mut budget = PixelBudget::new(policy);
     let mut out = Vec::with_capacity(pictures.len());
-    let mut moved: HashMap<u32, (u32, u32)> = HashMap::new();
-    let (mut reencoded, mut kept, mut replaced) = (0u64, 0u64, 0u64);
+    // 원래 위치 → (새 위치, 새 크기, 바뀐 그림 형식)
+    let mut moved: HashMap<u32, (u32, u32, Option<u8>)> = HashMap::new();
+    let (mut reencoded, mut kept, mut replaced, mut unsupported) = (0u64, 0u64, 0u64, 0u64);
     for &old in referenced.keys() {
-        let h = header(pictures, old as usize)
-            .filter(|h| (RT_BLIP_FIRST..=RT_BLIP_LAST).contains(&h.rtype))?;
+        let Some(h) = header(pictures, old as usize)
+            .filter(|h| (RT_BLIP_FIRST..=RT_BLIP_LAST).contains(&h.rtype))
+        else {
+            return Ok(None);
+        };
         let body = &pictures[h.body..h.body + h.len];
-        let new_body = match raster_prefix(h.rtype, h.instance) {
+        let uid: Vec<u8> = body
+            .iter()
+            .copied()
+            .take(16)
+            .chain(std::iter::repeat(0))
+            .take(16)
+            .collect();
+        // (버전·인스턴스, 형식, 본문, 바뀐 FBSE 그림 형식)
+        let (vi, rtype, new_body, retype) = match raster_prefix(h.rtype, h.instance) {
+            _ if METAFILES.contains(&h.rtype) => {
+                kept += 1;
+                ((h.instance << 4) | h.ver, h.rtype, body.to_vec(), None)
+            }
             Some(prefix) if body.len() > prefix => {
                 let (head, image) = body.split_at(prefix);
                 let rebuilt = match h.rtype {
-                    RT_DIB => reencode_dib(image, policy),
-                    RT_JPEG => reencode(image, ImageKind::Jpeg, policy),
-                    _ => reencode(image, ImageKind::Png, policy),
+                    RT_DIB => reencode_dib(image, policy, &mut budget)?,
+                    RT_JPEG => reencode(image, ImageKind::Jpeg, policy, &mut budget)?,
+                    _ => reencode(image, ImageKind::Png, policy, &mut budget)?,
                 };
                 let image = match rebuilt {
                     Some(d) => {
@@ -145,19 +204,44 @@ pub fn rebuild(
                 };
                 let mut b = head.to_vec();
                 b.extend(image);
-                b
+                ((h.instance << 4) | h.ver, h.rtype, b, None)
             }
             _ => {
-                kept += 1;
-                body.to_vec()
+                // CMYK JPEG 는 일반 JPEG 로, 그 밖의 형식(TIFF, 규격 외 인스턴스, 정의되지 않은
+                // 형식)은 빈 PNG 로 바꾸고 FBSE 의 그림 형식도 맞춘다
+                let cmyk = if h.rtype == RT_JPEG_CMYK && body.len() > 17 {
+                    let start = if h.instance & 1 == 1 { 33 } else { 17 };
+                    match body.get(start..) {
+                        Some(img) => reencode(img, ImageKind::Jpeg, policy, &mut budget)?,
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let mut b = uid;
+                b.push(0xFF);
+                match cmyk {
+                    Some(jpeg) => {
+                        reencoded += 1;
+                        b.extend(jpeg);
+                        (0x46A << 4, RT_JPEG, b, Some(BT_JPEG))
+                    }
+                    None => {
+                        unsupported += 1;
+                        b.extend(placeholder(RT_PNG));
+                        (0x6E0 << 4, RT_PNG, b, Some(BT_PNG))
+                    }
+                }
             }
         };
-        let at = u32::try_from(out.len()).ok()?;
-        out.extend(((h.instance << 4) | h.ver).to_le_bytes());
-        out.extend(h.rtype.to_le_bytes());
+        let Ok(at) = u32::try_from(out.len()) else {
+            return Ok(None);
+        };
+        out.extend(vi.to_le_bytes());
+        out.extend(rtype.to_le_bytes());
         out.extend((new_body.len() as u32).to_le_bytes());
         out.extend(&new_body);
-        moved.insert(old, (at, new_body.len() as u32 + 8));
+        moved.insert(old, (at, new_body.len() as u32 + 8, retype));
     }
 
     let mut document = document.to_vec();
@@ -165,7 +249,11 @@ pub fn rebuild(
         if f.fo_delay == u32::MAX {
             continue;
         }
-        let (at, size) = moved[&f.fo_delay];
+        let (at, size, retype) = moved[&f.fo_delay];
+        if let Some(bt) = retype {
+            document[f.body] = bt;
+            document[f.body + 1] = bt;
+        }
         document[f.body + 20..f.body + 24].copy_from_slice(&size.to_le_bytes());
         document[f.body + 28..f.body + 32].copy_from_slice(&at.to_le_bytes());
     }
@@ -179,6 +267,14 @@ pub fn rebuild(
             "image",
             Severity::Low,
             format!("해석할 수 없는 그림 {replaced}개를 빈 그림으로 대체"),
+            location,
+        );
+    }
+    if unsupported > 0 {
+        findings.add(
+            "image",
+            Severity::Low,
+            format!("재조합할 수 없는 형식(TIFF 등)의 그림 {unsupported}개를 빈 그림으로 대체"),
             location,
         );
     }
@@ -196,21 +292,35 @@ pub fn rebuild(
             location,
         );
     }
-    Some(Rebuilt {
+    Ok(Some(Rebuilt {
         pictures: out,
         document,
-    })
+    }))
 }
 
-fn reencode(data: &[u8], kind: ImageKind, policy: &Policy) -> Option<Vec<u8>> {
+fn reencode(
+    data: &[u8],
+    kind: ImageKind,
+    policy: &Policy,
+    budget: &mut PixelBudget,
+) -> Result<Option<Vec<u8>>> {
     if ImageKind::sniff(data) != Some(kind) {
-        return None;
+        return Ok(None);
     }
-    imaging::reencode_same(data, kind, policy).ok()
+    budget.charge(data, kind)?;
+    Ok(imaging::reencode_same(data, kind, policy).ok())
 }
 
 /// DIB(파일 헤더 없는 BMP)를 24비트 DIB 로 다시 만든다
-fn reencode_dib(dib: &[u8], policy: &Policy) -> Option<Vec<u8>> {
+fn reencode_dib(dib: &[u8], policy: &Policy, budget: &mut PixelBudget) -> Result<Option<Vec<u8>>> {
+    let Some(bmp) = dib_to_bmp(dib) else {
+        return Ok(None);
+    };
+    budget.charge(&bmp, ImageKind::Bmp)?;
+    Ok(reencode_bmp_as_dib(dib, &bmp, policy))
+}
+
+fn dib_to_bmp(dib: &[u8]) -> Option<Vec<u8>> {
     let header_size = u32::from_le_bytes(dib.get(0..4)?.try_into().ok()?) as usize;
     let bpp = u16::from_le_bytes(dib.get(14..16)?.try_into().ok()?) as usize;
     let colors_used = u32::from_le_bytes(dib.get(32..36)?.try_into().ok()?) as usize;
@@ -229,11 +339,15 @@ fn reencode_dib(dib: &[u8], policy: &Policy) -> Option<Vec<u8>> {
     bmp.extend([0; 4]);
     bmp.extend((pixel_offset as u32).to_le_bytes());
     bmp.extend(dib);
+    Some(bmp)
+}
+
+fn reencode_bmp_as_dib(dib: &[u8], bmp: &[u8], policy: &Policy) -> Option<Vec<u8>> {
     if policy.media_passthrough {
-        imaging::reencode_same(&bmp, ImageKind::Bmp, policy).ok()?;
+        imaging::reencode_same(bmp, ImageKind::Bmp, policy).ok()?;
         return Some(dib.to_vec());
     }
-    let img = imaging::decode(&bmp, ImageKind::Bmp, policy).ok()?;
+    let img = imaging::decode(bmp, ImageKind::Bmp, policy).ok()?;
     let mut out = Cursor::new(Vec::new());
     image::DynamicImage::ImageRgb8(img.to_rgb8())
         .write_to(&mut out, image::ImageFormat::Bmp)
@@ -264,8 +378,10 @@ fn placeholder(rtype: u16) -> Vec<u8> {
 #[derive(Default)]
 pub struct InPlace {
     pub reencoded: u64,
-    /// 새 인코딩이 원래 자리에 들어가지 않아 원본을 유지한 그림
-    pub kept: u64,
+    /// 원래 자리에 맞추려고 크기를 줄인 그림
+    pub downscaled: u64,
+    /// 줄여도 자리에 들어가지 않아 내용을 지운(0 으로 채운) 그림
+    pub cleared: u64,
     /// 디코딩할 수 없어 빈 그림으로 대체한 그림
     pub replaced: u64,
 }
@@ -273,15 +389,18 @@ pub struct InPlace {
 /// 오프셋이 얽힌 스트림(doc 의 Data·WordDocument, xls 의 Workbook) 안의 래스터 그림 레코드를
 /// 찾아 **길이를 바꾸지 않고** 재인코딩한다. 새 인코딩을 원래 자리에 쓰고 남는 부분은 0 으로 채운다
 /// (PNG/JPEG 디코더는 끝 표시 뒤를 읽지 않는다). 레코드 길이와 모든 오프셋은 그대로다.
+/// 원본은 어떤 경우에도 남기지 않는다: 자리에 맞지 않으면 품질을 낮추고, 그래도 안 되면 크기를
+/// 줄이고, 끝내 들어가지 않으면 자리를 0 으로 채운다.
 /// `allowed` 는 그림 레코드 전체가 들어 있어야 하는 구간(예: BIFF 레코드 본문)을 판정한다.
 pub fn reencode_in_place(
     stream: &mut [u8],
     policy: &Policy,
     allowed: &dyn Fn(usize, usize) -> bool,
-) -> InPlace {
+    budget: &mut PixelBudget,
+) -> Result<InPlace> {
     let mut stats = InPlace::default();
     if policy.media_passthrough {
-        return stats;
+        return Ok(stats);
     }
     let mut p = 0;
     while p + 8 <= stream.len() {
@@ -304,60 +423,105 @@ pub fn reencode_in_place(
             continue;
         };
         let slot = &mut stream[start..end];
-        let (new, broken) = match reencode(slot, kind, policy) {
-            Some(first) => (fit(first, slot, kind, policy), false),
-            None => (Some(placeholder(rtype)), true),
+        budget.charge(slot, kind)?;
+        let (result, broken) = match imaging::decode(slot, kind, policy) {
+            Ok(img) => (fit(&img, slot.len(), kind), false),
+            Err(_) => (Fit::Encoded(placeholder(rtype)), true),
         };
-        match new {
-            Some(bytes) if bytes.len() <= slot.len() => {
-                slot[..bytes.len()].copy_from_slice(&bytes);
-                slot[bytes.len()..].fill(0);
+        let bytes = match result {
+            Fit::Encoded(b) => {
                 if broken {
                     stats.replaced += 1;
                 } else {
                     stats.reencoded += 1;
                 }
+                Some(b)
             }
-            _ => stats.kept += 1,
+            Fit::Downscaled(b) => {
+                stats.downscaled += 1;
+                Some(b)
+            }
+            Fit::Nothing => None,
+        };
+        match bytes.filter(|b| b.len() <= slot.len()) {
+            Some(b) => {
+                slot[..b.len()].copy_from_slice(&b);
+                slot[b.len()..].fill(0);
+            }
+            None => {
+                slot.fill(0);
+                stats.cleared += 1;
+            }
         }
         p = end;
     }
-    stats
+    Ok(stats)
 }
 
-/// 재인코딩 결과가 자리보다 크면 더 강하게 압축해 본다
-fn fit(first: Vec<u8>, slot: &[u8], kind: ImageKind, policy: &Policy) -> Option<Vec<u8>> {
-    if first.len() <= slot.len() {
-        return Some(first);
+impl InPlace {
+    pub fn add(&mut self, o: &InPlace) {
+        self.reencoded += o.reencoded;
+        self.downscaled += o.downscaled;
+        self.cleared += o.cleared;
+        self.replaced += o.replaced;
     }
-    let img = imaging::decode(slot, kind, policy).ok()?;
-    let mut out = Cursor::new(Vec::new());
+}
+
+enum Fit {
+    Encoded(Vec<u8>),
+    Downscaled(Vec<u8>),
+    Nothing,
+}
+
+/// 디코딩한 그림을 `slot` 바이트 안에 들어가게 인코딩한다.
+/// 같은 크기로 품질·압축을 조정해 보고, 그래도 크면 크기를 단계적으로 줄인다.
+fn fit(img: &image::DynamicImage, slot: usize, kind: ImageKind) -> Fit {
+    if let Some(d) = encode_smallest(img, kind, slot) {
+        return Fit::Encoded(d);
+    }
+    let (w, h) = (img.width(), img.height());
+    for scale in [0.75f32, 0.5, 0.35, 0.25, 0.15, 0.1, 0.05] {
+        let (nw, nh) = (
+            ((w as f32 * scale) as u32).max(1),
+            ((h as f32 * scale) as u32).max(1),
+        );
+        let small = img.resize_exact(nw, nh, image::imageops::FilterType::Triangle);
+        if let Some(d) = encode_smallest(&small, kind, slot) {
+            return Fit::Downscaled(d);
+        }
+        if nw == 1 && nh == 1 {
+            break;
+        }
+    }
+    Fit::Nothing
+}
+
+/// 같은 형식으로 `limit` 바이트 이하가 되는 인코딩을 찾는다
+fn encode_smallest(img: &image::DynamicImage, kind: ImageKind, limit: usize) -> Option<Vec<u8>> {
     match kind {
         ImageKind::Jpeg => {
             let rgb8 = img.to_rgb8();
             let gray = rgb8.pixels().all(|p| p[0] == p[1] && p[1] == p[2]);
-            let rgb = if gray {
+            let src = if gray {
                 image::DynamicImage::ImageLuma8(img.to_luma8())
             } else {
                 image::DynamicImage::ImageRgb8(rgb8)
             };
             for q in [92u8, 85, 75, 60, 45] {
-                out.get_mut().clear();
-                out.set_position(0);
+                let mut out = Cursor::new(Vec::new());
                 let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, q);
-                rgb.write_with_encoder(enc).ok()?;
-                if out.get_ref().len() <= slot.len() {
+                src.write_with_encoder(enc).ok()?;
+                if out.get_ref().len() <= limit {
                     return Some(out.into_inner());
                 }
             }
             None
         }
         _ => {
-            // 색이 256개 이하면 색상표(indexed) PNG 로, 아니면 최고 압축으로 다시 시도
-            if let Some(data) = indexed_png(&img).filter(|d| d.len() <= slot.len()) {
-                return Some(data);
+            if let Some(d) = indexed_png(img).filter(|d| d.len() <= limit) {
+                return Some(d);
             }
-            reduced_png(&img).filter(|d| d.len() <= slot.len())
+            reduced_png(img).filter(|d| d.len() <= limit)
         }
     }
 }
@@ -527,9 +691,15 @@ fn reduced_png(img: &image::DynamicImage) -> Option<Vec<u8>> {
         ),
         (false, false) => (6, 4, rgba.into_raw()),
     };
-    // 행별 적응 필터와 전체 고정 필터(5종) 중 가장 작은 결과
-    [None, Some(0), Some(1), Some(2), Some(3), Some(4)]
-        .into_iter()
+    // 행별 적응 필터와 (작은 그림이면) 전체 고정 필터 5종 중 가장 작은 결과
+    let variants: &[Option<u8>] = if (w as u64) * (h as u64) <= 4_000_000 {
+        &[None, Some(0), Some(1), Some(2), Some(3), Some(4)]
+    } else {
+        &[None]
+    };
+    variants
+        .iter()
+        .copied()
         .filter_map(|f| write_png(w, h, color, 8, bpp, &data, None, f))
         .min_by_key(Vec::len)
 }
@@ -539,8 +709,19 @@ pub fn report(stats: &InPlace, findings: &mut Findings, location: &str) {
     if stats.reencoded > 0 {
         findings.count("images_reencoded", stats.reencoded);
     }
-    if stats.kept > 0 {
-        findings.count("images_kept_original", stats.kept);
+    if stats.downscaled > 0 {
+        findings.count("images_downscaled", stats.downscaled);
+    }
+    if stats.cleared > 0 {
+        findings.add(
+            "image",
+            Severity::Low,
+            format!(
+                "원래 자리에 다시 인코딩할 수 없는 그림 {}개의 내용을 지움",
+                stats.cleared
+            ),
+            location,
+        );
     }
     if stats.replaced > 0 {
         findings.add(

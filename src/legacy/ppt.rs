@@ -354,7 +354,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     // 그림 스트림 재조합: 그림을 새로 인코딩하고 본문의 그림 목록(FBSE) 위치·크기만 제자리에서 고친다
     let mut pictures = c.stream("Pictures").map(<[u8]>::to_vec);
     if let Some(p) = &pictures {
-        match super::blip::rebuild(p, &doc, policy, findings, "Pictures") {
+        match super::blip::rebuild(p, &doc, policy, findings, "Pictures")? {
             Some(r) => {
                 doc = r.document;
                 pictures = Some(r.pictures);

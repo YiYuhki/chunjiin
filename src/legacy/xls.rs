@@ -80,7 +80,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     let mut external_books = 0u32;
     let mut hlink_bodies: Vec<(usize, usize)> = Vec::new();
     // 모든 BIFF 레코드 본문 구간 (그림 제자리 재인코딩이 레코드 경계를 넘지 않게)
-    let mut bodies: Vec<(usize, usize)> = Vec::new();
+    let mut bodies: Vec<(usize, usize, u16)> = Vec::new();
     while pos + 4 <= wb.len() {
         let rt = u16::from_le_bytes([wb[pos], wb[pos + 1]]);
         let len = u16::from_le_bytes([wb[pos + 2], wb[pos + 3]]) as usize;
@@ -88,7 +88,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             return blocked("structure", "BIFF 레코드 길이 오류");
         };
         let body_at = pos + 4;
-        bodies.push((body_at, body_at + len));
+        bodies.push((body_at, body_at + len, rt));
         pos += 4 + len;
         records += 1;
         match rt {
@@ -223,13 +223,49 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         );
     }
 
-    // 그리기 그룹의 그림(OfficeArt BLIP): 한 BIFF 레코드 안에 온전히 들어 있는 것만 제자리 재인코딩
-    // (CONTINUE 레코드로 나뉜 큰 그림은 레코드 헤더가 중간에 끼어 있어 원본 유지)
+    // 그리기 그룹의 그림(OfficeArt BLIP): 그리기 그룹 레코드(MsoDrawingGroup)와 뒤따르는 CONTINUE
+    // 레코드의 본문을 하나의 논리 스트림으로 이어 붙여 제자리 재인코딩한 뒤 원래 위치에 다시 나눠 쓴다
+    // (길이가 바뀌지 않으므로 레코드 헤더는 그대로). 그 밖의 레코드는 한 본문 안의 그림만 처리한다.
+    const MSO_DRAWING_GROUP: u16 = 0x00EB;
+    const CONTINUE: u16 = 0x003C;
+    let mut stats = super::blip::InPlace::default();
+    let mut budget = super::blip::PixelBudget::new(policy);
+    let mut groups: Vec<Vec<(usize, usize)>> = Vec::new();
+    let mut in_group = false;
+    for &(b, e, rt) in &bodies {
+        match rt {
+            MSO_DRAWING_GROUP => {
+                groups.push(vec![(b, e)]);
+                in_group = true;
+            }
+            CONTINUE if in_group => groups.last_mut().unwrap().push((b, e)),
+            _ => in_group = false,
+        }
+    }
+    for group in &groups {
+        let mut logical: Vec<u8> = group
+            .iter()
+            .flat_map(|&(b, e)| wb_out[b..e].to_vec())
+            .collect();
+        let s = super::blip::reencode_in_place(&mut logical, policy, &|_, _| true, &mut budget)?;
+        let mut at = 0;
+        for &(b, e) in group {
+            wb_out[b..e].copy_from_slice(&logical[at..at + (e - b)]);
+            at += e - b;
+        }
+        stats.add(&s);
+    }
+    let in_groups = |s: usize| groups.iter().flatten().any(|&(b, e)| s >= b && s < e);
     let within_record = |s: usize, e: usize| {
-        let i = bodies.partition_point(|&(b, _)| b <= s);
-        i > 0 && e <= bodies[i - 1].1
+        let i = bodies.partition_point(|&(b, _, _)| b <= s);
+        i > 0 && e <= bodies[i - 1].1 && !in_groups(s)
     };
-    let stats = super::blip::reencode_in_place(&mut wb_out, policy, &within_record);
+    stats.add(&super::blip::reencode_in_place(
+        &mut wb_out,
+        policy,
+        &within_record,
+        &mut budget,
+    )?);
     super::blip::report(&stats, findings, stream_name);
 
     // 새 컨테이너 조립

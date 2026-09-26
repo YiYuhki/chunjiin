@@ -44,6 +44,8 @@ enum Role {
     TrueType,
     /// 글꼴 기술자의 FontFile3 (CFF 또는 OpenType)
     FontFile3,
+    /// 글꼴 기술자의 FontFile (Type 1)
+    Type1,
 }
 
 /// 어떤 사전에서도 복사하지 않는 키: 액션·스크립트·첨부·외부 참조·메타데이터·구조 역참조
@@ -115,6 +117,36 @@ const FONT_KEYS: &[&[u8]] = &[
     b"FontMatrix",
     b"CharProcs",
     b"Resources",
+];
+
+/// 글꼴 기술자에서 옮기는 키 (PDF 32000 9.8) - 글꼴 프로그램은 FontFile* 키로만 참조된다
+const FONT_DESCRIPTOR_KEYS: &[&[u8]] = &[
+    b"Type",
+    b"FontName",
+    b"FontFamily",
+    b"FontStretch",
+    b"FontWeight",
+    b"Flags",
+    b"FontBBox",
+    b"ItalicAngle",
+    b"Ascent",
+    b"Descent",
+    b"Leading",
+    b"CapHeight",
+    b"XHeight",
+    b"StemV",
+    b"StemH",
+    b"AvgWidth",
+    b"MaxWidth",
+    b"MissingWidth",
+    b"FontFile",
+    b"FontFile2",
+    b"FontFile3",
+    b"CharSet",
+    b"Style",
+    b"Lang",
+    b"FD",
+    b"CIDSet",
 ];
 
 /// 원본 그대로 옮기되 디코딩 검증을 할 수 없는 이미지 필터
@@ -215,6 +247,15 @@ impl<'a> Copier<'a> {
             .and_then(|o| o.as_name().ok())
             == Some(b"Font")
             || subtype.is_some_and(|s| FONT_SUBTYPES.contains(&s));
+        let is_descriptor = d
+            .get(b"Type")
+            .ok()
+            .and_then(|o| self.deref(o))
+            .and_then(|o| o.as_name().ok())
+            == Some(b"FontDescriptor")
+            || d.has(b"FontFile")
+            || d.has(b"FontFile2")
+            || d.has(b"FontFile3");
         let mut out = Dictionary::new();
         for (k, v) in d.iter() {
             if DENY_KEYS.contains(&k.as_slice()) {
@@ -224,10 +265,14 @@ impl<'a> Copier<'a> {
             if is_font && !FONT_KEYS.contains(&k.as_slice()) {
                 continue;
             }
+            if is_descriptor && !FONT_DESCRIPTOR_KEYS.contains(&k.as_slice()) {
+                continue;
+            }
             let role = match k.as_slice() {
                 b"CharProcs" if is_type3 => Role::Content,
                 b"FontFile2" => Role::TrueType,
                 b"FontFile3" => Role::FontFile3,
+                b"FontFile" => Role::Type1,
                 _ => Role::Generic,
             };
             let copied = if role == Role::Content {
@@ -327,7 +372,7 @@ impl<'a> Copier<'a> {
             .map(|f| f.into_iter().map(<[u8]>::to_vec).collect())
             .unwrap_or_default();
 
-        if matches!(role, Role::TrueType | Role::FontFile3) {
+        if matches!(role, Role::TrueType | Role::FontFile3 | Role::Type1) {
             if let Some(r) = self.font_program(s, role, depth)? {
                 return Ok(r);
             }
@@ -473,8 +518,9 @@ impl<'a> Copier<'a> {
         Ok(Some(Stream::new(dict, raw).with_compression(false)))
     }
 
-    /// 글꼴 프로그램 스트림. TrueType 외곽선 글꼴은 새로 조립하고, 조립할 수 없으면 제외한다.
-    /// CFF 계열(FontFile3 의 Type1C/CIDFontType0C/CFF OpenType)은 None 을 돌려 일반 스트림으로 옮긴다.
+    /// 글꼴 프로그램 스트림. TrueType 과 CFF 기반 OpenType 은 새로 조립하고, CFF(Type1C 등)와
+    /// Type 1 은 모든 글리프 프로그램을 검증한 뒤 옮긴다. 조립·검증에 실패하면 제외한다.
+    /// 반환: Some(결과) = 처리 완료, None = 일반 스트림으로 옮김(검증 통과)
     fn font_program(
         &mut self,
         s: &Stream,
@@ -490,26 +536,42 @@ impl<'a> Copier<'a> {
             );
             return Ok(Some(None));
         };
-        if role == Role::FontFile3 && !font::is_truetype(&plain) {
-            // CFF 계열: 구조를 새로 쓰지는 않고, 모든 글리프 프로그램을 독립 해석기로 검증한 뒤 옮긴다
-            return match font::validate_cff(&plain) {
+        let kind = match role {
+            Role::Type1 => "Type 1",
+            Role::FontFile3 if plain.starts_with(b"OTTO") => "CFF 기반 OpenType",
+            Role::FontFile3 if !font::is_truetype(&plain) => "CFF",
+            _ => "TrueType",
+        };
+        // 검증만 하고 옮기는 형식
+        let validated = match kind {
+            "Type 1" => Some(font::validate_type1(&plain)),
+            "CFF" => Some(font::validate_cff(&plain)),
+            _ => None,
+        };
+        if let Some(r) = validated {
+            return match r {
                 Ok(glyphs) => {
-                    *self.font_stats.entry("cff_fonts_validated").or_default() += 1;
-                    *self.font_stats.entry("cff_glyphs_validated").or_default() += glyphs as u64;
+                    *self.font_stats.entry("fonts_validated").or_default() += 1;
+                    *self.font_stats.entry("font_glyphs_validated").or_default() += glyphs as u64;
                     Ok(None)
                 }
                 Err(e) => {
                     self.findings.add(
                         "font",
                         Severity::Medium,
-                        format!("검증을 통과하지 못한 CFF 글꼴 프로그램 제외 ({e})"),
+                        format!("검증을 통과하지 못한 {kind} 글꼴 프로그램 제외 ({e})"),
                         "",
                     );
                     Ok(Some(None))
                 }
             };
         }
-        match font::rebuild_truetype(&plain) {
+        let rebuilt = if kind == "CFF 기반 OpenType" {
+            font::rebuild_opentype_cff(&plain)
+        } else {
+            font::rebuild_truetype(&plain)
+        };
+        match rebuilt {
             Ok(rebuilt) => {
                 *self.font_stats.entry("fonts_rebuilt").or_default() += 1;
                 *self
@@ -532,19 +594,22 @@ impl<'a> Copier<'a> {
                     b"F",
                     b"FFilter",
                     b"FDecodeParms",
+                    b"Length1",
                     b"Length2",
                     b"Length3",
                 ] {
                     dict.remove(k);
                 }
-                dict.set("Length1", Object::Integer(rebuilt.data.len() as i64));
+                if role == Role::TrueType {
+                    dict.set("Length1", Object::Integer(rebuilt.data.len() as i64));
+                }
                 Ok(Some(Some(Stream::new(dict, rebuilt.data))))
             }
             Err(e) => {
                 self.findings.add(
                     "font",
-                    Severity::Low,
-                    format!("재조합할 수 없는 TrueType 글꼴 프로그램 제외 ({e})"),
+                    Severity::Medium,
+                    format!("재조합할 수 없는 {kind} 글꼴 프로그램 제외 ({e})"),
                     "",
                 );
                 Ok(Some(None))

@@ -448,9 +448,11 @@ fn doc_and_xls_pictures_are_reencoded_in_place() {
     let img_at = 23 + 8 + 17;
     image::load_from_memory(&new_data[img_at..new_data.len() - 4]).expect("재인코딩된 PNG");
 
-    // xls: 그리기 그룹 레코드 안의 그림은 재인코딩, 레코드 경계를 넘는 그림은 건드리지 않음
-    let mut spanning = biff(0x00EB, &blip[..blip.len() / 2]);
-    spanning.extend(biff(0x003C, &blip[blip.len() / 2..]));
+    // xls: 그리기 그룹 레코드 안의 그림, CONTINUE 레코드로 나뉜 그림 모두 재인코딩 (레코드 헤더 불변)
+    let half = blip.len() / 2;
+    let mut spanning = biff(0x00EB, &blip[..half]);
+    let continue_at = spanning.len();
+    spanning.extend(biff(0x003C, &blip[half..]));
     let src = xls(0, &[biff(0x00EB, &blip), spanning.clone()]);
     let r = neutralizing().process(&src, "a.xls");
     assert_eq!(r.status, Status::Sanitized, "{}", r.reason);
@@ -459,14 +461,89 @@ fn doc_and_xls_pictures_are_reencoded_in_place() {
         .unwrap()
         .to_vec();
     assert_eq!(wb.len(), before.len());
-    let first = before.windows(4).position(|w| w == b"<?ph").unwrap();
-    assert!(
-        !contains(&wb[..first + 16], b"<?php"),
-        "레코드 안의 그림은 재조합"
+    assert!(!contains(&wb, b"<?php"), "모든 그림 재조합");
+    let span_at = before
+        .windows(spanning.len())
+        .position(|w| w == spanning.as_slice())
+        .unwrap();
+    assert_eq!(
+        &wb[span_at..span_at + 4],
+        &spanning[..4],
+        "그리기 그룹 헤더 유지"
     );
-    assert!(contains(&wb, &spanning), "경계를 넘는 그림은 원본 유지");
+    assert_eq!(
+        &wb[span_at + continue_at..span_at + continue_at + 4],
+        &spanning[continue_at..continue_at + 4],
+        "CONTINUE 헤더 유지"
+    );
+    // 나뉜 그림을 다시 이어 붙이면 정상 PNG
+    let mut joined = wb[span_at + 4..span_at + continue_at].to_vec();
+    joined.extend(&wb[span_at + continue_at + 4..span_at + spanning.len()]);
+    image::load_from_memory(&joined[8 + 17..]).expect("나뉜 그림 재인코딩");
     assert_eq!(
         r.findings.iter().filter(|f| f.category == "image").count(),
         0
     );
+}
+
+#[test]
+fn ppt_unsupported_picture_types_become_png_and_budget_is_enforced() {
+    // TIFF 그림(0xF029)은 빈 PNG 로 바꾸고 FBSE 의 그림 형식도 PNG(6)로
+    let mut tiff_body = vec![0u8; 17];
+    tiff_body.extend(b"II*\x00TIFF-PAYLOAD");
+    let tiff = ppt_rec(0, 0x6E4, 0xF029, &tiff_body);
+    let mut b = vec![17u8, 17];
+    b.extend([0u8; 18]);
+    b.extend((tiff.len() as u32).to_le_bytes());
+    b.extend(1u32.to_le_bytes());
+    b.extend(0u32.to_le_bytes());
+    b.extend([0u8; 4]);
+    let store = ppt_rec(2, 17, 0xF007, &b);
+    let dgg = ppt_rec(0xF, 0, 0xF000, &ppt_rec(0xF, 1, 0xF001, &store));
+    let doc = ppt_rec(0xF, 0, 0x03E8, &ppt_rec(0xF, 0, 0x040B, &dgg));
+    let src = cfb(&[
+        ("PowerPoint Document", &doc),
+        ("Current User", &[0u8; 28]),
+        ("Pictures", &tiff),
+    ]);
+    let r = Engine::default().process(&src, "a.ppt");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let out = read_cfb(r.output.as_ref().unwrap());
+    let pics = stream(&out, "Pictures").unwrap();
+    assert!(!contains(pics, b"TIFF-PAYLOAD"));
+    assert_eq!(&pics[2..4], &0xF01Eu16.to_le_bytes());
+    image::load_from_memory(&pics[8 + 17..]).unwrap();
+    let new_doc = stream(&out, "PowerPoint Document").unwrap();
+    let at = new_doc
+        .windows(4)
+        .position(|w| w == [0x12, 0x01, 0x07, 0xF0])
+        .unwrap()
+        + 8;
+    assert_eq!(&new_doc[at..at + 2], &[6, 6]);
+
+    // 문서 전체 그림 화소 예산: 작은 그림 여러 개로 한도를 넘기면 차단
+    let mut png = Vec::new();
+    image::RgbImage::from_pixel(8, 8, image::Rgb([1, 2, 3]))
+        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let data: Vec<u8> = (0..10).flat_map(|_| png_blip(&png)).collect();
+    let mut streams = read_cfb(&malicious_doc(1 << 9));
+    streams.push(("Data".into(), data));
+    let refs: Vec<(&str, &[u8])> = streams
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let tight = Engine::new(cdr::Policy {
+        max_image_pixels: 100,
+        ..cdr::Policy::default()
+    });
+    let r = tight.process(&cfb(&refs), "a.doc");
+    assert_eq!(r.status, Status::Blocked, "{}", r.reason);
+    assert!(r.reason.contains("화소"), "{}", r.reason);
 }
