@@ -2,18 +2,26 @@
 
 use crate::detect::{self, FileType, OLE_MAGIC};
 use crate::error::{CdrError, Result};
+use crate::imaging::{self, ImageKind};
 use crate::policy::Policy;
 use crate::report::{sha256_hex, CdrResult, Findings, Severity, Status};
-use crate::{hwpx, legacy, ooxml, pdf};
+use crate::{archive, hwpx, legacy, ooxml, pdf};
 
 #[derive(Default)]
 pub struct Engine {
     pub policy: Policy,
+    /// 압축 파일 중첩 깊이 (최상위 0)
+    depth: usize,
 }
 
 impl Engine {
     pub fn new(policy: Policy) -> Self {
-        Engine { policy }
+        Engine { policy, depth: 0 }
+    }
+
+    /// 압축 파일 안의 항목을 처리하는 엔진
+    pub(crate) fn nested(policy: Policy, depth: usize) -> Self {
+        Engine { policy, depth }
     }
 
     pub fn process(&self, data: &[u8], filename: &str) -> CdrResult {
@@ -126,15 +134,29 @@ impl Engine {
                 category: "legacy-format",
                 reason: ole_reason(data),
             }),
-            FileType::Zip => Err(CdrError::Blocked {
-                category: "unsupported",
-                reason: "일반 압축 파일은 지원하지 않음".into(),
-            }),
+            FileType::Zip => archive::reassemble(self, self.depth, data, findings),
+            FileType::Png | FileType::Jpeg | FileType::Gif | FileType::Bmp => {
+                if !self.policy.allow_images {
+                    return Err(CdrError::Blocked {
+                        category: "unsupported",
+                        reason: "단독 이미지 파일 처리가 비활성화되어 있음".into(),
+                    });
+                }
+                let kind = match ftype {
+                    FileType::Png => ImageKind::Png,
+                    FileType::Jpeg => ImageKind::Jpeg,
+                    FileType::Gif => ImageKind::Gif,
+                    _ => ImageKind::Bmp,
+                };
+                let (bytes, _) = imaging::reencode(data, kind, &self.policy)?;
+                findings.count("images_reencoded", 1);
+                Ok(bytes)
+            }
             FileType::Unknown => {
                 let reason = if data.starts_with(b"MZ") || data.starts_with(b"\x7fELF") {
                     "실행 파일은 허용되지 않음"
                 } else {
-                    "지원하지 않는 파일 형식 (오피스·한글·PDF 만 지원)"
+                    "지원하지 않는 파일 형식 (오피스·한글·PDF·이미지·ZIP 만 지원)"
                 };
                 Err(CdrError::Blocked {
                     category: "unsupported",
@@ -146,17 +168,20 @@ impl Engine {
 
     fn verify(&self, output: &[u8], ftype: FileType) -> Option<String> {
         let out_type = detect::detect(output);
-        if out_type != ftype {
+        if out_type != ftype.output_type() {
             return Some(format!("재조합 결과 형식 불일치({})", out_type.name()));
         }
         // 재검증은 구조 재조합만 수행한다(래스터화 결과를 다시 렌더링할 필요는 없음)
-        let verifier = Engine::new(Policy {
-            pdf_rasterize: false,
-            media_passthrough: true,
-            ..self.policy.clone()
-        });
+        let verifier = Engine::nested(
+            Policy {
+                pdf_rasterize: false,
+                media_passthrough: true,
+                ..self.policy.clone()
+            },
+            self.depth,
+        );
         let mut f = Findings::default();
-        if let Err(e) = verifier.reassemble(output, ftype, &mut f) {
+        if let Err(e) = verifier.reassemble(output, out_type, &mut f) {
             return Some(e.to_string());
         }
         let residual: Vec<String> = f

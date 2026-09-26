@@ -44,6 +44,14 @@ pub struct Policy {
     /// 빈 개체로 대체한다. 미리보기 그림은 유지된다. (Office 에서의 동작은 문서에 따라 다를 수 있음)
     pub neutralize_embedded_ole: bool,
 
+    /// 단독 이미지 파일(PNG/JPEG/GIF/BMP)을 픽셀 재인코딩으로 재조합한다 (false 면 차단)
+    pub allow_images: bool,
+    /// 일반 ZIP 압축 파일을 항목별로 재조합한다 (false 면 차단)
+    pub allow_archives: bool,
+    /// 압축 파일 안의 항목이 하나라도 차단되면 압축 파일 전체를 차단한다
+    /// (false 면 차단된 항목만 빼고 새 압축 파일을 만든다)
+    pub strict_archives: bool,
+
     /// 재검증 단계 전용: 이미 재인코딩된 이미지를 다시 인코딩하지 않고 헤더(크기)만 검사한다.
     /// 일반 사용에서는 false 여야 한다.
     #[doc(hidden)]
@@ -70,6 +78,9 @@ impl Default for Policy {
             raster_dpi: 150.0,
             raster_jpeg_quality: 85,
             neutralize_embedded_ole: false,
+            allow_images: true,
+            allow_archives: true,
+            strict_archives: false,
             media_passthrough: false,
         }
     }

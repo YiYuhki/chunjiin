@@ -21,6 +21,11 @@ pub enum FileType {
     /// 레거시 doc/xls/ppt/hwp 또는 암호화된 OOXML
     Ole,
     Zip,
+    /// 단독 이미지 파일
+    Png,
+    Jpeg,
+    Gif,
+    Bmp,
     Unknown,
 }
 
@@ -38,11 +43,23 @@ impl FileType {
             FileType::Ppt => "ppt",
             FileType::Ole => "ole",
             FileType::Zip => "zip",
+            FileType::Png => "png",
+            FileType::Jpeg => "jpeg",
+            FileType::Gif => "gif",
+            FileType::Bmp => "bmp",
             FileType::Unknown => "unknown",
         }
     }
 
     /// 재조합 결과물의 확장자 (매크로/템플릿/쇼 형식은 일반 문서 형식으로)
+    /// 재조합 결과물의 형식 (BMP 는 PNG 로 바뀐다)
+    pub fn output_type(self) -> FileType {
+        match self {
+            FileType::Bmp => FileType::Png,
+            t => t,
+        }
+    }
+
     pub fn output_extension(self) -> Option<&'static str> {
         match self {
             FileType::Pdf => Some("pdf"),
@@ -54,6 +71,10 @@ impl FileType {
             FileType::Doc => Some("doc"),
             FileType::Xls => Some("xls"),
             FileType::Ppt => Some("ppt"),
+            FileType::Zip => Some("zip"),
+            FileType::Png | FileType::Bmp => Some("png"),
+            FileType::Jpeg => Some("jpg"),
+            FileType::Gif => Some("gif"),
             _ => None,
         }
     }
@@ -74,6 +95,10 @@ impl FileType {
                 "doc", "dot", "xls", "xlt", "ppt", "pot", "pps", "hwp", "msg",
             ],
             FileType::Zip => &["zip"],
+            FileType::Png => &["png"],
+            FileType::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
+            FileType::Gif => &["gif"],
+            FileType::Bmp => &["bmp", "dib"],
             FileType::Unknown => &[],
         };
         list.contains(&ext)
@@ -106,7 +131,13 @@ pub fn detect(data: &[u8]) -> FileType {
     if data.starts_with(b"PK\x03\x04") {
         return detect_zip(data);
     }
-    FileType::Unknown
+    match crate::imaging::ImageKind::sniff(data) {
+        Some(crate::imaging::ImageKind::Png) => FileType::Png,
+        Some(crate::imaging::ImageKind::Jpeg) => FileType::Jpeg,
+        Some(crate::imaging::ImageKind::Gif) => FileType::Gif,
+        Some(crate::imaging::ImageKind::Bmp) => FileType::Bmp,
+        None => FileType::Unknown,
+    }
 }
 
 fn detect_zip(data: &[u8]) -> FileType {

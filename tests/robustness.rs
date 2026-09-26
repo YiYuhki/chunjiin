@@ -248,6 +248,22 @@ fn fuzz_legacy() {
 }
 
 #[test]
+fn fuzz_archive_and_images() {
+    let archive = common::make_zip(&[
+        ("a/doc.docm", &common::malicious_docm()),
+        ("b.pdf", &common::clean_pdf()),
+        ("c.png", &common::png_with_payload()),
+        (
+            "d.zip",
+            &common::make_zip(&[("x.hwpx", &common::malicious_hwpx())]),
+        ),
+    ]);
+    run("a.zip", 19, archive.clone(), mutate_zip);
+    run("r.zip", 20, archive, mutate_bytes);
+    run("a.png", 21, common::png_with_payload(), mutate_bytes);
+}
+
+#[test]
 fn fuzz_raw_bytes_all_formats() {
     // 컨테이너 자체(ZIP 헤더, CFB 헤더/FAT)를 직접 변조
     run("r.docx", 12, common::malicious_docm(), mutate_bytes);

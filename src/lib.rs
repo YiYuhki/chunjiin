@@ -4,6 +4,7 @@
 //! 허용 목록에 없는 요소(매크로, 스크립트, 임베디드 개체, 외부 참조 등)는
 //! 새 문서에 애초에 존재하지 않는다.
 
+pub mod archive;
 pub mod audit;
 pub mod batch;
 pub mod config;

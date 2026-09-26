@@ -22,6 +22,15 @@ pub struct PolicyFile {
     pub content: Content,
     #[serde(default)]
     pub pdf: Pdf,
+    #[serde(default)]
+    pub archive: Archive,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Archive {
+    pub enabled: Option<bool>,
+    pub strict: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -51,6 +60,7 @@ pub struct Content {
     pub strip_metadata: Option<bool>,
     pub flatten_pdf_annotations: Option<bool>,
     pub neutralize_embedded_ole: Option<bool>,
+    pub allow_images: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -135,6 +145,15 @@ impl PolicyFile {
         if let Some(v) = self.content.neutralize_embedded_ole {
             p.neutralize_embedded_ole = v;
         }
+        if let Some(v) = self.content.allow_images {
+            p.allow_images = v;
+        }
+        if let Some(v) = self.archive.enabled {
+            p.allow_archives = v;
+        }
+        if let Some(v) = self.archive.strict {
+            p.strict_archives = v;
+        }
         if let Some(v) = self.pdf.rasterize {
             p.pdf_rasterize = v;
         }
@@ -184,11 +203,16 @@ remove_hyperlinks = {}         # 허용 스킴 링크까지 모두 제거
 strip_metadata = {}             # 작성자 등 메타데이터 제거
 flatten_pdf_annotations = {}    # PDF 주석·폼 외형을 본문에 평면화하여 보존
 neutralize_embedded_ole = {}   # 레거시 PPT/XLS 임베디드 OLE 를 차단 대신 빈 개체로 대체
+allow_images = {}               # 단독 이미지(PNG/JPEG/GIF/BMP)를 픽셀 재인코딩으로 재조합
 
 [pdf]
 rasterize = {}                 # 최고 보안 모드: 페이지를 이미지로 재구성
 raster_dpi = {}                 # 이미지화 해상도
 raster_jpeg_quality = {}         # 이미지화 JPEG 품질
+
+[archive]
+enabled = {}                   # 일반 ZIP 압축 파일을 항목별로 재조합 (false 면 차단)
+strict = {}                    # 항목이 하나라도 차단되면 압축 파일 전체를 차단
 "#,
         p.max_file_size as u64 / MB,
         p.max_zip_entries,
@@ -204,9 +228,12 @@ raster_jpeg_quality = {}         # 이미지화 JPEG 품질
         p.strip_metadata,
         p.flatten_pdf_annotations,
         p.neutralize_embedded_ole,
+        p.allow_images,
         p.pdf_rasterize,
         p.raster_dpi,
         p.raster_jpeg_quality,
+        p.allow_archives,
+        p.strict_archives,
     )
 }
 
