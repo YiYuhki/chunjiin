@@ -4,7 +4,7 @@ use crate::detect::{self, FileType, OLE_MAGIC};
 use crate::error::{CdrError, Result};
 use crate::policy::Policy;
 use crate::report::{sha256_hex, CdrResult, Findings, Severity, Status};
-use crate::{hwpx, ooxml, pdf};
+use crate::{hwpx, legacy, ooxml, pdf};
 
 #[derive(Default)]
 pub struct Engine {
@@ -118,6 +118,10 @@ impl Engine {
                 ooxml::reassemble(data, ftype, &self.policy, findings)
             }
             FileType::Hwpx => hwpx::reassemble(data, &self.policy, findings),
+            FileType::Hwp => legacy::hwp::reassemble(data, &self.policy, findings),
+            FileType::Doc => legacy::doc::reassemble(data, &self.policy, findings),
+            FileType::Xls => legacy::xls::reassemble(data, &self.policy, findings),
+            FileType::Ppt => legacy::ppt::reassemble(data, &self.policy, findings),
             FileType::Ole => Err(CdrError::Blocked {
                 category: "legacy-format",
                 reason: ole_reason(data),
@@ -130,7 +134,7 @@ impl Engine {
                 let reason = if data.starts_with(b"MZ") || data.starts_with(b"\x7fELF") {
                     "실행 파일은 허용되지 않음"
                 } else {
-                    "지원하지 않는 파일 형식 (오피스/PDF 만 지원)"
+                    "지원하지 않는 파일 형식 (오피스·한글·PDF 만 지원)"
                 };
                 Err(CdrError::Blocked {
                     category: "unsupported",
@@ -179,7 +183,7 @@ fn ole_reason(data: &[u8]) -> String {
     if detect::find(data, &utf16("EncryptedPackage")).is_some() {
         "암호화된 Office 문서는 검사할 수 없어 차단합니다".into()
     } else {
-        "레거시 바이너리 문서(doc/xls/ppt/hwp)는 재조합을 지원하지 않아 차단합니다".into()
+        "지원하지 않는 OLE 복합 문서(Outlook 메시지 등)라 차단합니다".into()
     }
 }
 

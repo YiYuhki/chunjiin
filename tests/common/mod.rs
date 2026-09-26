@@ -1,6 +1,8 @@
 //! 테스트용 악성/정상 샘플 생성기.
 #![allow(dead_code)]
 
+pub mod legacy;
+
 use std::io::{Cursor, Read, Write};
 
 use lopdf::content::{Content, Operation};

@@ -102,3 +102,20 @@ pub fn reencode(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<(Vec<u8
     }
     Ok((out.into_inner(), target))
 }
+
+/// 이미지를 원래 형식 그대로(BMP 포함) 재인코딩한다. 형식 정보가 문서 안에 따로
+/// 기록되는 레거시 문서(HWP 등)에서 사용한다.
+pub fn reencode_same(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<Vec<u8>> {
+    if kind != ImageKind::Bmp {
+        let (bytes, out) = reencode(data, kind, policy)?;
+        if out == kind {
+            return Ok(bytes);
+        }
+    }
+    let img = decode(data, kind, policy)?;
+    let mut out = Cursor::new(Vec::new());
+    match img.write_to(&mut out, kind.format()) {
+        Ok(()) => Ok(out.into_inner()),
+        Err(e) => blocked("reconstruct", format!("이미지 재인코딩 실패: {e}")),
+    }
+}

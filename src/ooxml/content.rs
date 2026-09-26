@@ -38,7 +38,8 @@ const DANGEROUS_FIELDS: &[&str] = &[
     "INCLUDE",
     "IMPORT",
     "LINK",
-    "MACROBUTTON",
+    // MACROBUTTON 은 표시 텍스트가 필드 코드 안에 있고 매크로를 모두 제거한 뒤에는
+    // 실행할 대상이 없으므로 무력화하지 않는다
 ];
 
 const DANGEROUS_FORMULA_FUNCS: &[&str] = &[
@@ -485,7 +486,7 @@ fn blank_fields(el: &mut Element, dangerous: &HashSet<usize>, counter: &mut usiz
     }
 }
 
-fn field_is_dangerous(code: &str, starts_with_nested: bool) -> bool {
+pub(crate) fn field_is_dangerous(code: &str, starts_with_nested: bool) -> bool {
     if starts_with_nested {
         return true;
     }

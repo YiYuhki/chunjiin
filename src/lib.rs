@@ -1,4 +1,4 @@
-//! CDR (Content Disarm & Reconstruction) - 오피스/PDF 문서 재조합 엔진.
+//! CDR (Content Disarm & Reconstruction) - 오피스/한글/PDF 문서 재조합 엔진.
 //!
 //! 원본 문서를 "고치는" 대신, 원본에서 허용된 콘텐츠만 추출해 **새 문서를 조립**한다.
 //! 허용 목록에 없는 요소(매크로, 스크립트, 임베디드 개체, 외부 참조 등)는
@@ -9,6 +9,7 @@ pub mod engine;
 pub mod error;
 pub mod hwpx;
 pub mod imaging;
+pub mod legacy;
 pub mod ooxml;
 pub mod pdf;
 pub mod policy;

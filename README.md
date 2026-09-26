@@ -18,8 +18,12 @@
 | Excel | xlsx, xlsm, xltx, xltm, xlam | xlsx |
 | PowerPoint | pptx, pptm, ppsx, ppsm, potx, potm | pptx |
 | 한글 | hwpx | hwpx |
+| 한글 5.x (바이너리) | hwp | hwp |
+| Word 97-2003 | doc, dot | doc |
+| Excel 97-2003 (BIFF8/BIFF5) | xls, xlt, xla | xls |
+| PowerPoint 97-2003 | ppt, pot, pps | ppt |
 | PDF | pdf | pdf (선택: 페이지 이미지화) |
-| 레거시 doc/xls/ppt/hwp, 암호화 문서, 실행 파일, 기타 | — | **차단** |
+| 암호화·DRM·배포용 문서, Word 6/95·PowerPoint 95, 실행 파일, 기타 | — | **차단** |
 
 ## 재조합 방식
 
@@ -71,6 +75,23 @@
    - 제외된 바이너리를 가리키는 그림은 제거하고, 임베디드 글꼴 참조는 해제합니다.
    - 허용되지 않은 하이퍼링크 필드(`file:`, UNC 등)는 대상을 비웁니다. 한컴 형식(`http\://…;1;0;0;`, 스킴 없는 `www.…`)도 해석합니다.
 4. `mimetype`을 무압축 첫 엔트리로 둔 새 OCF 패키지를 작성합니다. 매니페스트와 `META-INF` 목록은 조립된 파일에 맞게 정리합니다.
+
+### 레거시 바이너리 문서 (HWP 5.x / doc / xls / ppt)
+
+OLE 복합 파일(CFB)은 **새 컨테이너를 만들어 허용된 스트림만** 옮겨 담습니다. 스트림 내부는 방식이 둘로 나뉩니다.
+- HWP처럼 레코드에 절대 오프셋이 없는 형식은 레코드를 재구성합니다.
+- doc/ppt처럼 오프셋이 얽힌 형식은 **길이가 바뀌지 않게 제자리에서** 무력화합니다.
+
+떼어낼 수 없는 능동 콘텐츠가 있으면 차단합니다(fail-closed).
+
+| 형식 | 조립하는 것 | 조립하지 않음 / 무력화 | 차단 |
+|---|---|---|---|
+| **HWP 5.x** | FileHeader(속성 비트 정리), DocInfo, BodyText, 래스터 이미지 BinData(재인코딩), 미리보기 | 문서 스크립트(JScript), **EPS/PostScript**, OLE, DocOptions(연결 문서·DRM·서명), XMLTemplate, 문서 이력. 레코드 재구성으로 외부 파일 연결(BIN_DATA LINK) 경로와 허용되지 않은 하이퍼링크 필드 제거 | 암호, 배포용, DRM, 인증서 암호화 |
+| **doc** | WordDocument, 사용 중인 테이블 스트림, Data, CompObj | VBA(Macros), ObjectPool(OLE, 미리보기 그림은 유지), 사용하지 않는 테이블 스트림(이전 편집 잔재), MsoDataStore. FIB의 명령 사용자 지정·매크로 이름·**첨부 서식 파일 연결** 제거. 조각 테이블을 따라 **DDE/INCLUDE*/LINK/위험 HYPERLINK 필드 코드를 같은 길이 공백으로 덮어씀** | 암호화, Word 6/95 |
+| **xls** | Workbook, 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, 임베디드 OLE, ActiveX |
+| **ppt** | PowerPoint Document, Current User, Pictures, CompObj | 매크로·프로그램 실행·OLE 동작을 "동작 없음"으로, 위험 하이퍼링크 대상을 공백으로 바꿈(제자리) | 암호화, 임베디드 OLE/VBA 저장소, ActiveX, PowerPoint 95 |
+
+PPT의 위험 레코드는 트리 순회에만 의존하지 않습니다. 비정상 컨테이너 속에 숨긴 경우까지 잡도록 **스트림 전체를 레코드 헤더 패턴으로 전수 검색**합니다.
 
 ### 공통
 
@@ -194,6 +215,12 @@ src/
 ├── zipsafe.rs         안전한 압축 해제 / 결정적 재압축
 ├── imaging.rs         이미지 디코딩 → 재인코딩
 ├── hwpx.rs            HWPX 매니페스트 기반 재조합
+├── legacy/
+│   ├── cfbx.rs        OLE 복합 파일 안전 읽기 / 새 컨테이너 조립
+│   ├── hwp.rs         HWP 5.x (레코드 재구성)
+│   ├── doc.rs         Word 97-2003 (FIB 정리, 필드 코드 제자리 무력화)
+│   ├── xls.rs         Excel 97-2003 (BIFF 레코드 판정)
+│   └── ppt.rs         PowerPoint 97-2003 (동작·링크 제자리 무력화)
 ├── server.rs          REST API (axum)
 ├── ooxml/
 │   ├── mod.rs         관계 그래프 탐색 → 파트 재구성 → 새 패키지 조립
@@ -216,8 +243,13 @@ cargo test
 
 ## 한계
 
-- 레거시 바이너리 형식(doc/xls/ppt/hwp)은 차단합니다. 필요하면 격리 환경에서 OOXML/HWPX/PDF로 변환한 뒤 재조합하십시오.
-- HWPX 결과물은 실제 한컴 문서 49종으로 검증했습니다. 구조 무결성, 본문 텍스트 일치, 독립 파서(hwpxlib)의 읽기·쓰기를 확인했습니다. 한컴오피스에서 직접 열어 보는 확인은 하지 않았습니다.
+- 레거시 형식에서 떼어낼 수 없는 능동 콘텐츠(PPT·XLS의 임베디드 OLE, XLS의 Excel 4.0 매크로 시트 등)는 차단합니다. 필요하면 격리 환경에서 OOXML/HWPX로 변환한 뒤 재조합하십시오.
+- XLS에서 VBA 저장소를 빼도 워크북의 VBA 표시 레코드(OBPROJ)는 남습니다(오프셋 보존). 매크로 본체는 없습니다.
+- doc/xls/ppt 이미지(Data, Pictures 스트림)와 PDF 글꼴 프로그램은 재인코딩하지 않고 그대로 옮깁니다.
+- 검증은 실제 문서와 독립 파서로 했습니다. MS Office와 한컴오피스에서 직접 열어 보는 확인은 하지 않았습니다.
+  - HWPX 49종: hwpxlib로 49/49 읽기·쓰기 성공, 본문 텍스트 동일
+  - HWP 42종: hwplib로 42/42 읽기·쓰기 성공, 본문 텍스트 동일
+  - Apache POI 테스트 문서: xls 366/366, ppt 88/88, doc 121/128 텍스트 동일. doc의 나머지 7건은 조립하지 않은 내장 OLE 개체 안의 텍스트입니다.
 - 래스터화 모드는 hayro 렌더러의 지원 범위를 따릅니다(일부 블렌딩/녹아웃 그룹 미지원).
 - PDF 글꼴 프로그램(TrueType/CFF)은 구조를 재작성하지 않고 그대로 옮깁니다. 글꼴 파서 취약점까지 막으려면 글꼴 재생성이나 페이지 래스터화 모드를 추가로 고려해야 합니다.
 - PDF 인라인 이미지 중 필터가 걸린 것은 파서가 지원하지 않아 제외됩니다.

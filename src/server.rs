@@ -248,7 +248,7 @@ button{padding:8px 16px;margin:8px 8px 0 0;cursor:pointer}label{margin-right:16p
 pre{background:#f6f8fa;padding:12px;overflow:auto;font-size:.85rem;white-space:pre-wrap}
 </style></head><body>
 <h1>CDR 문서 재조합</h1>
-<p>오피스(docx/xlsx/pptx)·한글(hwpx)·PDF 문서에서 허용된 콘텐츠만 꺼내 새 문서로 다시 조립합니다.</p>
+<p>오피스(docx/xlsx/pptx, doc/xls/ppt)·한글(hwpx, hwp)·PDF 문서에서 허용된 콘텐츠만 꺼내 새 문서로 다시 조립합니다.</p>
 <div class="box">
 <input type="file" id="f"><br><br>
 <label><input type="checkbox" id="raster"> PDF 이미지화(최고 보안)</label>

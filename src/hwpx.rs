@@ -627,7 +627,7 @@ fn sanitize_attrs(el: &mut Element, ctx: &mut Ctx) {
 }
 
 /// 한컴 하이퍼링크 경로("http\\://x;1;0;0;", "www.daum.net|-")를 URI 로 정규화한다.
-fn normalize_link(raw: &str) -> String {
+pub(crate) fn normalize_link(raw: &str) -> String {
     let v = raw.replace("\\:", ":");
     let v = v.split([';', '|']).next().unwrap_or("").trim().to_string();
     if v.is_empty() || v.contains(':') || v.starts_with('#') {
@@ -656,8 +656,12 @@ fn looks_like_local_path(href: &str) -> bool {
 }
 
 /// 스크립트를 보고한다. 한컴이 모든 문서에 넣는 빈 기본 템플릿은 Info 로 구분한다.
-fn report_script(findings: &mut Findings, name: &str, data: &[u8]) {
-    if script_is_default_template(data) {
+pub(crate) fn report_script(findings: &mut Findings, name: &str, data: &[u8]) {
+    report_script_text(findings, name, &decode_script(data));
+}
+
+pub(crate) fn report_script_text(findings: &mut Findings, name: &str, text: &str) {
+    if text_is_default_script(text) {
         findings.add(
             "script",
             Severity::Info,
@@ -699,11 +703,10 @@ fn decode_script(data: &[u8]) -> String {
     }
 }
 
-fn script_is_default_template(data: &[u8]) -> bool {
-    let text = decode_script(data);
+fn text_is_default_script(text: &str) -> bool {
     // 주석 제거
     let mut code = String::new();
-    let mut rest = text.as_str();
+    let mut rest = text;
     while !rest.is_empty() {
         if let Some(r) = rest.strip_prefix("//") {
             rest = r.find('\n').map(|i| &r[i..]).unwrap_or("");

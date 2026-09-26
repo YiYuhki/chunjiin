@@ -12,6 +12,12 @@ pub enum FileType {
     Pptx,
     /// 한컴오피스 OWPML 문서
     Hwpx,
+    /// 한글 5.x 바이너리 문서
+    Hwp,
+    /// Word/Excel/PowerPoint 97-2003 바이너리 문서
+    Doc,
+    Xls,
+    Ppt,
     /// 레거시 doc/xls/ppt/hwp 또는 암호화된 OOXML
     Ole,
     Zip,
@@ -26,6 +32,10 @@ impl FileType {
             FileType::Xlsx => "xlsx",
             FileType::Pptx => "pptx",
             FileType::Hwpx => "hwpx",
+            FileType::Hwp => "hwp",
+            FileType::Doc => "doc",
+            FileType::Xls => "xls",
+            FileType::Ppt => "ppt",
             FileType::Ole => "ole",
             FileType::Zip => "zip",
             FileType::Unknown => "unknown",
@@ -40,6 +50,10 @@ impl FileType {
             FileType::Xlsx => Some("xlsx"),
             FileType::Pptx => Some("pptx"),
             FileType::Hwpx => Some("hwpx"),
+            FileType::Hwp => Some("hwp"),
+            FileType::Doc => Some("doc"),
+            FileType::Xls => Some("xls"),
+            FileType::Ppt => Some("ppt"),
             _ => None,
         }
     }
@@ -52,6 +66,10 @@ impl FileType {
             FileType::Xlsx => &["xlsx", "xlsm", "xltx", "xltm", "xlam"],
             FileType::Pptx => &["pptx", "pptm", "potx", "potm", "ppsx", "ppsm", "ppam"],
             FileType::Hwpx => &["hwpx"],
+            FileType::Hwp => &["hwp"],
+            FileType::Doc => &["doc", "dot"],
+            FileType::Xls => &["xls", "xlt", "xla"],
+            FileType::Ppt => &["ppt", "pot", "pps"],
             FileType::Ole => &[
                 "doc", "dot", "xls", "xlt", "ppt", "pot", "pps", "hwp", "msg",
             ],
@@ -76,7 +94,14 @@ pub fn detect(data: &[u8]) -> FileType {
         return FileType::Pdf;
     }
     if data.starts_with(OLE_MAGIC) {
-        return FileType::Ole;
+        use crate::legacy::Kind;
+        return match crate::legacy::classify(data) {
+            Kind::Hwp => FileType::Hwp,
+            Kind::Doc => FileType::Doc,
+            Kind::Xls => FileType::Xls,
+            Kind::Ppt => FileType::Ppt,
+            Kind::EncryptedOoxml | Kind::Other => FileType::Ole,
+        };
     }
     if data.starts_with(b"PK\x03\x04") {
         return detect_zip(data);

@@ -26,6 +26,9 @@ sha2 = "0.10"
 hayro = "0.7"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
+cfb = "0.15"
+flate2 = "1"
+uuid = "1"
 
 [profile.release]
 opt-level = 3
