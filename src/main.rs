@@ -74,6 +74,9 @@ struct Common {
     /// PDF 주석/폼 외형을 평면화하지 않고 버림
     #[arg(long)]
     no_flatten: bool,
+    /// 레거시 PPT/XLS 의 임베디드 OLE 개체를 차단하지 않고 빈 개체로 대체
+    #[arg(long)]
+    neutralize_ole: bool,
     /// 최고 보안 모드: PDF 페이지를 이미지로 렌더링하여 재구성
     #[arg(long)]
     rasterize: bool,
@@ -158,6 +161,7 @@ fn run(common: &Common, output: Option<(&Path, bool)>) -> ExitCode {
         strip_metadata: !common.keep_metadata,
         flatten_pdf_annotations: !common.no_flatten,
         pdf_rasterize: common.rasterize,
+        neutralize_embedded_ole: common.neutralize_ole,
         raster_dpi: common.dpi,
         max_file_size: common.max_size * 1024 * 1024,
         ..Policy::default()

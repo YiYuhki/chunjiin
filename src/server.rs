@@ -48,6 +48,7 @@ pub struct Options {
     dpi: Option<f32>,
     remove_links: Option<bool>,
     keep_metadata: Option<bool>,
+    neutralize_ole: Option<bool>,
 }
 
 pub fn router(state: AppState) -> Router {
@@ -127,6 +128,9 @@ async fn run(
     }
     if let Some(v) = opts.keep_metadata {
         policy.strip_metadata = !v;
+    }
+    if let Some(v) = opts.neutralize_ole {
+        policy.neutralize_embedded_ole = v;
     }
 
     let Ok(_permit) = state.permits.clone().acquire_owned().await else {

@@ -200,18 +200,38 @@ fn doc_encrypted_is_blocked() {
 
 // ============================================================================ XLS
 
+fn neutralizing() -> Engine {
+    Engine::new(cdr::Policy {
+        neutralize_embedded_ole: true,
+        ..cdr::Policy::default()
+    })
+}
+
 #[test]
-fn xls_vba_is_not_reassembled() {
+fn xls_embedded_ole_is_blocked_by_default() {
     let r = Engine::default().process(&xls(0, &[obproj()]), "매출.xls");
+    assert_eq!(r.status, Status::Blocked);
+    assert!(r.reason.contains("--neutralize-ole"), "{}", r.reason);
+}
+
+#[test]
+fn xls_vba_and_ole_are_not_reassembled() {
+    let r = neutralizing().process(&xls(0, &[obproj()]), "매출.xls");
     assert_eq!(r.status, Status::Sanitized, "{}", r.reason);
-    assert_cats(&r, &["macro", "metadata"]);
-    let out = read_cfb(r.output.as_ref().unwrap());
-    assert_eq!(names(&out), vec!["Workbook"]);
+    assert_cats(&r, &["macro", "metadata", "embedded-object"]);
+    let out = r.output.as_ref().unwrap();
+    assert_eq!(names(&read_cfb(out)), vec!["Workbook"]);
+    // 빈 MBD 저장소는 남아 있음 (시트의 개체 참조 유지)
+    let c = cfb::CompoundFile::open(std::io::Cursor::new(out.as_slice())).unwrap();
+    assert!(c.is_storage("/MBD0001A2B3"));
+    let second = neutralizing().process(out, "a.xls");
+    assert_eq!(second.status, Status::Clean, "{:#?}", second.findings);
 }
 
 #[test]
 fn xls_xlm_macro_sheet_and_encryption_are_blocked() {
-    let e = Engine::default();
+    // 임베디드 OLE 는 대체 모드로 통과시켜 BIFF 판정까지 도달하게 한다
+    let e = neutralizing();
     let r = e.process(&xls(1, &[]), "a.xls");
     assert_eq!(r.status, Status::Blocked);
     assert!(r.reason.contains("XLM"), "{}", r.reason);
@@ -263,8 +283,43 @@ fn ppt_actions_are_neutralized_in_place() {
 }
 
 #[test]
-fn ppt_with_embedded_ole_is_blocked() {
+fn ppt_with_embedded_ole_is_blocked_by_default() {
     let r = Engine::default().process(&ppt(true), "a.ppt");
     assert_eq!(r.status, Status::Blocked);
     assert!(r.reason.contains("OLE"), "{}", r.reason);
+}
+
+#[test]
+fn ppt_embedded_ole_is_replaced_with_empty_storage() {
+    let src = ppt(true);
+    let r = neutralizing().process(&src, "a.ppt");
+    assert_eq!(r.status, Status::Sanitized, "{}", r.reason);
+    assert!(r
+        .findings
+        .iter()
+        .any(|f| f.description.contains("빈 개체로 대체")));
+    let out = read_cfb(r.output.as_ref().unwrap());
+    let doc = stream(&out, "PowerPoint Document").unwrap();
+    assert_eq!(
+        doc.len(),
+        stream(&read_cfb(&src), "PowerPoint Document")
+            .unwrap()
+            .len()
+    );
+    assert!(!contains(doc, b"payload") && !contains(doc, &[b'A'; 64]));
+
+    // 대체된 저장소는 스트림이 하나도 없는 정상 OLE 복합 파일
+    let at = doc
+        .windows(4)
+        .position(|w| w == [0x10, 0x00, 0x11, 0x10])
+        .unwrap();
+    let len = u32::from_le_bytes(doc[at + 4..at + 8].try_into().unwrap()) as usize;
+    let body = &doc[at + 8..at + 8 + len];
+    let mut raw = Vec::new();
+    std::io::Read::read_to_end(&mut flate2::read::ZlibDecoder::new(&body[4..]), &mut raw).unwrap();
+    let c = cfb::CompoundFile::open(std::io::Cursor::new(raw)).unwrap();
+    assert_eq!(c.walk().filter(|e| !e.is_root()).count(), 0);
+
+    let second = neutralizing().process(r.output.as_ref().unwrap(), "a.ppt");
+    assert_eq!(second.status, Status::Clean, "{:#?}", second.findings);
 }

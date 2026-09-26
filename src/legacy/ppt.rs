@@ -79,6 +79,48 @@ fn walk(
     n
 }
 
+/// 최상위 레코드 목록
+fn top_level(d: &[u8]) -> Vec<Rec> {
+    let mut out = Vec::new();
+    let mut pos = 0;
+    while let Some(r) = header(d, pos) {
+        pos = r.body + r.len;
+        out.push(r);
+    }
+    out
+}
+
+struct EmptyStorage {
+    raw: Vec<u8>,
+    compressed: Vec<u8>,
+}
+
+/// 내용이 없는 OLE 복합 파일 (비압축 / "원본 크기 + zlib" 압축 형태)
+fn empty_storage() -> Result<EmptyStorage> {
+    let raw = cfbx::write(cfb::Version::V3, [0; 16], &[])?;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::best());
+    let _ = std::io::Write::write_all(&mut e, &raw);
+    let mut compressed = (raw.len() as u32).to_le_bytes().to_vec();
+    compressed.extend(e.finish().unwrap_or_default());
+    Ok(EmptyStorage { raw, compressed })
+}
+
+/// 이미 비어 있는(스트림이 하나도 없는) OLE 저장소인지 - 재검증 시 중복 보고 방지
+fn storage_is_empty(d: &[u8], r: &Rec, policy: &Policy) -> bool {
+    let body = &d[r.body..r.body + r.len];
+    let data = if r.instance == 1 {
+        let mut out = Vec::new();
+        let dec = flate2::read::ZlibDecoder::new(&body[4..]);
+        if std::io::Read::read_to_end(&mut std::io::Read::take(dec, 1 << 20), &mut out).is_err() {
+            return false;
+        }
+        out
+    } else {
+        body.to_vec()
+    };
+    matches!(cfbx::read(&data, policy), Ok(c) if c.nodes.is_empty())
+}
+
 /// 스트림 전체에서 지정한 레코드 헤더(형식, 버전) 모양을 모두 찾는다.
 /// 비정상 컨테이너 속에 숨겨 트리 순회를 피하는 경우까지 잡기 위한 전수 검색이다.
 fn find_headers(d: &[u8], rtype: u16, ver: Option<u16>) -> Vec<Rec> {
@@ -137,15 +179,10 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                 _ => false,
             }
     };
-    if find_headers(&doc, RT_EX_OLE_OBJ_STG, None)
-        .iter()
-        .any(is_ole_storage)
-    {
-        return blocked(
-            "embedded-object",
-            "임베디드 OLE 개체/VBA 저장소가 포함된 PPT 는 안전하게 재조합할 수 없어 차단합니다",
-        );
-    }
+    let storages: Vec<Rec> = find_headers(&doc, RT_EX_OLE_OBJ_STG, None)
+        .into_iter()
+        .filter(|r| is_ole_storage(r) && !storage_is_empty(&doc, r, policy))
+        .collect();
     if !find_headers(&doc, RT_EX_CONTROL, Some(0xF)).is_empty() {
         return blocked(
             "activex",
@@ -153,14 +190,73 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         );
     }
     // VBAInfoContainer 는 대부분 문서에 있으며, 실제 매크로 유무는 원자 레코드의 fHasMacros 로 판단
-    if find_headers(&doc, RT_VBA_INFO_ATOM, None)
+    let vba_flags: Vec<usize> = find_headers(&doc, RT_VBA_INFO_ATOM, None)
         .iter()
-        .any(|r| r.len >= 8 && doc[r.body + 4..r.body + 8] == [1, 0, 0, 0])
-    {
-        return blocked(
-            "macro",
-            "VBA 매크로가 포함된 PPT 는 안전하게 재조합할 수 없어 차단합니다",
-        );
+        .filter(|r| r.len >= 8 && doc[r.body + 4..r.body + 8] == [1, 0, 0, 0])
+        .map(|r| r.body + 4)
+        .collect();
+    if !storages.is_empty() || !vba_flags.is_empty() {
+        if !policy.neutralize_embedded_ole {
+            let (cat, why) = if vba_flags.is_empty() {
+                ("embedded-object", "임베디드 OLE 개체가 포함된 PPT 는 차단합니다 (--neutralize-ole 로 빈 개체 대체 가능)")
+            } else {
+                (
+                    "macro",
+                    "VBA 매크로가 포함된 PPT 는 차단합니다 (--neutralize-ole 로 빈 개체 대체 가능)",
+                )
+            };
+            return blocked(cat, why);
+        }
+        // 정상 트리의 최상위 영구 객체만 덮어쓴다. 비정상 위치에서만 발견되면 은닉 시도로 보고 차단
+        let top: HashSet<usize> = top_level(&doc)
+            .into_iter()
+            .filter(|r| r.rtype == RT_EX_OLE_OBJ_STG)
+            .map(|r| r.body)
+            .collect();
+        let replacement = empty_storage()?;
+        for r in &storages {
+            if !top.contains(&r.body) {
+                return blocked(
+                    "embedded-object",
+                    "레코드 구조 밖에 숨겨진 OLE 저장소가 있어 차단합니다",
+                );
+            }
+            let body = if r.instance == 1 {
+                replacement.compressed.clone()
+            } else {
+                replacement.raw.clone()
+            };
+            if body.len() > r.len {
+                return blocked(
+                    "embedded-object",
+                    "OLE 개체 자리가 작아 빈 개체로 대체할 수 없어 차단합니다",
+                );
+            }
+            doc[r.body..r.body + body.len()].copy_from_slice(&body);
+            doc[r.body + body.len()..r.body + r.len].fill(0);
+        }
+        for at in &vba_flags {
+            doc[*at..*at + 4].copy_from_slice(&[0; 4]);
+        }
+        if !storages.is_empty() {
+            findings.add(
+                "embedded-object",
+                Severity::High,
+                format!(
+                    "임베디드 OLE/VBA 저장소 {}개를 빈 개체로 대체(미리보기 그림 유지)",
+                    storages.len()
+                ),
+                "PowerPoint Document",
+            );
+        }
+        if !vba_flags.is_empty() {
+            findings.add(
+                "macro",
+                Severity::Critical,
+                "VBA 매크로 제거(매크로 표시 해제, 저장소는 빈 개체로 대체)",
+                "PowerPoint Document",
+            );
+        }
     }
 
     // 하이퍼링크 대상 수집 (트리 순회)

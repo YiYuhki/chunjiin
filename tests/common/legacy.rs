@@ -212,6 +212,7 @@ pub fn xls(sheet_type: u8, extra: &[Vec<u8>]) -> Vec<u8> {
     wb.extend(biff(0x000A, &[]));
     cfb(&[
         ("Workbook", &wb),
+        ("MBD0001A2B3/\u{1}Ole10Native", b"MZ embedded payload"),
         ("_VBA_PROJECT_CUR/VBA/dir", b"vba"),
         ("\u{5}SummaryInformation", b"author"),
     ])
@@ -255,8 +256,16 @@ pub fn ppt(with_ole: bool) -> Vec<u8> {
     inner.extend(interactive(3, 0)); // 슬라이드 이동
     let mut doc = ppt_rec(0xF, 0, 0x03E8, &inner);
     if with_ole {
-        let mut body = 100u32.to_le_bytes().to_vec();
-        body.extend_from_slice(&[0x78, 0x9C, 1, 2, 3, 4]);
+        // 실제와 같은 형태: 원본 크기 + zlib(OLE 복합 파일)
+        let payload = vec![b'A'; 4000];
+        let storage = cfb(&[
+            ("\u{1}Ole10Native", &payload),
+            ("Package", b"MZ\x90\x00 payload"),
+        ]);
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::none());
+        z.write_all(&storage).unwrap();
+        let mut body = (storage.len() as u32).to_le_bytes().to_vec();
+        body.extend(z.finish().unwrap());
         doc.extend(ppt_rec(0, 1, 0x1011, &body));
     }
     cfb(&[

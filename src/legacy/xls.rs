@@ -33,20 +33,41 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     };
     let (stream_name, wb) = (node.path.as_str(), node.data.as_slice());
 
-    for n in &c.nodes {
-        let top = n.path.split('/').next().unwrap_or("");
-        if top.starts_with("MBD") {
-            return blocked(
+    // 임베디드 OLE 개체(MBD* 저장소): 내용이 있으면 차단하거나(기본) 빈 저장소로 대체
+    let mut mbd: Vec<(String, [u8; 16])> = Vec::new();
+    for n in c
+        .nodes
+        .iter()
+        .filter(|n| n.is_storage && !n.path.contains('/') && n.path.starts_with("MBD"))
+    {
+        let has_children = c
+            .nodes
+            .iter()
+            .any(|x| x.path.starts_with(&format!("{}/", n.path)));
+        if has_children {
+            if !policy.neutralize_embedded_ole {
+                return blocked(
+                    "embedded-object",
+                    "임베디드 OLE 개체가 포함된 XLS 는 차단합니다 (--neutralize-ole 로 빈 개체 대체 가능)",
+                );
+            }
+            findings.add(
                 "embedded-object",
-                "임베디드 OLE 개체가 포함된 XLS 는 안전하게 재조합할 수 없어 차단합니다",
+                Severity::High,
+                "임베디드 OLE 개체를 빈 개체로 대체(미리보기 그림 유지)",
+                n.path.as_str(),
             );
         }
-        if top == "Ctls" {
-            return blocked(
-                "activex",
-                "ActiveX 컨트롤이 포함된 XLS 는 안전하게 재조합할 수 없어 차단합니다",
-            );
-        }
+        mbd.push((n.path.clone(), n.clsid));
+    }
+    if c.nodes
+        .iter()
+        .any(|n| n.path.split('/').next() == Some("Ctls"))
+    {
+        return blocked(
+            "activex",
+            "ActiveX 컨트롤이 포함된 XLS 는 안전하게 재조합할 수 없어 차단합니다",
+        );
     }
 
     // BIFF 레코드 검사
@@ -163,6 +184,14 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                 data: n.data.clone(),
             });
         }
+    }
+    for (path, clsid) in &mbd {
+        out.push(Node {
+            path: path.clone(),
+            is_storage: true,
+            clsid: *clsid,
+            data: Vec::new(),
+        });
     }
     if let Some(d) = c.stream("\u{1}CompObj") {
         out.push(Node {

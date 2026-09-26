@@ -38,6 +38,10 @@ pub struct Policy {
     pub raster_dpi: f32,
     /// 래스터화 JPEG 품질(1~100)
     pub raster_jpeg_quality: u8,
+
+    /// 레거시 PPT/XLS 의 임베디드 OLE 개체(와 PPT VBA 저장소)를 차단하지 않고
+    /// 빈 개체로 대체한다. 미리보기 그림은 유지된다. (Office 에서의 동작은 문서에 따라 다를 수 있음)
+    pub neutralize_embedded_ole: bool,
 }
 
 impl Default for Policy {
@@ -59,6 +63,7 @@ impl Default for Policy {
             pdf_rasterize: false,
             raster_dpi: 150.0,
             raster_jpeg_quality: 85,
+            neutralize_embedded_ole: false,
         }
     }
 }
