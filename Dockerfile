@@ -1,11 +1,12 @@
-FROM python:3.12-slim
-
-WORKDIR /app
-COPY pyproject.toml README.md ./
+FROM rust:1-slim AS build
+WORKDIR /src
+COPY Cargo.toml Cargo.lock ./
 COPY src ./src
-RUN pip install --no-cache-dir ".[api]" \
-    && useradd --system --no-create-home cdr
+RUN cargo build --release --locked
 
+FROM debian:bookworm-slim
+RUN useradd --system --no-create-home cdr
+COPY --from=build /src/target/release/cdr /usr/local/bin/cdr
 USER cdr
-EXPOSE 8080
-CMD ["uvicorn", "cdr.api:app", "--host", "0.0.0.0", "--port", "8080"]
+ENTRYPOINT ["cdr"]
+CMD ["--help"]

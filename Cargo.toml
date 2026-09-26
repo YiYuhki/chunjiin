@@ -1,0 +1,30 @@
+[package]
+name = "cdr"
+version = "0.1.0"
+edition = "2021"
+description = "CDR (Content Disarm & Reconstruction) - 오피스/PDF 문서 재조합 엔진"
+license = "MIT"
+
+[lib]
+name = "cdr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cdr"
+path = "src/main.rs"
+
+[dependencies]
+lopdf = "0.45"
+quick-xml = "0.42"
+zip = { version = "2", default-features = false, features = ["deflate"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+panic = "unwind"
