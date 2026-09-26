@@ -414,3 +414,59 @@ fn ppt_pictures_are_reencoded_and_references_patched() {
     let again = Engine::default().process(r.output.as_ref().unwrap(), "a.ppt");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
+
+/// OfficeArt PNG 그림 레코드 (식별자 16 + 태그 1 + PNG)
+fn png_blip(png: &[u8]) -> Vec<u8> {
+    let mut body = vec![0xCD; 16];
+    body.push(0xFF);
+    body.extend(png);
+    ppt_rec(0, 0x6E0, 0xF01E, &body)
+}
+
+#[test]
+fn doc_and_xls_pictures_are_reencoded_in_place() {
+    let png = common::png_with_payload();
+    let blip = png_blip(&png);
+
+    // doc: Data 스트림 안의 그림 (앞뒤에 다른 데이터)
+    let mut data = b"PICF-HEADER-PLACEHOLDER".to_vec();
+    data.extend(&blip);
+    data.extend(b"TAIL");
+    let mut streams = read_cfb(&malicious_doc(1 << 9));
+    streams.push(("Data".into(), data.clone()));
+    let refs: Vec<(&str, &[u8])> = streams
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    let r = Engine::default().process(&cfb(&refs), "a.doc");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let out = read_cfb(r.output.as_ref().unwrap());
+    let new_data = stream(&out, "Data").unwrap();
+    assert_eq!(new_data.len(), data.len(), "길이(오프셋) 보존");
+    assert!(new_data.starts_with(b"PICF-HEADER-PLACEHOLDER") && new_data.ends_with(b"TAIL"));
+    assert!(!contains(new_data, b"<?php"));
+    let img_at = 23 + 8 + 17;
+    image::load_from_memory(&new_data[img_at..new_data.len() - 4]).expect("재인코딩된 PNG");
+
+    // xls: 그리기 그룹 레코드 안의 그림은 재인코딩, 레코드 경계를 넘는 그림은 건드리지 않음
+    let mut spanning = biff(0x00EB, &blip[..blip.len() / 2]);
+    spanning.extend(biff(0x003C, &blip[blip.len() / 2..]));
+    let src = xls(0, &[biff(0x00EB, &blip), spanning.clone()]);
+    let r = neutralizing().process(&src, "a.xls");
+    assert_eq!(r.status, Status::Sanitized, "{}", r.reason);
+    let before = stream(&read_cfb(&src), "Workbook").unwrap().to_vec();
+    let wb = stream(&read_cfb(r.output.as_ref().unwrap()), "Workbook")
+        .unwrap()
+        .to_vec();
+    assert_eq!(wb.len(), before.len());
+    let first = before.windows(4).position(|w| w == b"<?ph").unwrap();
+    assert!(
+        !contains(&wb[..first + 16], b"<?php"),
+        "레코드 안의 그림은 재조합"
+    );
+    assert!(contains(&wb, &spanning), "경계를 넘는 그림은 원본 유지");
+    assert_eq!(
+        r.findings.iter().filter(|f| f.category == "image").count(),
+        0
+    );
+}

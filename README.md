@@ -91,8 +91,8 @@ OLE 복합 파일(CFB)은 **새 컨테이너를 만들어 허용된 스트림만
 | 형식 | 조립하는 것 | 조립하지 않음 / 무력화 | 차단 |
 |---|---|---|---|
 | **HWP 5.x** | FileHeader(속성 비트 정리), DocInfo, BodyText, 래스터 이미지 BinData(재인코딩), 미리보기 | 문서 스크립트(JScript), **EPS/PostScript**, OLE, DocOptions(연결 문서·DRM·서명), XMLTemplate, 문서 이력. 레코드 재구성으로 외부 파일 연결(BIN_DATA LINK) 경로와 허용되지 않은 하이퍼링크 필드 제거 | 암호, 배포용, DRM, 인증서 암호화 |
-| **doc** | WordDocument, 사용 중인 테이블 스트림, Data, CompObj | VBA(Macros), ObjectPool(OLE, 미리보기 그림은 유지), 사용하지 않는 테이블 스트림(이전 편집 잔재), MsoDataStore. FIB의 명령 사용자 지정·매크로 이름·**첨부 서식 파일 연결** 제거. 조각 테이블을 따라 **DDE/INCLUDE*/LINK/위험 HYPERLINK 필드 코드를 같은 길이 공백으로 덮어씀** | 암호화, Word 6/95 |
-| **xls** | Workbook, 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록. 하이퍼링크(HLINK) 레코드를 구조대로 해석해 허용되지 않은 대상(URL·파일 모니커)만 제자리에서 공백으로 덮어씀(표시 문자열은 유지). `--neutralize-ole` 사용 시 임베디드 OLE(MBD*)를 빈 저장소로 대체 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, ActiveX, 외부 요청 함수(`WEBSERVICE`/`FILTERXML`/`IMAGE`), 임베디드 OLE(기본값) |
+| **doc** | WordDocument, 사용 중인 테이블 스트림, Data(그림 제자리 재인코딩), CompObj | VBA(Macros), ObjectPool(OLE, 미리보기 그림은 유지), 사용하지 않는 테이블 스트림(이전 편집 잔재), MsoDataStore. FIB의 명령 사용자 지정·매크로 이름·**첨부 서식 파일 연결** 제거. 조각 테이블을 따라 **DDE/INCLUDE*/LINK/위험 HYPERLINK 필드 코드를 같은 길이 공백으로 덮어씀** | 암호화, Word 6/95 |
+| **xls** | Workbook(그림 제자리 재인코딩), 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록. 하이퍼링크(HLINK) 레코드를 구조대로 해석해 허용되지 않은 대상(URL·파일 모니커)만 제자리에서 공백으로 덮어씀(표시 문자열은 유지). `--neutralize-ole` 사용 시 임베디드 OLE(MBD*)를 빈 저장소로 대체 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, ActiveX, 외부 요청 함수(`WEBSERVICE`/`FILTERXML`/`IMAGE`), 임베디드 OLE(기본값) |
 | **ppt** | PowerPoint Document, Current User, **Pictures(재조합)**, CompObj | 매크로·프로그램 실행·OLE 동작을 "동작 없음"으로, 위험 하이퍼링크 대상(상대 경로 포함)을 공백으로 바꿈(제자리). 압축 여부와 관계없이 임베디드 개체를 인식. 그림 스트림은 새로 만들고(JPEG/PNG/DIB 재인코딩, 그림 목록이 가리키지 않는 데이터 제거, 손상된 그림은 빈 그림으로 대체) 본문 그림 목록(FBSE)의 위치·크기 필드만 제자리에서 고침. `--neutralize-ole` 사용 시 OLE/VBA 저장소를 같은 자리의 빈 OLE 파일로 덮어쓰고 매크로 표시를 끔 | 암호화, ActiveX, PowerPoint 95, 임베디드 OLE/VBA(기본값), 레코드 구조 밖에 숨긴 저장소 |
 
 `--neutralize-ole`은 개체 **내용만** 비웁니다. 슬라이드와 시트에 저장된 미리보기 그림은 그대로 남습니다. PPT는 정상 레코드 트리의 최상위 영구 객체만 덮어쓰고, 전수 검색에서만 발견되는 저장소는 은닉 시도로 보고 차단합니다.
@@ -316,7 +316,7 @@ CDR_FUZZ_ITERS=2000 cargo test --release --test robustness
 
 - 레거시 형식에서 떼어낼 수 없는 능동 콘텐츠(XLS의 Excel 4.0 매크로 시트, ActiveX 등)는 차단합니다. 임베디드 OLE는 기본값이 차단이며 `--neutralize-ole`로 빈 개체로 대체할 수 있습니다. 필요하면 격리 환경에서 OOXML/HWPX로 변환한 뒤 재조합하십시오.
 - XLS에서 VBA 저장소를 빼도 워크북의 VBA 표시 레코드(OBPROJ)는 남습니다(오프셋 보존). 매크로 본체는 없습니다.
-- doc/xls 이미지(Data 스트림, 그리기 그룹)와 PPT 메타파일(EMF/WMF/PICT), PDF의 Type1(FontFile) 글꼴 프로그램은 재인코딩하지 않고 그대로 옮깁니다. PDF CFF 글꼴은 구조를 새로 쓰지는 않지만 전 글리프를 검증한 뒤 옮깁니다. PPT 래스터 그림은 재조합합니다(POI 테스트 문서 117건에서 그림 수·형식·크기·슬라이드 참조와 텍스트가 원본과 동일, 원본에서도 깨져 있던 PNG 1개만 빈 그림으로 대체).
+- doc/xls의 래스터 그림(JPEG/PNG)은 **제자리에서** 재인코딩합니다. 오프셋이 얽혀 있어 스트림을 다시 쓸 수 없으므로, 새 인코딩을 원래 자리에 쓰고 남는 공간은 0으로 채웁니다(레코드 길이·오프셋 불변). 자리에 맞추기 위해 색상표 PNG(1~8비트), 색 형식 축소(불투명→알파 제거, 무채색→회색조), 행별 적응 필터, JPEG 품질 단계 조정을 차례로 시도합니다. POI 테스트 문서에서 doc 그림 92개 중 90개, xls는 한 레코드 안의 그림 60개 중 53개를 재조합했고, 그림 수·형식·크기와 텍스트는 원본과 같았습니다. 새 인코딩이 자리에 들어가지 않는 그림, xls에서 CONTINUE 레코드로 나뉜 큰 그림, 메타파일(EMF/WMF/PICT)과 DIB, PDF의 Type1(FontFile) 글꼴 프로그램은 원본 그대로 옮깁니다(`images_kept_original` 통계). PDF CFF 글꼴은 구조를 새로 쓰지는 않지만 전 글리프를 검증한 뒤 옮깁니다. PPT 래스터 그림은 재조합합니다(POI 테스트 문서 117건에서 그림 수·형식·크기·슬라이드 참조와 텍스트가 원본과 동일, 원본에서도 깨져 있던 PNG 1개만 빈 그림으로 대체).
 - 검증은 실제 문서와 독립 파서로 했습니다. MS Office와 한컴오피스에서 직접 열어 보는 확인은 하지 않았습니다.
   - HWPX 49종: hwpxlib로 49/49 읽기·쓰기 성공, 본문 텍스트 동일
   - HWP 42종: hwplib로 42/42 읽기·쓰기 성공, 본문 텍스트 동일

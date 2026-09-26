@@ -223,12 +223,21 @@ fn fuzz_legacy() {
     run("b.hwp", 8, legacy::malicious_hwp(0), mutate_cfb);
     run("a.doc", 9, legacy::malicious_doc(1 << 9), mutate_cfb);
     // 기본 정책은 임베디드 OLE 가 있으면 차단하므로, 대체 모드로 BIFF 해석까지 도달시킨다
-    let neutralizing = Engine::new(Policy {
-        neutralize_embedded_ole: true,
-        ..Policy::default()
-    });
+    let neutralizing = || {
+        Engine::new(Policy {
+            neutralize_embedded_ole: true,
+            ..Policy::default()
+        })
+    };
     run_with(
-        neutralizing,
+        neutralizing(),
+        "p.xls",
+        18,
+        legacy::xls_with_picture(),
+        mutate_cfb,
+    );
+    run_with(
+        neutralizing(),
         "a.xls",
         10,
         legacy::xls(0, &[legacy::obproj()]),

@@ -79,6 +79,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     let mut auto_names = 0u32;
     let mut external_books = 0u32;
     let mut hlink_bodies: Vec<(usize, usize)> = Vec::new();
+    // 모든 BIFF 레코드 본문 구간 (그림 제자리 재인코딩이 레코드 경계를 넘지 않게)
+    let mut bodies: Vec<(usize, usize)> = Vec::new();
     while pos + 4 <= wb.len() {
         let rt = u16::from_le_bytes([wb[pos], wb[pos + 1]]);
         let len = u16::from_le_bytes([wb[pos + 2], wb[pos + 3]]) as usize;
@@ -86,6 +88,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             return blocked("structure", "BIFF 레코드 길이 오류");
         };
         let body_at = pos + 4;
+        bodies.push((body_at, body_at + len));
         pos += 4 + len;
         records += 1;
         match rt {
@@ -219,6 +222,15 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             stream_name,
         );
     }
+
+    // 그리기 그룹의 그림(OfficeArt BLIP): 한 BIFF 레코드 안에 온전히 들어 있는 것만 제자리 재인코딩
+    // (CONTINUE 레코드로 나뉜 큰 그림은 레코드 헤더가 중간에 끼어 있어 원본 유지)
+    let within_record = |s: usize, e: usize| {
+        let i = bodies.partition_point(|&(b, _)| b <= s);
+        i > 0 && e <= bodies[i - 1].1
+    };
+    let stats = super::blip::reencode_in_place(&mut wb_out, policy, &within_record);
+    super::blip::report(&stats, findings, stream_name);
 
     // 새 컨테이너 조립
     let mut out = vec![Node {

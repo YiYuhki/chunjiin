@@ -344,6 +344,10 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         );
     }
 
+    // 그림(OfficeArt BLIP): 오프셋을 보존하며 제자리에서 재인코딩 (떠 있는 그림은 WordDocument, 인라인 그림은 Data)
+    let stats = super::blip::reencode_in_place(&mut doc, policy, &|_, _| true);
+    super::blip::report(&stats, findings, "WordDocument");
+
     // 새 컨테이너 조립
     let mut out = vec![
         Node {
@@ -361,11 +365,16 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     ];
     for keep in ["Data", "\u{1}CompObj"] {
         if let Some(d) = c.stream(keep) {
+            let mut data = d.to_vec();
+            if keep == "Data" {
+                let stats = super::blip::reencode_in_place(&mut data, policy, &|_, _| true);
+                super::blip::report(&stats, findings, "Data");
+            }
             out.push(Node {
                 path: keep.into(),
                 is_storage: false,
                 clsid: [0; 16],
-                data: d.to_vec(),
+                data,
             });
         }
     }

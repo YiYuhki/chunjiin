@@ -306,3 +306,14 @@ pub fn ppt_with_pictures() -> Vec<u8> {
         ("Pictures", &pictures),
     ])
 }
+
+/// 그리기 그룹 레코드에 PNG 그림을 가진 XLS
+pub fn xls_with_picture() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbImage::from_pixel(6, 5, image::Rgb([200, 10, 90]))
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let mut body = vec![0u8; 17];
+    body.extend(&png);
+    xls(0, &[biff(0x00EB, &ppt_rec(0, 0x6E0, 0xF01E, &body))])
+}
