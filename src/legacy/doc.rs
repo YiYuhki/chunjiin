@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use super::cfbx::{self, Node};
 use crate::error::{blocked, Result};
-use crate::ooxml::content::{field_is_dangerous, truncate};
+use crate::ooxml::content::{truncate, word_field_is_dangerous};
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
 
@@ -111,7 +111,8 @@ fn read_chars(doc: &[u8], table: &[u8], fc_clx: usize, lcb_clx: usize) -> Option
         let fc = (fc_raw & 0x3FFF_FFFF) as usize;
         let (base, width) = if compressed { (fc / 2, 1) } else { (fc, 2) };
         let len = cp1.checked_sub(cp0)?;
-        if chars.len() + len > MAX_CHARS {
+        // 정상 문서에서 문자 수는 WordDocument 크기를 넘지 않는다(조각 중복으로 인한 증폭 방지)
+        if chars.len() + len > MAX_CHARS.min(doc.len()) {
             return None;
         }
         for k in 0..len {
@@ -164,9 +165,7 @@ fn dangerous_fields(chars: &[Char], policy: &Policy, reports: &mut Vec<String>) 
             }
             0x15 => {
                 if let Some(f) = stack.pop() {
-                    if field_is_dangerous(&f.code, f.starts_nested)
-                        || hyperlink_is_dangerous(&f.code, policy)
-                    {
+                    if word_field_is_dangerous(&f.code, f.starts_nested, policy) {
                         reports.push(if f.code.trim().is_empty() {
                             "(중첩 필드로 생성된 필드 코드)".into()
                         } else {
@@ -192,46 +191,6 @@ fn dangerous_fields(chars: &[Char], policy: &Policy, reports: &mut Vec<String>) 
         }
     }
     out
-}
-
-fn hyperlink_is_dangerous(code: &str, policy: &Policy) -> bool {
-    // 필드 코드 안의 개체 기준점(0x01) 등 제어 문자는 무시
-    let cleaned: String = code
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
-    let t = cleaned.trim_start();
-    if !t
-        .get(..9)
-        .is_some_and(|s| s.eq_ignore_ascii_case("HYPERLINK"))
-    {
-        return false;
-    }
-    // 스위치(\l 책갈피, \o 도움말 등)의 인수가 아닌 첫 인수가 대상 URL
-    let mut rest = &t[9..];
-    let mut after_switch = false;
-    loop {
-        rest = rest.trim_start();
-        if rest.is_empty() {
-            return false; // 문서 내 이동만 있음
-        }
-        let (token, next) = if let Some(r) = rest.strip_prefix('"') {
-            let end = r.find('"').unwrap_or(r.len());
-            (&r[..end], r.get(end + 1..).unwrap_or(""))
-        } else {
-            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-            (&rest[..end], &rest[end..])
-        };
-        if token.starts_with('\\') && !rest.starts_with('"') {
-            after_switch = true;
-        } else if after_switch {
-            after_switch = false;
-        } else {
-            let url = token.replace("\\\\", "\\");
-            return !url.is_empty() && (!policy.uri_allowed(&url) || policy.remove_hyperlinks);
-        }
-        rest = next;
-    }
 }
 
 /// SttbfAssoc 의 첨부 서식 파일 경로(ibstAssocDot = 1)

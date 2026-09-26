@@ -62,7 +62,7 @@ pub fn inflate(data: &[u8]) -> Vec<u8> {
     out
 }
 
-fn utf16(s: &str) -> Vec<u8> {
+pub fn utf16(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(u16::to_le_bytes).collect()
 }
 
@@ -191,7 +191,7 @@ pub fn malicious_doc(flags: u16) -> Vec<u8> {
 }
 
 // ------------------------------------------------------------------------- XLS
-fn biff(rt: u16, body: &[u8]) -> Vec<u8> {
+pub fn biff(rt: u16, body: &[u8]) -> Vec<u8> {
     let mut v = rt.to_le_bytes().to_vec();
     v.extend_from_slice(&(body.len() as u16).to_le_bytes());
     v.extend_from_slice(body);
@@ -227,7 +227,7 @@ pub fn filepass() -> Vec<u8> {
 }
 
 // ------------------------------------------------------------------------- PPT
-fn ppt_rec(ver: u16, instance: u16, rt: u16, body: &[u8]) -> Vec<u8> {
+pub fn ppt_rec(ver: u16, instance: u16, rt: u16, body: &[u8]) -> Vec<u8> {
     let mut v = ((instance << 4) | ver).to_le_bytes().to_vec();
     v.extend_from_slice(&rt.to_le_bytes());
     v.extend_from_slice(&(body.len() as u32).to_le_bytes());
@@ -235,7 +235,7 @@ fn ppt_rec(ver: u16, instance: u16, rt: u16, body: &[u8]) -> Vec<u8> {
     v
 }
 
-fn interactive(action: u8, link: u32) -> Vec<u8> {
+pub fn interactive(action: u8, link: u32) -> Vec<u8> {
     let mut b = vec![0u8; 16];
     b[4..8].copy_from_slice(&link.to_le_bytes());
     b[8] = action;

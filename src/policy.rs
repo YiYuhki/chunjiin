@@ -12,6 +12,7 @@ pub struct Policy {
 
     /// XML 파싱 제한
     pub max_xml_depth: usize,
+    /// 문서(패키지) 전체의 최대 XML 노드(요소+속성) 수
     pub max_xml_nodes: usize,
 
     /// 이미지 최대 픽셀 수 - 디컴프레션 폭탄 방어

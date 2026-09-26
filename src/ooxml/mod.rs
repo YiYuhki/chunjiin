@@ -81,7 +81,18 @@ fn reassemble_at(
 
     // ---------------------------------------------------------------- 1. 관계 그래프 탐색
     let mut reported: HashSet<String> = HashSet::new();
-    let root_rels = read_rels(&files, "", None, kind, policy, findings, &mut reported)?;
+    // 패키지 전체가 공유하는 XML 노드 예산
+    let mut xml_nodes = 0usize;
+    let root_rels = read_rels(
+        &files,
+        "",
+        None,
+        kind,
+        policy,
+        findings,
+        &mut reported,
+        &mut xml_nodes,
+    )?;
     let main: Vec<&Rel> = root_rels
         .iter()
         .filter(|r| rules::rel_short_name(&r.rtype).map(|s| s.0) == Some("officeDocument"))
@@ -120,9 +131,10 @@ fn reassemble_at(
                 policy,
                 findings,
                 &mut reported,
+                &mut xml_nodes,
             ) {
                 Ok(r) => r,
-                Err(e) if e.category() == "xxe" => return Err(e),
+                Err(e) if matches!(e.category(), "xxe" | "resource") => return Err(e),
                 Err(e) => {
                     findings.add(
                         "structure",
@@ -229,29 +241,31 @@ fn reassemble_at(
                     }
                 }
             }
-            PartType::Xml(_) | PartType::Vml => match xml::parse(data, name, policy) {
-                Ok(doc) if rules::namespace_allowed(&doc.root.ns) => part.xml = Some(doc),
-                Ok(doc) => {
-                    findings.add(
-                        "foreign-xml",
-                        Severity::Low,
-                        format!("허용되지 않은 루트 네임스페이스({}) 파트 제외", doc.root.ns),
-                        name.as_str(),
-                    );
-                    dropped.insert(name.clone());
+            PartType::Xml(_) | PartType::Vml => {
+                match xml::parse_counted(data, name, policy, &mut xml_nodes) {
+                    Ok(doc) if rules::namespace_allowed(&doc.root.ns) => part.xml = Some(doc),
+                    Ok(doc) => {
+                        findings.add(
+                            "foreign-xml",
+                            Severity::Low,
+                            format!("허용되지 않은 루트 네임스페이스({}) 파트 제외", doc.root.ns),
+                            name.as_str(),
+                        );
+                        dropped.insert(name.clone());
+                    }
+                    Err(e) if matches!(e.category(), "xxe" | "resource") => return Err(e),
+                    Err(e) if *name == main_name => return Err(e),
+                    Err(e) => {
+                        findings.add(
+                            "structure",
+                            Severity::Medium,
+                            format!("파트 제외: {e}"),
+                            name.as_str(),
+                        );
+                        dropped.insert(name.clone());
+                    }
                 }
-                Err(e) if e.category() == "xxe" => return Err(e),
-                Err(e) if *name == main_name => return Err(e),
-                Err(e) => {
-                    findings.add(
-                        "structure",
-                        Severity::Medium,
-                        format!("파트 제외: {e}"),
-                        name.as_str(),
-                    );
-                    dropped.insert(name.clone());
-                }
-            },
+            }
         }
     }
     if dropped.contains(&main_name) {
@@ -374,6 +388,7 @@ fn internal_target(r: &Rel) -> Option<String> {
 }
 
 /// 소스 파트의 관계 파일을 읽고 허용 목록으로 걸러낸다.
+#[allow(clippy::too_many_arguments)]
 fn read_rels(
     files: &HashMap<String, Entry>,
     source: &str,
@@ -382,6 +397,7 @@ fn read_rels(
     policy: &Policy,
     findings: &mut Findings,
     reported: &mut HashSet<String>,
+    xml_nodes: &mut usize,
 ) -> Result<Vec<Rel>> {
     let from_root = source.is_empty();
     let path = rels_path(source);
@@ -391,7 +407,7 @@ fn read_rels(
         }
         return Ok(Vec::new());
     };
-    let doc = xml::parse(&entry.data, &path, policy)?;
+    let doc = xml::parse_counted(&entry.data, &path, policy, xml_nodes)?;
     if !(doc.root.local == "Relationships" && doc.root.ns == PKG_REL_NS) {
         return Err(CdrError::Blocked {
             category: "structure",

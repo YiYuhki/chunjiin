@@ -46,10 +46,16 @@ pub struct Record {
     pub data: Vec<u8>,
 }
 
+/// 한 스트림에서 허용하는 최대 레코드 수 (빈 레코드 남발로 인한 메모리 증폭 방지)
+const MAX_RECORDS: usize = 4_000_000;
+
 pub fn parse_records(buf: &[u8]) -> Option<Vec<Record>> {
     let mut out = Vec::new();
     let mut pos = 0usize;
     while pos < buf.len() {
+        if out.len() >= MAX_RECORDS {
+            return None;
+        }
         let h = u32::from_le_bytes(buf.get(pos..pos + 4)?.try_into().ok()?);
         pos += 4;
         let tag = (h & 0x3FF) as u16;

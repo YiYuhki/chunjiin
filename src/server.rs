@@ -30,8 +30,12 @@ pub struct AppState {
     policy: Arc<Policy>,
     /// CPU 집약 작업 동시 실행 수 제한 (자원 고갈 방지)
     permits: Arc<Semaphore>,
+    /// 동시에 메모리에 올려 둘 수 있는 업로드 수 제한
+    uploads: Arc<Semaphore>,
     timeout: Duration,
     auditor: Arc<Auditor>,
+    /// 요청 파라미터로 정책을 완화(래스터화 해제, 링크 유지, 메타데이터 유지, OLE 대체)할 수 있는지
+    allow_relax: bool,
 }
 
 impl AppState {
@@ -39,9 +43,17 @@ impl AppState {
         AppState {
             policy: Arc::new(policy),
             permits: Arc::new(Semaphore::new(concurrency.max(1))),
+            uploads: Arc::new(Semaphore::new(concurrency.max(1) * 2)),
             timeout,
             auditor: Arc::new(Auditor::disabled()),
+            allow_relax: false,
         }
+    }
+
+    /// 요청 파라미터로 운영 정책을 완화하는 것을 허용한다(기본: 강화만 허용).
+    pub fn with_request_relaxation(mut self, allow: bool) -> Self {
+        self.allow_relax = allow;
+        self
     }
 
     /// 감사 로그/격리 보관을 켠다. 기록에 실패한 요청은 결과를 내주지 않는다(fail-closed).
@@ -103,8 +115,65 @@ async fn run(
     state: &AppState,
     opts: &Options,
     source: String,
-    mut multipart: Multipart,
+    multipart: Multipart,
 ) -> Result<(CdrResult, Option<String>), Box<Response>> {
+    // 업로드를 메모리에 올리기 전에 자리를 확보하고, 수신 자체에도 시간 제한을 둔다
+    let Ok(_upload) = state.uploads.clone().acquire_owned().await else {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "서버 종료 중"));
+    };
+    let (name, data) = match tokio::time::timeout(state.timeout, read_upload(multipart)).await {
+        Ok(r) => r?,
+        Err(_) => return Err(fail(StatusCode::REQUEST_TIMEOUT, "업로드 수신 시간 초과")),
+    };
+    let policy = effective_policy(&state.policy, opts, state.allow_relax);
+
+    // 처리 허가는 작업 스레드가 끝날 때까지 쥐고 있어야 한다. 시간 초과로 응답이 먼저 나가도
+    // 작업은 계속 돌기 때문에, 허가를 여기서 놓으면 동시 처리 한도가 무너진다.
+    let Ok(permit) = state.permits.clone().acquire_owned().await else {
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "서버 종료 중"));
+    };
+    drop(_upload);
+    let auditor = state.auditor.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let started = std::time::Instant::now();
+        let r = Engine::new(policy.clone()).process(&data, &name);
+        let audit = auditor
+            .is_enabled()
+            .then(|| auditor.record(&r, &data, &source, &policy, started.elapsed()));
+        (r, audit)
+    });
+    match tokio::time::timeout(state.timeout, task).await {
+        Ok(Ok((r, None))) => Ok((r, None)),
+        Ok(Ok((r, Some(Ok(rec))))) => Ok((r, Some(rec.event_id))),
+        Ok(Ok((_, Some(Err(e))))) => Err(fail(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("감사 기록 실패로 결과를 제공하지 않습니다: {e}"),
+        )),
+        Ok(Err(_)) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "처리 중 내부 오류")),
+        Err(_) => Err(fail(StatusCode::SERVICE_UNAVAILABLE, "처리 시간 초과")),
+    }
+}
+
+/// 요청 파라미터를 반영한 정책. 완화가 허용되지 않으면 더 엄격해지는 방향만 받아들인다.
+fn effective_policy(base: &Policy, opts: &Options, allow_relax: bool) -> Policy {
+    let mut policy = base.clone();
+    if let Some(v) = opts.dpi {
+        policy.raster_dpi = v.clamp(36.0, 300.0);
+    }
+    let apply = |current: bool, requested: Option<bool>, stricter: bool| match requested {
+        Some(v) if allow_relax || v == stricter => v,
+        _ => current,
+    };
+    policy.pdf_rasterize = apply(policy.pdf_rasterize, opts.rasterize, true);
+    policy.remove_hyperlinks = apply(policy.remove_hyperlinks, opts.remove_links, true);
+    policy.strip_metadata = apply(policy.strip_metadata, opts.keep_metadata.map(|k| !k), true);
+    policy.neutralize_embedded_ole =
+        apply(policy.neutralize_embedded_ole, opts.neutralize_ole, false);
+    policy
+}
+
+async fn read_upload(mut multipart: Multipart) -> Result<(String, Vec<u8>), Box<Response>> {
     let mut file: Option<(String, Vec<u8>)> = None;
     loop {
         match multipart.next_field().await {
@@ -130,49 +199,7 @@ async fn run(
             }
         }
     }
-    let Some((name, data)) = file else {
-        return Err(fail(StatusCode::BAD_REQUEST, "'file' 필드가 없습니다"));
-    };
-
-    let mut policy = (*state.policy).clone();
-    if let Some(v) = opts.rasterize {
-        policy.pdf_rasterize = v;
-    }
-    if let Some(v) = opts.dpi {
-        policy.raster_dpi = v.clamp(36.0, 300.0);
-    }
-    if let Some(v) = opts.remove_links {
-        policy.remove_hyperlinks = v;
-    }
-    if let Some(v) = opts.keep_metadata {
-        policy.strip_metadata = !v;
-    }
-    if let Some(v) = opts.neutralize_ole {
-        policy.neutralize_embedded_ole = v;
-    }
-
-    let Ok(_permit) = state.permits.clone().acquire_owned().await else {
-        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "서버 종료 중"));
-    };
-    let auditor = state.auditor.clone();
-    let task = tokio::task::spawn_blocking(move || {
-        let started = std::time::Instant::now();
-        let r = Engine::new(policy.clone()).process(&data, &name);
-        let audit = auditor
-            .is_enabled()
-            .then(|| auditor.record(&r, &data, &source, &policy, started.elapsed()));
-        (r, audit)
-    });
-    match tokio::time::timeout(state.timeout, task).await {
-        Ok(Ok((r, None))) => Ok((r, None)),
-        Ok(Ok((r, Some(Ok(rec))))) => Ok((r, Some(rec.event_id))),
-        Ok(Ok((_, Some(Err(e))))) => Err(fail(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("감사 기록 실패로 결과를 제공하지 않습니다: {e}"),
-        )),
-        Ok(Err(_)) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "처리 중 내부 오류")),
-        Err(_) => Err(fail(StatusCode::SERVICE_UNAVAILABLE, "처리 시간 초과")),
-    }
+    file.ok_or_else(|| fail(StatusCode::BAD_REQUEST, "'file' 필드가 없습니다"))
 }
 
 type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
@@ -327,3 +354,54 @@ async function run(kind){
   out.textContent='상태: '+r.headers.get('x-cdr-status')+' / 탐지: '+r.headers.get('x-cdr-findings')+'건 → '+name;
 }
 </script></body></html>"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn opts(q: &str) -> Options {
+        let mut o = Options::default();
+        for kv in q.split('&').filter(|s| !s.is_empty()) {
+            let (k, v) = kv.split_once('=').unwrap();
+            let b = Some(v == "true");
+            match k {
+                "rasterize" => o.rasterize = b,
+                "remove_links" => o.remove_links = b,
+                "keep_metadata" => o.keep_metadata = b,
+                "neutralize_ole" => o.neutralize_ole = b,
+                _ => {}
+            }
+        }
+        o
+    }
+
+    #[test]
+    fn requests_can_only_tighten_by_default() {
+        let base = Policy {
+            pdf_rasterize: true,
+            ..Policy::default()
+        };
+        let p = effective_policy(
+            &base,
+            &opts("rasterize=false&keep_metadata=true&neutralize_ole=true&remove_links=true"),
+            false,
+        );
+        assert!(
+            p.pdf_rasterize,
+            "운영자가 켠 래스터화를 요청으로 끌 수 없음"
+        );
+        assert!(p.strip_metadata, "메타데이터 유지 요청 무시");
+        assert!(!p.neutralize_embedded_ole, "OLE 대체(차단 완화) 요청 무시");
+        assert!(p.remove_hyperlinks, "링크 제거(강화) 요청은 반영");
+
+        let p = effective_policy(
+            &base,
+            &opts("rasterize=false&keep_metadata=true&neutralize_ole=true"),
+            true,
+        );
+        assert!(
+            !p.pdf_rasterize && !p.strip_metadata && p.neutralize_embedded_ole,
+            "완화 허용 시 반영"
+        );
+    }
+}

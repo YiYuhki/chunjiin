@@ -36,10 +36,11 @@
 3. 각 XML 파트를 DOM으로 파싱한 뒤 다시 구성합니다.
    - 표준 OOXML / Microsoft Office 확장 / VML / Dublin Core 네임스페이스만 허용합니다(그 밖의 요소·속성은 버림).
    - 조립되지 않은 파트를 가리키는 `r:id` 참조를 정리합니다(하이퍼링크는 텍스트를 남기고 링크만 풀고, PPT OLE 프레임은 통째로 제거).
-   - Word: DDE / DDEAUTO / INCLUDEPICTURE / INCLUDETEXT / IMPORT / LINK 필드 코드를 비웁니다. 여러 run으로 쪼갠 코드(`DD`+`EAUTO`)와 중첩 필드 난독화도 처리합니다. 첨부 템플릿, docVars, 메일 병합 데이터 원본도 제거합니다.
-   - Excel: DDE 수식(`cmd|'/c calc'!A0`)과 `CALL`, `REGISTER`, `EXEC`, `WEBSERVICE`, `FILTERXML`, `RTD` 수식을 없앱니다(캐시 값은 유지). `Auto_Open` 류 자동 실행 이름도 제거합니다.
+   - Word: DDE / DDEAUTO / INCLUDEPICTURE / INCLUDETEXT / IMPORT / LINK / DATABASE / RD 필드 코드와, 허용되지 않은 대상(UNC·`file:` 등)을 가리키는 HYPERLINK 필드를 비웁니다. 여러 run으로 쪼갠 코드(`DD`+`EAUTO`)와 중첩 필드 난독화도 처리합니다. 첨부 템플릿, docVars, 메일 병합 데이터 원본도 제거합니다.
+   - Excel: DDE 수식(`cmd|'/c calc'!A0`)과 `CALL`, `REGISTER`, `EXEC`, `WEBSERVICE`, `FILTERXML`, `RTD` 수식, 허용되지 않은 대상의 `HYPERLINK`/`IMAGE` 수식을 없앱니다(캐시 값은 유지). 셀 수식뿐 아니라 이름 정의, 조건부 서식(`cfRule`), 데이터 유효성 검사 수식도 검사하며, 해당 규칙은 통째로 제거합니다. `Auto_Open` 류 자동 실행 이름도 제거합니다.
    - PowerPoint: `ppaction://program`, `macro`, `ole` 실행 액션을 제거합니다.
-   - 외부 경로(`file:`, `http:`, UNC, `ms-*:` 프로토콜 핸들러 등)를 가리키는 속성, `xml:base`, `HyperlinkBase`를 제거합니다.
+   - 외부 경로를 가리키는 속성, `xml:base`, `HyperlinkBase`를 제거합니다. 외부 여부는 문자열 패턴이 아니라 구조로 판단합니다: 계층형 URI(`스킴://`), UNC(`\\`, `//`, `/\` 혼용 포함), 드라이브 경로, `ms-*:`·`search-ms:`·`mhtml:` 등 프로토콜 핸들러.
+   - XML 노드 수 제한(`max_xml_nodes`)은 파트별이 아니라 **문서 전체 합계**에 적용합니다(작은 파트 여러 개로 한도를 나눠 쓰는 우회 방지).
    - DTD/DOCTYPE이 들어 있으면 문서를 차단합니다(XXE, Billion laughs).
 4. 이미지는 픽셀만 디코딩해 새로 인코딩합니다(메타데이터·덧붙은 데이터·폴리글롯 제거). EMF/WMF/SVG/TIFF는 조립하지 않습니다.
 5. 차트의 원본 데이터 통합 문서(내장 xlsx)는 **같은 엔진으로 재귀 재조합**해서 보존합니다.
@@ -51,7 +52,8 @@
 2. **빈 PDF 문서를 새로 만듭니다.**
 3. 각 페이지의 콘텐츠 스트림을 연산자 단위로 파싱합니다. 허용 목록(경로·색·텍스트·이미지·셰이딩 등 표준 그리기 연산자)에 있는 연산자만 다시 인코딩하고, q/Q·BT/ET·BMC/EMC 균형을 보정합니다.
 4. 페이지가 쓰는 리소스(글꼴·이미지·그래픽 상태·색공간·패턴·셰이딩)만 옮겨 담습니다. 이때 액션·스크립트·첨부·외부 참조 키는 복사하지 않습니다.
-   - 폼 XObject, 타일링 패턴, Type3 글리프의 콘텐츠도 같은 방식으로 재구성합니다.
+   - 폼 XObject, 타일링 패턴, Type3 글리프의 콘텐츠도 같은 방식으로 재구성합니다. 판정에 쓰는 키(`/Subtype`, `/Filter` 등)가 간접 참조여도 풀어서 판단하고, 같은 객체라도 쓰임(일반/콘텐츠)별로 따로 복사해 캐시를 통한 필터 우회를 막습니다. 글꼴 사전은 정의된 키만 옮깁니다.
+   - 콘텐츠 스트림은 해석 전에 토큰 수를 세어 스트림당 400만, 문서 전체 4천만을 넘으면 차단합니다(작은 압축 스트림으로 메모리를 고갈시키는 공격 방어).
    - Flate/LZW/ASCII/RunLength 스트림은 풀어서 다시 압축합니다. JPEG은 형식을 검증합니다.
    - JBIG2/JPX 이미지는 코덱 취약점 위험 때문에 조립하지 않습니다.
 5. 주석과 폼 필드는 외형(appearance)을 페이지 본문에 **평면화**합니다. 링크는 허용된 URI와 문서 안 페이지 이동만 새로 만듭니다.
@@ -73,7 +75,7 @@
 3. 본문을 이렇게 재구성합니다.
    - `hp:ole`와 `hp:video`를 제거합니다.
    - 제외된 바이너리를 가리키는 그림은 제거하고, 임베디드 글꼴 참조는 해제합니다.
-   - 허용되지 않은 하이퍼링크 필드(`file:`, UNC 등)는 대상을 비웁니다. 한컴 형식(`http\://…;1;0;0;`, 스킴 없는 `www.…`)도 해석합니다.
+   - 허용되지 않은 하이퍼링크 필드(`file:`, UNC 등)는 대상을 비웁니다. 한컴 형식(`http\://…;1;0;0;`, 스킴 없는 `www.…`)도 해석합니다. `Path`와 실제 실행되는 `Command`를 모두 검사하고, 하나라도 허용되지 않으면 둘 다 비웁니다.
 4. `mimetype`을 무압축 첫 엔트리로 둔 새 OCF 패키지를 작성합니다. 매니페스트와 `META-INF` 목록은 조립된 파일에 맞게 정리합니다.
 
 ### 레거시 바이너리 문서 (HWP 5.x / doc / xls / ppt)
@@ -88,8 +90,8 @@ OLE 복합 파일(CFB)은 **새 컨테이너를 만들어 허용된 스트림만
 |---|---|---|---|
 | **HWP 5.x** | FileHeader(속성 비트 정리), DocInfo, BodyText, 래스터 이미지 BinData(재인코딩), 미리보기 | 문서 스크립트(JScript), **EPS/PostScript**, OLE, DocOptions(연결 문서·DRM·서명), XMLTemplate, 문서 이력. 레코드 재구성으로 외부 파일 연결(BIN_DATA LINK) 경로와 허용되지 않은 하이퍼링크 필드 제거 | 암호, 배포용, DRM, 인증서 암호화 |
 | **doc** | WordDocument, 사용 중인 테이블 스트림, Data, CompObj | VBA(Macros), ObjectPool(OLE, 미리보기 그림은 유지), 사용하지 않는 테이블 스트림(이전 편집 잔재), MsoDataStore. FIB의 명령 사용자 지정·매크로 이름·**첨부 서식 파일 연결** 제거. 조각 테이블을 따라 **DDE/INCLUDE*/LINK/위험 HYPERLINK 필드 코드를 같은 길이 공백으로 덮어씀** | 암호화, Word 6/95 |
-| **xls** | Workbook, 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록. `--neutralize-ole` 사용 시 임베디드 OLE(MBD*)를 빈 저장소로 대체 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, ActiveX, 임베디드 OLE(기본값) |
-| **ppt** | PowerPoint Document, Current User, Pictures, CompObj | 매크로·프로그램 실행·OLE 동작을 "동작 없음"으로, 위험 하이퍼링크 대상을 공백으로 바꿈(제자리). `--neutralize-ole` 사용 시 OLE/VBA 저장소를 같은 자리의 빈 OLE 파일로 덮어쓰고 매크로 표시를 끔 | 암호화, ActiveX, PowerPoint 95, 임베디드 OLE/VBA(기본값), 레코드 구조 밖에 숨긴 저장소 |
+| **xls** | Workbook, 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록. 하이퍼링크(HLINK) 레코드를 구조대로 해석해 허용되지 않은 대상(URL·파일 모니커)만 제자리에서 공백으로 덮어씀(표시 문자열은 유지). `--neutralize-ole` 사용 시 임베디드 OLE(MBD*)를 빈 저장소로 대체 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, ActiveX, 외부 요청 함수(`WEBSERVICE`/`FILTERXML`/`IMAGE`), 임베디드 OLE(기본값) |
+| **ppt** | PowerPoint Document, Current User, Pictures, CompObj | 매크로·프로그램 실행·OLE 동작을 "동작 없음"으로, 위험 하이퍼링크 대상(상대 경로 포함)을 공백으로 바꿈(제자리). 압축 여부와 관계없이 임베디드 개체를 인식. `--neutralize-ole` 사용 시 OLE/VBA 저장소를 같은 자리의 빈 OLE 파일로 덮어쓰고 매크로 표시를 끔 | 암호화, ActiveX, PowerPoint 95, 임베디드 OLE/VBA(기본값), 레코드 구조 밖에 숨긴 저장소 |
 
 `--neutralize-ole`은 개체 **내용만** 비웁니다. 슬라이드와 시트에 저장된 미리보기 그림은 그대로 남습니다. PPT는 정상 레코드 트리의 최상위 영구 객체만 덮어쓰고, 전수 검색에서만 발견되는 저장소는 은닉 시도로 보고 차단합니다.
 Apache POI 테스트 문서로 확인한 결과는 다음과 같습니다.
@@ -160,7 +162,8 @@ cdr watch --inbox /data/수신 --outbox /data/송신 --blocked /data/차단 \
 수신 폴더에 들어온 문서를 자동으로 재조합해 송신 폴더로 넘깁니다. "들어온 문서는 반드시 CDR을 거쳐서만 나간다"는 흐름을 한 명령으로 구성합니다.
 - 크기와 수정 시각이 `--settle`초(기본 3) 동안 변하지 않은 파일만 처리합니다. 복사 중인 파일은 건드리지 않습니다.
 - 숨김 파일과 `.part`, `.tmp`, `.crdownload` 등 쓰는 중인 파일은 건너뜁니다.
-- 결과물은 숨김 임시 파일에 쓴 뒤 이름을 바꿉니다. 송신 측이 쓰는 도중의 파일을 가져가지 않습니다.
+- 결과물은 숨김 임시 파일에 쓴 뒤 이름을 바꿉니다. 송신 측이 쓰는 도중의 파일을 가져가지 않습니다. 임시 파일은 매번 고유한 이름으로 새로 만들어(`O_EXCL`) 미리 심어 둔 파일이나 심볼릭 링크를 따라가지 않습니다.
+- 심볼릭 링크는 따라가지 않습니다. 목록 작성 뒤 파일을 링크로 바꿔치기하면(열기 전후 파일 식별자 비교) 처리하지 않습니다.
 - 하위 폴더 구조를 유지합니다. 차단된 문서는 결과물 대신 `<이름>.blocked.json` 보고서만 `--blocked`에 남깁니다.
 - 감사 기록과 결과물 쓰기가 **모두 성공했을 때만** 원본을 수신 폴더에서 지웁니다. 실패한 파일은 내용이 바뀌기 전까지 다시 시도하지 않습니다.
 - 수신 폴더와 송신·차단 폴더가 서로 포함 관계이면 시작을 거부합니다. 무한 재처리를 막기 위해서입니다.
@@ -194,7 +197,7 @@ cdr sanitize inbox/ -o clean/ --audit-log /var/log/cdr/audit.jsonl --quarantine 
 
 ```bash
 cdr serve --bind 0.0.0.0:8080 [--jobs 4] [--timeout 120] [--max-size 100] [--config cdr.toml] \
-          [--audit-log audit.jsonl] [--quarantine quarantine/]
+          [--audit-log audit.jsonl] [--quarantine quarantine/] [--allow-request-relax]
 ```
 
 | 메서드 | 경로 | 설명 |
@@ -204,7 +207,8 @@ cdr serve --bind 0.0.0.0:8080 [--jobs 4] [--timeout 120] [--max-size 100] [--con
 | `GET` | `/health` | 상태 확인 |
 | `GET` | `/` | 브라우저 업로드 페이지 |
 
-요청마다 정책을 바꿀 수 있습니다: `?rasterize=true&dpi=150&remove_links=true&keep_metadata=true&neutralize_ole=true`
+요청마다 정책을 **강화하는 방향으로만** 바꿀 수 있습니다: `?rasterize=true&dpi=150&remove_links=true`
+서버 정책을 완화하는 요청(`keep_metadata=true`, `neutralize_ole=true`로 기본 차단 해제, `rasterize=false` 등)은 무시합니다. 신뢰할 수 있는 내부 호출자만 있는 환경에서 완화를 허용하려면 `--allow-request-relax`로 서버를 띄우십시오.
 감사 로그를 켜면 응답 헤더 `X-CDR-Event-Id`가 로그의 `event_id`와 같아 요청을 추적할 수 있습니다.
 
 ```bash
@@ -212,7 +216,7 @@ curl -F "file=@invoice.docm" http://localhost:8080/api/v1/sanitize -OJ
 curl -F "file=@report.pdf" "http://localhost:8080/api/v1/scan?rasterize=true"
 ```
 
-재조합 작업은 별도 스레드 풀에서 실행합니다. 동시 처리 수(세마포어), 요청 크기, 처리 시간으로 자원 고갈을 막습니다.
+재조합 작업은 별도 스레드 풀에서 실행합니다. 동시 업로드 수와 동시 처리 수(세마포어), 요청 크기, 업로드·처리 시간 제한으로 자원 고갈을 막습니다. 처리 슬롯은 작업 스레드가 끝날 때까지 유지되므로, 시간 초과로 응답한 뒤에도 뒤에서 도는 작업이 한도를 넘지 않습니다.
 
 ### 라이브러리로 사용
 
@@ -298,7 +302,12 @@ tests/                 악성 샘플을 코드로 생성해 검증하는 통합 
 
 ```bash
 cargo test
+# 결정적 변조(퍼징) 테스트 반복 횟수 늘리기
+CDR_FUZZ_ITERS=2000 cargo test --release --test robustness
 ```
+
+- `tests/security.rs`: 보안 검토에서 재현된 우회·자원 고갈 사례의 회귀 테스트(PDF 연산자 폭탄·간접 참조 우회·Type3 캐시 우회·JPX, OOXML 노드 예산·전체 압축률, Word/Excel 링크 필드·수식, HWPX Command, XLS HLINK·외부 요청 함수, PPT 상대 경로 링크·비압축 OLE)
+- `tests/robustness.rs`: 모든 형식의 샘플을 컨테이너를 풀어 내부 파트 단위로 변조한 뒤, 내부 오류(패닉)가 없고 재조합 결과가 다시 차단되지 않는지 확인
 
 ## 한계
 

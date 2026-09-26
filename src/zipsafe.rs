@@ -62,6 +62,10 @@ pub fn read_entries(data: &[u8], policy: &Policy, findings: &mut Findings) -> Re
         if total > policy.max_zip_total {
             return blocked("zip-bomb", "압축 해제 총량 초과");
         }
+        // 작은 엔트리 여러 개로 개별 압축률 검사를 피하는 경우 대비: 패키지 전체 압축률
+        if total > 16 * 1024 * 1024 && total / (data.len() as u64).max(1) > policy.max_zip_ratio {
+            return blocked("zip-bomb", "패키지 전체 압축률이 비정상적으로 높음");
+        }
         if size > 1024 * 1024 && csize > 0 && size / csize > policy.max_zip_ratio {
             return blocked("zip-bomb", format!("비정상 압축률 엔트리: {name}"));
         }

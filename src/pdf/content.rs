@@ -141,6 +141,30 @@ fn operands_ok_inner(items: &[Object]) -> bool {
 }
 
 /// 연산자 목록을 콘텐츠 스트림 바이트로 인코딩한다. 인라인 이미지는 BI … ID … EI 로 직접 쓴다.
+/// lopdf 의 연산자 해석기는 영문자만 연산자로 읽어 Type3 글리프의 `d0`/`d1` 을
+/// `d` + 숫자 피연산자로 쪼갠다. 글리프 스트림은 반드시 d0/d1 로 시작하므로 첫 연산자가
+/// 숫자 피연산자 2개(d0) 또는 6개(d1)를 가진 `d` 이면 원래 연산자로 되돌리고, 다음 연산자로
+/// 넘어간 숫자(0/1)를 제거한다. (선 대시 `d` 는 첫 피연산자가 배열이므로 구분된다.)
+pub fn restore_glyph_ops(ops: &mut [Operation]) {
+    let Some(first) = ops.first() else { return };
+    let numeric = first
+        .operands
+        .iter()
+        .all(|o| matches!(o, Object::Integer(_) | Object::Real(_)));
+    let name = match (first.operator.as_str(), first.operands.len()) {
+        ("d", 2) if numeric => "d0",
+        ("d", 6) if numeric => "d1",
+        _ => return,
+    };
+    let digit = if name == "d0" { 0 } else { 1 };
+    ops[0].operator = name.into();
+    if let Some(next) = ops.get_mut(1) {
+        if matches!(next.operands.first(), Some(Object::Integer(v)) if *v == digit) {
+            next.operands.remove(0);
+        }
+    }
+}
+
 pub fn encode(ops: &[Operation]) -> Vec<u8> {
     let mut out = Vec::new();
     let mut batch: Vec<Operation> = Vec::new();
@@ -190,4 +214,41 @@ pub fn encode(ops: &[Operation]) -> Vec<u8> {
     }
     flush(&mut batch, &mut out);
     out
+}
+
+/// 콘텐츠 스트림의 토큰 수를 빠르게 센다(해석 전 예산 검사용).
+/// 공백 뒤에 오는 문자와 구분자(/ ( [ < { ] > })로 시작하는 토큰을 모두 센다.
+pub fn count_tokens(data: &[u8]) -> usize {
+    let mut n = 0;
+    let mut prev_ws = true;
+    for &b in data {
+        let ws = matches!(b, b' ' | b'\n' | b'\r' | b'\t' | b'\x0c' | 0);
+        if !ws && (prev_ws || matches!(b, b'/' | b'(' | b'[' | b'<' | b'{' | b']' | b'>' | b'}')) {
+            n += 1;
+        }
+        prev_ws = ws;
+    }
+    n
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn roundtrip(src: &[u8]) -> String {
+        let mut ops = Content::decode(src).unwrap().operations;
+        restore_glyph_ops(&mut ops);
+        String::from_utf8(encode(&ops)).unwrap()
+    }
+
+    #[test]
+    fn glyph_operators_survive_reencoding() {
+        assert_eq!(roundtrip(b"500 0 d0 0 0 m"), "500 0 d0\n0 0 m\n");
+        assert_eq!(
+            roundtrip(b"500 0 10 -5 490 700 d1 1 0 0 1 0 0 cm"),
+            "500 0 10 -5 490 700 d1\n1 0 0 1 0 0 cm\n"
+        );
+        // 선 대시 연산자는 그대로
+        assert_eq!(roundtrip(b"[3 2] 0 d 0 0 m"), "[3 2] 0 d\n0 0 m\n");
+    }
 }

@@ -18,6 +18,9 @@ const BOUNDSHEET: u16 = 0x0085;
 const NAME: u16 = 0x0018;
 const SUPBOOK: u16 = 0x01AE;
 const OBPROJ: u16 = 0x00D3;
+const HLINK: u16 = 0x01B8;
+/// 외부로 요청을 보내는 함수 (BIFF8 에는 "_xlfn." 이름으로 저장됨)
+const REQUEST_FUNCTIONS: &[&str] = &["_xlfn.webservice", "_xlfn.filterxml", "_xlfn.image"];
 
 pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<u8>> {
     let c = cfbx::read(data, policy)?;
@@ -75,12 +78,14 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     let mut records = 0usize;
     let mut auto_names = 0u32;
     let mut external_books = 0u32;
+    let mut hlink_bodies: Vec<(usize, usize)> = Vec::new();
     while pos + 4 <= wb.len() {
         let rt = u16::from_le_bytes([wb[pos], wb[pos + 1]]);
         let len = u16::from_le_bytes([wb[pos + 2], wb[pos + 3]]) as usize;
         let Some(body) = wb.get(pos + 4..pos + 4 + len) else {
             return blocked("structure", "BIFF 레코드 길이 오류");
         };
+        let body_at = pos + 4;
         pos += 4 + len;
         records += 1;
         match rt {
@@ -114,6 +119,12 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                         .unwrap_or_default()
                 };
                 let lower = name.to_ascii_lowercase();
+                if REQUEST_FUNCTIONS.iter().any(|f| lower == *f) {
+                    return blocked(
+                        "external-resource",
+                        format!("외부 요청 함수({})가 포함되어 차단합니다", &name[6..]),
+                    );
+                }
                 if (builtin && matches!(name.chars().next(), Some('\u{1}') | Some('\u{2}')))
                     || lower.starts_with("auto_open")
                     || lower.starts_with("auto_close")
@@ -131,6 +142,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                     external_books += 1;
                 }
             }
+            HLINK => hlink_bodies.push((body_at, len)),
             OBPROJ => findings.add(
                 "macro",
                 Severity::Info,
@@ -168,12 +180,52 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         );
     }
 
+    // 하이퍼링크(HLINK): 허용 URI 가 아닌 문자열(파일 모니커, 상대/UNC 경로 등)을 제자리에서 공백으로
+    let mut wb_out = wb.to_vec();
+    let mut neutralized = Vec::new();
+    for (at, len) in hlink_bodies {
+        let body = &wb_out[at..at + len];
+        // 구조를 해석할 수 있으면 실제 대상(모니커)만 검사하고, 표시 문자열·문서 내 위치는 그대로 둔다.
+        // 해석할 수 없는 형태(알 수 없는 모니커 등)는 안전하게 문자열 전체를 검사한다.
+        let targets = hlink_targets(body).unwrap_or_else(|| text_runs(body));
+        for (start, bytes, wide, text) in targets {
+            let t = text.trim_matches(char::from(0));
+            if t.starts_with('#') || (policy.uri_allowed(t) && !policy.remove_hyperlinks) {
+                continue;
+            }
+            // 대상처럼 보이는 문자열(스킴·경로 구분자·확장자 포함)만 보고 대상으로 삼는다
+            let looks_like_target = t.contains([':', '\\', '/', '.']);
+            let region = &mut wb_out[at + start..at + start + bytes];
+            if wide {
+                for c in region.as_chunks_mut::<2>().0 {
+                    *c = [0x20, 0];
+                }
+            } else {
+                region.fill(0x20);
+            }
+            if looks_like_target {
+                neutralized.push(t.to_string());
+            }
+        }
+    }
+    if !neutralized.is_empty() {
+        findings.add(
+            "dangerous-link",
+            Severity::High,
+            format!(
+                "허용되지 않은 하이퍼링크 대상 제거: {}",
+                crate::ooxml::content::truncate(&neutralized.join(", "), 160)
+            ),
+            stream_name,
+        );
+    }
+
     // 새 컨테이너 조립
     let mut out = vec![Node {
         path: stream_name.into(),
         is_storage: false,
         clsid: [0; 16],
-        data: wb.to_vec(),
+        data: wb_out,
     }];
     for n in &c.nodes {
         if n.path == "_SX_DB_CUR" || n.path.starts_with("_SX_DB_CUR/") {
@@ -253,4 +305,154 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     }
     findings.count("output_parts", out.len() as u64);
     cfbx::write(c.version, c.root_clsid, &out)
+}
+
+const URL_MONIKER: [u8; 16] = [
+    0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B,
+];
+const FILE_MONIKER: [u8; 16] = [
+    0x03, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x46,
+];
+
+/// HLINK 레코드([MS-XLS] 2.4.140)의 하이퍼링크 개체([MS-OSHARED] 2.3.7.1)에서
+/// 링크 대상 문자열(모니커)의 위치를 찾는다. (시작 위치, 바이트 길이, UTF-16 여부, 문자열)
+fn hlink_targets(body: &[u8]) -> Option<Vec<(usize, usize, bool, String)>> {
+    let u32_at = |at: usize| -> Option<u32> {
+        Some(u32::from_le_bytes(body.get(at..at + 4)?.try_into().ok()?))
+    };
+    let u16_at = |at: usize| -> Option<u16> {
+        Some(u16::from_le_bytes(body.get(at..at + 2)?.try_into().ok()?))
+    };
+    // UTF-16 문자열(문자 수 = 끝의 NUL 포함) 한 개: (다음 위치, 대상 정보)
+    let wide = |at: usize, bytes: usize| -> Option<(usize, usize, bool, String)> {
+        let raw = body.get(at..at.checked_add(bytes)?)?;
+        let units: Vec<u16> = raw
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
+            .collect();
+        let text = String::from_utf16_lossy(&units)
+            .trim_end_matches('\0')
+            .to_string();
+        Some((at, bytes, true, text))
+    };
+    let hyperlink_string = |at: usize| -> Option<(usize, (usize, usize, bool, String))> {
+        let chars = u32_at(at)? as usize;
+        let bytes = chars.checked_mul(2)?;
+        Some((at + 4 + bytes, wide(at + 4, bytes)?))
+    };
+
+    let mut p = 8 + 16;
+    if u32_at(p)? != 2 {
+        return None;
+    }
+    let flags = u32_at(p + 4)?;
+    p += 8;
+    let mut out = Vec::new();
+    if flags & 0x10 != 0 {
+        p = hyperlink_string(p)?.0; // 표시 이름
+    }
+    if flags & 0x80 != 0 {
+        p = hyperlink_string(p)?.0; // 대상 프레임 이름
+    }
+    if flags & 0x01 != 0 {
+        if flags & 0x100 != 0 {
+            let (next, t) = hyperlink_string(p)?;
+            out.push(t);
+            p = next;
+        } else {
+            let clsid = body.get(p..p + 16)?;
+            p += 16;
+            if clsid == URL_MONIKER {
+                let len = u32_at(p)? as usize;
+                // 길이 안에 NUL 로 끝나는 URL 뒤로 선택적 GUID 등이 붙을 수 있다
+                let raw = body.get(p + 4..p + 4 + len)?;
+                let chars = raw
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .position(|c| *c == [0, 0])
+                    .unwrap_or(len / 2);
+                out.push(wide(p + 4, chars * 2)?);
+                p += 4 + len;
+            } else if clsid == FILE_MONIKER {
+                let ansi_len = u32_at(p + 2)? as usize;
+                let ansi_at = p + 6;
+                let ansi = body.get(ansi_at..ansi_at.checked_add(ansi_len)?)?;
+                let text: String = ansi
+                    .iter()
+                    .take_while(|&&b| b != 0)
+                    .map(|&b| b as char)
+                    .collect();
+                out.push((ansi_at, ansi_len, false, text));
+                p = ansi_at + ansi_len + 2 + 2 + 16 + 4;
+                let cb = u32_at(p)? as usize;
+                p += 4;
+                if cb > 0 {
+                    let bytes = u32_at(p)? as usize;
+                    u16_at(p + 4)?;
+                    out.push(wide(p + 6, bytes)?);
+                    p += 6 + bytes;
+                }
+            } else {
+                return None;
+            }
+        }
+    }
+    if flags & 0x08 != 0 {
+        hyperlink_string(p)?; // 문서 내 위치: 검사 대상 아님
+    }
+    Some(out)
+}
+
+/// 레코드 본문에서 사람이 읽을 수 있는 문자열 구간(UTF-16LE 우선, 그다음 ANSI)을 찾는다.
+/// (시작 위치, 바이트 길이, UTF-16 여부, 문자열)
+fn text_runs(body: &[u8]) -> Vec<(usize, usize, bool, String)> {
+    let printable = |b: u8| (0x20..0x7f).contains(&b);
+    let mut covered = vec![false; body.len()];
+    let mut out = Vec::new();
+    for parity in 0..2 {
+        let mut i = parity;
+        while i + 1 < body.len() {
+            let start = i;
+            let mut units = Vec::new();
+            while i + 1 < body.len() && !covered[i] {
+                let u = u16::from_le_bytes([body[i], body[i + 1]]);
+                let ok = (u < 0x80 && printable(u as u8))
+                    || (0xac00..=0xd7a3).contains(&u)
+                    || (0x3131..=0x318e).contains(&u);
+                if !ok {
+                    break;
+                }
+                units.push(u);
+                i += 2;
+            }
+            if units.len() >= 3 {
+                for c in covered.iter_mut().take(i).skip(start) {
+                    *c = true;
+                }
+                out.push((start, i - start, true, String::from_utf16_lossy(&units)));
+            } else {
+                i = start + 2;
+            }
+        }
+    }
+    let mut i = 0;
+    while i < body.len() {
+        let start = i;
+        while i < body.len() && !covered[i] && printable(body[i]) {
+            i += 1;
+        }
+        if i - start >= 4 {
+            out.push((
+                start,
+                i - start,
+                false,
+                body[start..i].iter().map(|&b| b as char).collect(),
+            ));
+        }
+        i = i.max(start + 1);
+    }
+    out
 }

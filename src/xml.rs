@@ -180,6 +180,18 @@ fn unescape_attr(raw: &str, name: &str) -> Result<String> {
 }
 
 pub fn parse(data: &[u8], name: &str, policy: &Policy) -> Result<Document> {
+    parse_counted(data, name, policy, &mut 0)
+}
+
+/// `used` 에 문서 전체에서 지금까지 만든 노드(요소·속성) 수를 누적한다.
+/// 여러 파트를 가진 패키지에서 파트마다 따로 세면 작은 파트 수백 개로 한도를 우회할 수 있으므로
+/// 패키지 단위로 하나의 예산을 공유한다.
+pub fn parse_counted(
+    data: &[u8],
+    name: &str,
+    policy: &Policy,
+    used: &mut usize,
+) -> Result<Document> {
     let data = data.strip_prefix(b"\xef\xbb\xbf").unwrap_or(data);
     let Ok(text) = std::str::from_utf8(data) else {
         return blocked("structure", format!("UTF-8 이 아닌 XML: {name}"));
@@ -191,7 +203,7 @@ pub fn parse(data: &[u8], name: &str, policy: &Policy) -> Result<Document> {
     let mut stack: Vec<Element> = Vec::new();
     let mut scopes: Vec<Scope> = Vec::new();
     let mut root: Option<Element> = None;
-    let mut nodes = 0usize;
+    let nodes = used;
 
     macro_rules! xml_err {
         ($e:expr) => {
@@ -206,9 +218,15 @@ pub fn parse(data: &[u8], name: &str, policy: &Policy) -> Result<Document> {
         };
         match ev {
             Event::Start(ref s) | Event::Empty(ref s) => {
-                nodes += 1;
-                if nodes > policy.max_xml_nodes {
-                    return blocked("structure", format!("XML 노드 수 초과: {name}"));
+                *nodes += 1 + s.attributes().count();
+                if *nodes > policy.max_xml_nodes {
+                    return blocked(
+                        "resource",
+                        format!(
+                            "XML 노드 수 초과(문서 전체 {}개 한도): {name}",
+                            policy.max_xml_nodes
+                        ),
+                    );
                 }
                 if stack.len() >= policy.max_xml_depth {
                     return blocked("structure", format!("XML 중첩 깊이 초과: {name}"));
@@ -357,28 +375,65 @@ fn push_text(stack: &mut [Element], s: &str, name: &str) -> Result<()> {
     }
 }
 
-const DANGEROUS_ATTR_SCHEMES: &[&str] = &[
+/// `scheme:` 뒤에 `//` 가 없어도 자원을 열거나 프로그램을 실행하는 비계층형 스킴
+const OPAQUE_RESOURCE_SCHEMES: &[&str] = &[
     "file",
-    "http",
-    "https",
-    "ftp",
-    "smb",
-    "mhtml",
     "javascript",
     "vbscript",
     "data",
+    "mhtml",
+    "mk",
+    "its",
+    "ms-its",
+    "hcp",
+    "shell",
+    "search",
+    "search-ms",
+    "ldap",
+    "ldaps",
+    "res",
+    "jar",
+    "cid",
+    "mid",
+    "smb",
+    "nfs",
+    "afp",
+    "telnet",
+    "news",
+    "nntp",
+    "gopher",
+    "tel",
+    "callto",
+    "sip",
+    "vnd.ms-",
+    "ie.http",
+    "ie.https",
 ];
 
-/// 속성 값이 외부 자원(URL, UNC 경로, ms-* 프로토콜 핸들러)을 가리키는지 판단한다.
+/// 값이 외부 자원(URL, UNC/드라이브 경로, 프로토콜 처리기)을 가리키는지 판단한다.
+///
+/// 차단 목록만으로는 새 프로토콜 처리기(`search:`, `shell:` 등)를 놓치므로 구조로 판정한다.
+/// - `//`, `\\`, `/\` 처럼 구분자 두 개로 시작(UNC·프로토콜 상대 경로)
+/// - `C:\`, `C:/` 드라이브 경로
+/// - `scheme://` 또는 `scheme:\\` 형태의 계층형 URI (단 `urn:` 식별자 제외)
+/// - 비계층형이라도 자원을 여는 스킴(`file:`, `its:`, `shell:`, `ms-*:` 등)
+///
+/// `position:absolute` 같은 스타일 값, `urn:schemas-...` 식별자는 외부로 보지 않는다.
 pub fn value_is_external(value: &str) -> bool {
-    let v = value.trim_start();
-    if v.starts_with("\\\\") || v.starts_with("//") {
+    let v = value.trim_start_matches(|c: char| c.is_whitespace() || c.is_control());
+    let b = v.as_bytes();
+    let sep = |c: u8| c == b'/' || c == b'\\';
+    if b.len() >= 2 && sep(b[0]) && sep(b[1]) {
         return true;
     }
-    let Some((scheme, _)) = v.split_once(':') else {
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && sep(b[2]) {
+        return true;
+    }
+    let Some((scheme, rest)) = v.split_once(':') else {
         return false;
     };
     if scheme.is_empty()
+        || !scheme.as_bytes()[0].is_ascii_alphabetic()
         || !scheme
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
@@ -386,9 +441,17 @@ pub fn value_is_external(value: &str) -> bool {
         return false;
     }
     let scheme = scheme.to_ascii_lowercase();
-    DANGEROUS_ATTR_SCHEMES.contains(&scheme.as_str())
+    // urn: 은 식별자, ppaction: 은 PowerPoint 내부 동작(위험한 program/macro/ole 은 별도 규칙으로 제거)
+    if scheme == "urn" || scheme == "ppaction" {
+        return false;
+    }
+    let r = rest.as_bytes();
+    let hierarchical = r.len() >= 2 && sep(r[0]) && sep(r[1]);
+    hierarchical
         || scheme.starts_with("ms-")
-        || scheme == "search-ms"
+        || OPAQUE_RESOURCE_SCHEMES
+            .iter()
+            .any(|s| scheme == *s || (s.ends_with('-') && scheme.starts_with(s)))
 }
 
 // ----------------------------------------------------------------------------- 직렬화
@@ -459,5 +522,53 @@ pub fn element(qname: &str, attrs: &[(&str, &str)], children: Vec<Node>) -> Elem
             })
             .collect(),
         children,
+    }
+}
+
+#[cfg(test)]
+mod external_tests {
+    use super::value_is_external as ext;
+
+    #[test]
+    fn external_values() {
+        for v in [
+            "http://x",
+            "HTTPS://x",
+            "file:///c:/x",
+            "\\\\srv\\s",
+            "//srv/s",
+            "/\\srv\\s",
+            "\\/srv",
+            "C:\\x.png",
+            "c:/x",
+            "search:query=x",
+            "shell:startup",
+            "its:x.chm::/a.htm",
+            "mk:@MSITStore:x",
+            "hcp://x",
+            "ldap://x",
+            "ms-msdt:/id x",
+            "ftp://x",
+            "gopher://x",
+            " \t file:x",
+            "x-custom://evil",
+            "webcal://x",
+        ] {
+            assert!(ext(v), "외부로 판정해야 함: {v:?}");
+        }
+        for v in [
+            "position:absolute;left:0",
+            "mso-position-horizontal:center",
+            "urn:schemas-microsoft-com:vml",
+            "image1.png",
+            "media/a.png",
+            "12:30",
+            "MS Gothic",
+            "a:b",
+            "ppaction://hlinkshowjump?jump=nextslide",
+            "",
+        ] {
+            assert!(!ext(v), "외부로 보면 안 됨: {v:?}");
+        }
     }
 }

@@ -3,7 +3,7 @@
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// 임시 파일 접미사 - 쓰는 도중의 결과물을 다른 프로세스가 가져가지 않도록 숨김 파일로 쓴다.
@@ -60,12 +60,31 @@ pub fn write_atomic(
 ) -> io::Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let file_name = sanitize_name(name);
-    let tmp = dir.join(format!(".{file_name}.{}{TEMP_SUFFIX}", std::process::id()));
-    {
-        let mut f = fs::File::create(&tmp)?;
-        f.write_all(data)?;
-        f.sync_all()?;
+    // 임시 파일은 프로세스·호출마다 고유한 이름으로 새로 만든다(create_new: 기존 파일이나
+    // 심볼릭 링크를 따라가 덮어쓰지 않으며, 동시 호출끼리 충돌하지 않는다)
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let (tmp, mut f) = loop {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!(
+            ".{file_name}.{}.{seq}{TEMP_SUFFIX}",
+            std::process::id()
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)
+        {
+            Ok(f) => break (tmp, f),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    if let Err(e) = f.write_all(data).and_then(|_| f.sync_all()) {
+        drop(f);
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
     }
+    drop(f);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut target = dir.join(&file_name);
     let (stem, ext) = match file_name.rsplit_once('.') {
@@ -73,7 +92,7 @@ pub fn write_atomic(
         _ => (file_name.clone(), String::new()),
     };
     let mut n = 1;
-    while !overwrite && target.exists() {
+    while !overwrite && fs::symlink_metadata(&target).is_ok() {
         target = dir.join(format!("{stem}_{n}{ext}"));
         n += 1;
     }

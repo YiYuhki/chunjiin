@@ -29,9 +29,12 @@ use crate::report::{Findings, Severity};
 const MAX_COPY_DEPTH: usize = 48;
 const MAX_OBJECTS: usize = 2_000_000;
 const MAX_OUTLINE_ITEMS: usize = 10_000;
+/// 콘텐츠 스트림 하나 / 문서 전체의 최대 토큰 수 (연산자 폭탄 방어)
+const MAX_STREAM_TOKENS: usize = 4_000_000;
+const MAX_DOCUMENT_TOKENS: usize = 40_000_000;
 
 /// 스트림이 어떤 역할로 재조합되는지
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum Role {
     Generic,
     /// 그리기 연산자 스트림(폼 XObject, 타일링 패턴, Type3 글리프)
@@ -74,6 +77,41 @@ const DENY_KEYS: &[&[u8]] = &[
     b"ID",
 ];
 
+const FONT_SUBTYPES: &[&[u8]] = &[
+    b"Type0",
+    b"Type1",
+    b"MMType1",
+    b"Type3",
+    b"TrueType",
+    b"CIDFontType0",
+    b"CIDFontType2",
+];
+
+/// 글꼴 사전에서 옮기는 키 (PDF 32000 9.6~9.7)
+const FONT_KEYS: &[&[u8]] = &[
+    b"Type",
+    b"Subtype",
+    b"Name",
+    b"BaseFont",
+    b"FirstChar",
+    b"LastChar",
+    b"Widths",
+    b"FontDescriptor",
+    b"Encoding",
+    b"ToUnicode",
+    b"DescendantFonts",
+    b"CIDSystemInfo",
+    b"DW",
+    b"W",
+    b"DW2",
+    b"W2",
+    b"CIDToGIDMap",
+    b"FontBBox",
+    b"FontMatrix",
+    b"CharProcs",
+    b"Resources",
+];
+
 /// 원본 그대로 옮기되 디코딩 검증을 할 수 없는 이미지 필터
 const PASSTHROUGH_IMAGE_FILTERS: &[&[u8]] = &[b"DCTDecode", b"CCITTFaxDecode"];
 /// 역사적으로 파서 취약점이 많아 재조합 대상에서 제외하는 이미지 필터
@@ -82,9 +120,12 @@ const BLOCKED_IMAGE_FILTERS: &[&[u8]] = &[b"JBIG2Decode", b"JPXDecode"];
 struct Copier<'a> {
     src: &'a Document,
     dst: Document,
-    map: HashMap<ObjectId, ObjectId>,
+    /// (원본 객체, 역할) → 새 객체. 같은 객체라도 콘텐츠로 쓰일 때는 따로 필터링한다
+    map: HashMap<(ObjectId, Role), ObjectId>,
     /// 복사 결과 제외된 원본 객체 (예: JBIG2 이미지)
-    rejected: HashSet<ObjectId>,
+    rejected: HashSet<(ObjectId, Role)>,
+    /// 문서 전체에서 해석한 콘텐츠 토큰 수 (처리량 제한)
+    content_tokens: usize,
     policy: &'a Policy,
     findings: &'a mut Findings,
     copied: usize,
@@ -110,10 +151,10 @@ impl<'a> Copier<'a> {
         }
         Ok(match obj {
             Object::Reference(id) => {
-                if let Some(new) = self.map.get(id) {
+                if let Some(new) = self.map.get(&(*id, role)) {
                     return Ok(Some(Object::Reference(*new)));
                 }
-                if self.rejected.contains(id) {
+                if self.rejected.contains(&(*id, role)) {
                     return Ok(None);
                 }
                 let Ok(target) = self.src.get_object(*id) else {
@@ -125,7 +166,7 @@ impl<'a> Copier<'a> {
                 }
                 // 순환 참조를 위해 새 ID 를 먼저 예약한다
                 let new_id = self.dst.new_object_id();
-                self.map.insert(*id, new_id);
+                self.map.insert((*id, role), new_id);
                 let target = target.clone();
                 match self.copy(&target, role, depth + 1)? {
                     Some(o) => {
@@ -133,8 +174,8 @@ impl<'a> Copier<'a> {
                         Some(Object::Reference(new_id))
                     }
                     None => {
-                        self.map.remove(id);
-                        self.rejected.insert(*id);
+                        self.map.remove(&(*id, role));
+                        self.rejected.insert((*id, role));
                         None
                     }
                 }
@@ -155,10 +196,26 @@ impl<'a> Copier<'a> {
     }
 
     fn copy_dict(&mut self, d: &Dictionary, depth: usize) -> Result<Dictionary> {
-        let is_type3 = d.get(b"Subtype").and_then(Object::as_name).ok() == Some(b"Type3");
+        let subtype = d
+            .get(b"Subtype")
+            .ok()
+            .and_then(|o| self.deref(o))
+            .and_then(|o| o.as_name().ok());
+        let is_type3 = subtype == Some(b"Type3");
+        let is_font = d
+            .get(b"Type")
+            .ok()
+            .and_then(|o| self.deref(o))
+            .and_then(|o| o.as_name().ok())
+            == Some(b"Font")
+            || subtype.is_some_and(|s| FONT_SUBTYPES.contains(&s));
         let mut out = Dictionary::new();
         for (k, v) in d.iter() {
             if DENY_KEYS.contains(&k.as_slice()) {
+                continue;
+            }
+            // 글꼴 사전은 정의된 키만 옮긴다 (알 수 없는 키로 글리프 프로그램을 필터 없이 끼워 넣는 우회 방지)
+            if is_font && !FONT_KEYS.contains(&k.as_slice()) {
                 continue;
             }
             let role = if is_type3 && k.as_slice() == b"CharProcs" {
@@ -190,7 +247,65 @@ impl<'a> Copier<'a> {
         Ok(out)
     }
 
+    /// 판정에 쓰는 키(/Subtype, /PatternType, /Filter, /DecodeParms, /Type)의 간접 참조를 풀어 둔다.
+    /// 뷰어는 간접 참조를 따라가므로, 풀지 않으면 폼 XObject 를 알아보지 못해 필터를 우회할 수 있다.
+    fn normalized(&self, s: &Stream) -> Stream {
+        const KEYS: &[&[u8]] = &[
+            b"Subtype",
+            b"PatternType",
+            b"Filter",
+            b"DecodeParms",
+            b"Type",
+            b"Length",
+        ];
+        let needs = KEYS.iter().any(|k| match s.dict.get(k) {
+            Ok(Object::Reference(_)) => true,
+            Ok(Object::Array(a)) => a.iter().any(|o| matches!(o, Object::Reference(_))),
+            _ => false,
+        });
+        if !needs {
+            return s.clone();
+        }
+        let mut n = s.clone();
+        for k in KEYS {
+            let Ok(v) = n.dict.get(k) else { continue };
+            let resolved = match v {
+                Object::Reference(_) => self.deref(v).cloned(),
+                Object::Array(a) => Some(Object::Array(
+                    a.iter()
+                        .map(|o| self.deref(o).cloned().unwrap_or(Object::Null))
+                        .collect(),
+                )),
+                // 직접 값은 그대로 둔다
+                _ => continue,
+            };
+            match resolved {
+                Some(r) => n.dict.set(k.to_vec(), r),
+                None => {
+                    n.dict.remove(k);
+                }
+            }
+        }
+        n
+    }
+
+    /// 콘텐츠 스트림을 연산자로 해석한다. 해석 전에 토큰 수를 세어 스트림/문서 단위 예산을 넘으면 차단한다
+    /// (작은 압축 스트림이 수천만 개의 연산자로 풀려 메모리를 고갈시키는 공격 방어).
+    fn decode_ops(&mut self, plain: &[u8]) -> Result<Option<Vec<Operation>>> {
+        let tokens = content::count_tokens(plain);
+        if tokens > MAX_STREAM_TOKENS {
+            return blocked("resource", format!("콘텐츠 스트림 토큰 수 초과 ({tokens})"));
+        }
+        self.content_tokens += tokens;
+        if self.content_tokens > MAX_DOCUMENT_TOKENS {
+            return blocked("resource", "문서 전체 콘텐츠 토큰 수 초과");
+        }
+        Ok(Content::decode(plain).ok().map(|c| c.operations))
+    }
+
     fn copy_stream(&mut self, s: &Stream, role: Role, depth: usize) -> Result<Option<Stream>> {
+        let normalized = self.normalized(s);
+        let s = &normalized;
         let subtype = s
             .dict
             .get(b"Subtype")
@@ -248,9 +363,9 @@ impl<'a> Copier<'a> {
                 );
                 return Ok(None);
             };
-            let ops = match Content::decode(&plain) {
-                Ok(c) => c.operations,
-                Err(_) => {
+            let ops = match self.decode_ops(&plain)? {
+                Some(ops) => ops,
+                None => {
                     self.findings.add(
                         "structure",
                         Severity::Medium,
@@ -260,6 +375,10 @@ impl<'a> Copier<'a> {
                     return Ok(None);
                 }
             };
+            let mut ops = ops;
+            if role == Role::Content && !is_form && !is_tiling {
+                content::restore_glyph_ops(&mut ops);
+            }
             let xobjects = self.resource_names(&dict, b"XObject");
             let ops = content::filter(ops, Some(&xobjects), &mut self.dropped_ops);
             let bytes = content::encode(&ops);
@@ -426,6 +545,7 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
         findings,
         copied: 0,
         dropped_ops: HashMap::new(),
+        content_tokens: 0,
     };
     let pages_id = copier.dst.new_object_id();
 
@@ -642,12 +762,12 @@ fn build_page(
             )
         }
     };
-    let ops = match Content::decode(&raw) {
-        Ok(ct) => ct.operations,
-        Err(e) => {
+    let ops = match c.decode_ops(&raw)? {
+        Some(ops) => ops,
+        None => {
             return blocked(
                 "structure",
-                format!("{page_no} 페이지 콘텐츠 스트림 해석 실패: {e}"),
+                format!("{page_no} 페이지 콘텐츠 스트림 해석 실패"),
             )
         }
     };

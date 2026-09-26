@@ -87,6 +87,9 @@ enum Command {
         /// 요청당 처리 제한 시간(초)
         #[arg(long, default_value_t = 120)]
         timeout: u64,
+        /// 요청 파라미터로 정책을 완화하는 것을 허용 (기본: 강화하는 방향만 허용)
+        #[arg(long)]
+        allow_request_relax: bool,
         #[command(flatten)]
         common: Common,
     },
@@ -465,7 +468,7 @@ fn watch(
     }
 }
 
-fn serve(bind: std::net::SocketAddr, timeout: u64, common: &Common) -> ExitCode {
+fn serve(bind: std::net::SocketAddr, timeout: u64, allow_relax: bool, common: &Common) -> ExitCode {
     let (policy, auditor) = match (common.policy(), common.auditor()) {
         (Ok(p), Ok(a)) => (p, a),
         (Err(e), _) | (_, Err(e)) => {
@@ -474,7 +477,8 @@ fn serve(bind: std::net::SocketAddr, timeout: u64, common: &Common) -> ExitCode 
         }
     };
     let state = cdr::server::AppState::new(policy, common.jobs(), Duration::from_secs(timeout))
-        .with_auditor(auditor);
+        .with_auditor(auditor)
+        .with_request_relaxation(allow_relax);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -524,8 +528,9 @@ fn main() -> ExitCode {
         Command::Serve {
             bind,
             timeout,
+            allow_request_relax,
             common,
-        } => serve(*bind, *timeout, common),
+        } => serve(*bind, *timeout, *allow_request_relax, common),
         Command::Policy => {
             print!("{}", cdr::config::default_toml());
             ExitCode::SUCCESS

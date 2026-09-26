@@ -38,6 +38,9 @@ const DANGEROUS_FIELDS: &[&str] = &[
     "INCLUDE",
     "IMPORT",
     "LINK",
+    // 외부 데이터베이스 질의(연결 문자열·SQL), 외부 문서 참조
+    "DATABASE",
+    "RD",
     // MACROBUTTON 은 표시 텍스트가 필드 코드 안에 있고 매크로를 모두 제거한 뒤에는
     // 실행할 대상이 없으므로 무력화하지 않는다
 ];
@@ -185,7 +188,7 @@ fn sanitize_element(el: &mut Element, ctx: &mut Ctx) -> Action {
     // 4) 형식별 규칙
     if ctx.kind == DocKind::Word && rules::is_word_ns(&el.ns) && el.local == "fldSimple" {
         let code = el.attr("instr").unwrap_or("").to_string();
-        if field_is_dangerous(&code, false) {
+        if word_field_is_dangerous(&code, false, ctx.policy) {
             ctx.note(
                 "dde",
                 Severity::High,
@@ -194,37 +197,57 @@ fn sanitize_element(el: &mut Element, ctx: &mut Ctx) -> Action {
             return Action::Unwrap;
         }
     }
-    if ctx.kind == DocKind::Excel && rules::is_sheet_ns(&el.ns) {
-        if el.local == "f" && formula_is_dangerous(&el.text()) {
+    // 수식을 담는 모든 요소: 셀 수식(f), 조건부 서식(cfRule/formula), 데이터 유효성(formula1/2),
+    // Office 확장(x14 의 xm:f), 정의된 이름(definedName)
+    if ctx.kind == DocKind::Excel
+        && (rules::is_sheet_ns(&el.ns) || el.ns.starts_with("http://schemas.microsoft.com/office/"))
+        && matches!(
+            el.local.as_str(),
+            "f" | "formula" | "formula1" | "formula2" | "definedName"
+        )
+        && formula_is_dangerous(&el.text(), ctx.policy)
+    {
+        ctx.note(
+            "dde",
+            Severity::High,
+            format!(
+                "위험 수식 제거: {} ={}",
+                el.local,
+                truncate(&el.text(), 100)
+            ),
+        );
+        // 수식만 빼면 구조가 깨지는 규칙은 규칙째 제거한다 (셀 수식은 캐시 값 유지)
+        return match el.local.as_str() {
+            "formula" => remove_up_to(ctx, "cfRule"),
+            "formula1" | "formula2" => remove_up_to(ctx, "dataValidation"),
+            "f" if !rules::is_sheet_ns(&el.ns) => {
+                if ctx.ancestors.iter().any(|a| a == "cfRule") {
+                    remove_up_to(ctx, "cfRule")
+                } else {
+                    remove_up_to(ctx, "dataValidation")
+                }
+            }
+            _ => Action::Remove,
+        };
+    }
+    if ctx.kind == DocKind::Excel && rules::is_sheet_ns(&el.ns) && el.local == "definedName" {
+        let name = el.attr("name").unwrap_or("").to_ascii_lowercase();
+        let name = name.trim_start_matches("_xlnm.");
+        if [
+            "auto_open",
+            "auto_close",
+            "auto_activate",
+            "auto_deactivate",
+        ]
+        .iter()
+        .any(|p| name.starts_with(p))
+        {
             ctx.note(
-                "dde",
+                "auto-exec",
                 Severity::High,
-                format!(
-                    "위험 수식 제거(캐시 값 유지): ={}",
-                    truncate(&el.text(), 100)
-                ),
+                format!("자동 실행 이름 제거: {}", el.attr("name").unwrap_or("")),
             );
             return Action::Remove;
-        }
-        if el.local == "definedName" {
-            let name = el.attr("name").unwrap_or("").to_ascii_lowercase();
-            let name = name.trim_start_matches("_xlnm.");
-            if [
-                "auto_open",
-                "auto_close",
-                "auto_activate",
-                "auto_deactivate",
-            ]
-            .iter()
-            .any(|p| name.starts_with(p))
-            {
-                ctx.note(
-                    "auto-exec",
-                    Severity::High,
-                    format!("자동 실행 이름 제거: {}", el.attr("name").unwrap_or("")),
-                );
-                return Action::Remove;
-            }
         }
     }
     if let Some(action) = el.attr("action") {
@@ -399,7 +422,14 @@ fn neutralize_word_fields(root: &mut Element, ctx: &mut Ctx) {
     let mut dangerous: HashSet<usize> = HashSet::new();
     let mut counter = 0usize;
     let mut reports: Vec<String> = Vec::new();
-    scan_fields(root, &mut stack, &mut dangerous, &mut counter, &mut reports);
+    scan_fields(
+        root,
+        &mut stack,
+        &mut dangerous,
+        &mut counter,
+        &mut reports,
+        ctx.policy,
+    );
     if dangerous.is_empty() {
         return;
     }
@@ -420,6 +450,7 @@ fn scan_fields(
     dangerous: &mut HashSet<usize>,
     counter: &mut usize,
     reports: &mut Vec<String>,
+    policy: &Policy,
 ) {
     for node in &el.children {
         let Node::Element(c) = node else { continue };
@@ -440,7 +471,11 @@ fn scan_fields(
                     }
                     Some("end") => {
                         if let Some(frame) = stack.pop() {
-                            if field_is_dangerous(&frame.own_code, frame.starts_with_nested) {
+                            if word_field_is_dangerous(
+                                &frame.own_code,
+                                frame.starts_with_nested,
+                                policy,
+                            ) {
                                 reports.push(if frame.own_code.trim().is_empty() {
                                     "(중첩 필드로 생성된 필드 코드)".to_string()
                                 } else {
@@ -468,7 +503,7 @@ fn scan_fields(
                 _ => {}
             }
         }
-        scan_fields(c, stack, dangerous, counter, reports);
+        scan_fields(c, stack, dangerous, counter, reports, policy);
     }
 }
 
@@ -486,6 +521,55 @@ fn blank_fields(el: &mut Element, dangerous: &HashSet<usize>, counter: &mut usiz
     }
 }
 
+/// Word 필드 코드가 위험한지: 위험 필드 유형이거나, 허용되지 않은 대상을 가리키는 HYPERLINK
+pub(crate) fn word_field_is_dangerous(
+    code: &str,
+    starts_with_nested: bool,
+    policy: &Policy,
+) -> bool {
+    field_is_dangerous(code, starts_with_nested) || hyperlink_is_dangerous(code, policy)
+}
+
+pub(crate) fn hyperlink_is_dangerous(code: &str, policy: &Policy) -> bool {
+    // 필드 코드 안의 개체 기준점(0x01) 등 제어 문자는 무시
+    let cleaned: String = code
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let t = cleaned.trim_start();
+    if !t
+        .get(..9)
+        .is_some_and(|s| s.eq_ignore_ascii_case("HYPERLINK"))
+    {
+        return false;
+    }
+    // 스위치(\l 책갈피, \o 도움말 등)의 인수가 아닌 첫 인수가 대상 URL
+    let mut rest = &t[9..];
+    let mut after_switch = false;
+    loop {
+        rest = rest.trim_start();
+        if rest.is_empty() {
+            return false; // 문서 내 이동만 있음
+        }
+        let (token, next) = if let Some(r) = rest.strip_prefix('"') {
+            let end = r.find('"').unwrap_or(r.len());
+            (&r[..end], r.get(end + 1..).unwrap_or(""))
+        } else {
+            let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+            (&rest[..end], &rest[end..])
+        };
+        if token.starts_with('\\') && !rest.starts_with('"') {
+            after_switch = true;
+        } else if after_switch {
+            after_switch = false;
+        } else {
+            let url = token.replace("\\\\", "\\");
+            return !url.is_empty() && (!policy.uri_allowed(&url) || policy.remove_hyperlinks);
+        }
+        rest = next;
+    }
+}
+
 pub(crate) fn field_is_dangerous(code: &str, starts_with_nested: bool) -> bool {
     if starts_with_nested {
         return true;
@@ -500,7 +584,21 @@ pub(crate) fn field_is_dangerous(code: &str, starts_with_nested: bool) -> bool {
 
 // ----------------------------------------------------------------------------- Excel 수식
 
-fn formula_is_dangerous(formula: &str) -> bool {
+fn formula_is_dangerous(formula: &str, policy: &Policy) -> bool {
+    // HYPERLINK/IMAGE 등의 문자열 인수가 허용되지 않은 외부 경로(file:, UNC, 기타 스킴)를 가리키는지
+    let upper = formula.to_ascii_uppercase();
+    if ["HYPERLINK", "IMAGE"].iter().any(|f| upper.contains(f)) {
+        let mut parts = formula.split('"');
+        parts.next();
+        for (i, lit) in parts.enumerate() {
+            if i % 2 == 0
+                && (attr_is_external(lit) || lit.starts_with("\\\\"))
+                && !policy.uri_allowed(lit)
+            {
+                return true;
+            }
+        }
+    }
     // 문자열 리터럴 제거
     let mut plain = String::with_capacity(formula.len());
     let mut in_str = false;
@@ -546,14 +644,28 @@ pub fn truncate(s: &str, max: usize) -> String {
 mod tests {
     use super::*;
 
+    static P: std::sync::LazyLock<Policy> = std::sync::LazyLock::new(Policy::default);
+
     #[test]
     fn formulas() {
-        assert!(formula_is_dangerous("cmd|'/c calc'!A0"));
-        assert!(formula_is_dangerous("WEBSERVICE(\"http://x\")"));
-        assert!(formula_is_dangerous("CALL (\"x\")"));
-        assert!(!formula_is_dangerous("SUM(A1:A3)"));
-        assert!(!formula_is_dangerous("\"a|b\"&A1"));
-        assert!(!formula_is_dangerous("RECALL(1)"));
+        assert!(formula_is_dangerous(
+            "HYPERLINK(\"file://evil/x.exe\",\"클릭\")",
+            &P
+        ));
+        assert!(formula_is_dangerous(
+            "HYPERLINK(\"\\\\evil\\share\\x\")",
+            &P
+        ));
+        assert!(!formula_is_dangerous(
+            "HYPERLINK(\"https://example.com\",\"a:b\")",
+            &P
+        ));
+        assert!(formula_is_dangerous("cmd|'/c calc'!A0", &P));
+        assert!(formula_is_dangerous("WEBSERVICE(\"http://x\")", &P));
+        assert!(formula_is_dangerous("CALL (\"x\")", &P));
+        assert!(!formula_is_dangerous("SUM(A1:A3)", &P));
+        assert!(!formula_is_dangerous("\"a|b\"&A1", &P));
+        assert!(!formula_is_dangerous("RECALL(1)", &P));
     }
 
     #[test]
@@ -562,6 +674,26 @@ mod tests {
         assert!(field_is_dangerous("includePicture \"http://x\"", false));
         assert!(!field_is_dangerous(" HYPERLINK \"http://x/link\" ", false));
         assert!(!field_is_dangerous(" PAGE ", false));
+        assert!(field_is_dangerous(
+            " DATABASE \\d \"c:\\db.mdb\" \\s \"select\" ",
+            false
+        ));
+        let p = Policy::default();
+        assert!(word_field_is_dangerous(
+            " HYPERLINK \"\\\\evil\\share\\x.exe\" ",
+            false,
+            &p
+        ));
+        assert!(!word_field_is_dangerous(
+            " HYPERLINK \\l \"_Toc1\" ",
+            false,
+            &p
+        ));
+        assert!(!word_field_is_dangerous(
+            " HYPERLINK \"https://example.com\" ",
+            false,
+            &p
+        ));
         assert!(field_is_dangerous("  \"c:\\cmd\" ", true));
     }
 

@@ -175,7 +175,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         r.ver == 0
             && match r.instance {
                 0 => doc.get(r.body..r.body + 8) == Some(crate::detect::OLE_MAGIC),
-                1 => r.len > 6 && doc[r.body + 4] == 0x78,
+                // zlib 헤더는 창 크기에 따라 0x08~0x78 등 다양하므로 헤더로 거르지 않는다
+                1 => r.len > 4,
                 _ => false,
             }
     };
@@ -259,35 +260,49 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         }
     }
 
-    // 하이퍼링크 대상 수집 (트리 순회)
+    // 하이퍼링크 대상 수집: PowerPoint 는 영구 객체 디렉터리로 레코드를 직접 찾아가므로
+    // 트리 순회가 중간에 끊겨도 놓치지 않도록 전수 헤더 검색으로 컨테이너를 찾는다
     let mut bad_links: HashSet<u32> = HashSet::new();
     let mut bad_strings: Vec<(usize, usize, String)> = Vec::new();
-    let d = &doc;
-    let records = walk(d, 0, d.len(), 0, &mut |r| {
-        if r.rtype == RT_EX_HYPERLINK && r.ver == 0xF {
-            let mut id = None;
-            let mut target = None;
-            walk(d, r.body, r.body + r.len, 1, &mut |c| {
-                if c.rtype == RT_EX_HYPERLINK_ATOM && c.len >= 4 {
-                    id = Some(u32::from_le_bytes(
-                        d[c.body..c.body + 4].try_into().unwrap(),
-                    ));
-                }
-                if c.rtype == RT_CSTRING && c.instance == 1 {
-                    target = Some((c.body, c.len, utf16le(&d[c.body..c.body + c.len])));
-                }
+    for r in find_headers(&doc, RT_EX_HYPERLINK, Some(0xF)) {
+        let d = &doc;
+        let mut id = None;
+        let mut targets = Vec::new();
+        walk(d, r.body, r.body + r.len, 1, &mut |c| {
+            if c.rtype == RT_EX_HYPERLINK_ATOM && c.len >= 4 {
+                id = Some(u32::from_le_bytes(
+                    d[c.body..c.body + 4].try_into().unwrap(),
+                ));
+            }
+            // instance 1 = 대상 주소, 3 = 위치(하위 주소)
+            if c.rtype == RT_CSTRING && (c.instance == 1 || c.instance == 3) {
+                targets.push((
+                    c.body,
+                    c.len,
+                    c.instance,
+                    utf16le(&d[c.body..c.body + c.len]),
+                ));
+            }
+            true
+        });
+        for (at, len, instance, url) in targets {
+            let internal = url.trim().is_empty() || url.starts_with('#');
+            // 대상 주소는 허용 URI 가 아니면(상대 파일 경로 포함) 제거, 위치는 외부 경로일 때만 제거
+            let risky = if instance == 1 {
                 true
-            });
-            if let (Some(id), Some((at, len, url))) = (id, target) {
-                let internal = url.trim().is_empty() || url.starts_with('#');
-                if !internal && (!policy.uri_allowed(&url) || policy.remove_hyperlinks) {
+            } else {
+                crate::xml::value_is_external(&url)
+            };
+            if !internal && risky && (!policy.uri_allowed(&url) || policy.remove_hyperlinks) {
+                if let Some(id) = id {
                     bad_links.insert(id);
-                    bad_strings.push((at, len, url));
                 }
+                bad_strings.push((at, len, url));
             }
         }
-        true
-    });
+    }
+    let d = &doc;
+    let records = walk(d, 0, d.len(), 0, &mut |_| true);
     if records == 0 {
         return blocked("structure", "PowerPoint 레코드 구조 해석 실패");
     }

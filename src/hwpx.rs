@@ -70,7 +70,10 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             "Contents/content.hpf 없음 - 올바른 HWPX 가 아님",
         );
     };
-    let mut manifest = xml::parse(&manifest_entry.data, manifest_name, policy)?;
+    // 패키지 전체가 공유하는 XML 노드 예산
+    let mut xml_nodes = 0usize;
+    let mut manifest =
+        xml::parse_counted(&manifest_entry.data, manifest_name, policy, &mut xml_nodes)?;
 
     // 조립할 파트: 원본 이름 → (출력 이름, 종류)
     let mut keep: BTreeMap<String, (String, Kind)> = BTreeMap::new();
@@ -264,10 +267,10 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                     .into_bytes()
             }
             Kind::Xml => {
-                let mut doc = match xml::parse(data, name, policy) {
+                let mut doc = match xml::parse_counted(data, name, policy, &mut xml_nodes) {
                     Ok(d) => d,
                     Err(e)
-                        if e.category() == "xxe"
+                        if matches!(e.category(), "xxe" | "resource")
                             || name.to_ascii_lowercase().starts_with("contents/") =>
                     {
                         return Err(e)
@@ -568,21 +571,26 @@ fn neutralize_hyperlink(el: &mut Element, ctx: &mut Ctx) {
     }
     let mut found = Vec::new();
     params(el, &mut found);
-    let target = found
-        .iter()
-        .find(|p| p.attr("name") == Some("Path"))
-        .or(found.first())
-        .map(|p| normalize_link(&p.text()))
-        .unwrap_or_default();
-    if target.is_empty() || target.starts_with('#') {
-        return; // 문서 내 책갈피 이동
+    // Path 와 Command 를 모두 검사한다 (한글은 Command 를 따라가므로 Path 만 보면 우회된다)
+    let mut worst: Option<(String, bool)> = None;
+    for p in &found {
+        let target = normalize_link(&p.text());
+        if target.is_empty() || target.starts_with('#') {
+            continue; // 문서 내 책갈피 이동
+        }
+        let permitted = ctx.policy.uri_allowed(&target);
+        if !permitted || ctx.policy.remove_hyperlinks {
+            let dangerous = !permitted;
+            if worst.as_ref().is_none_or(|(_, d)| dangerous && !d) {
+                worst = Some((target, dangerous));
+            }
+        }
     }
-    let allowed = ctx.policy.uri_allowed(&target) && !ctx.policy.remove_hyperlinks;
-    if !allowed {
-        let (cat, sev) = if ctx.policy.uri_allowed(&target) {
-            ("hyperlink", Severity::Low)
-        } else {
+    if let Some((target, dangerous)) = worst {
+        let (cat, sev) = if dangerous {
             ("dangerous-link", Severity::High)
+        } else {
+            ("hyperlink", Severity::Low)
         };
         for p in found {
             p.set_text("");

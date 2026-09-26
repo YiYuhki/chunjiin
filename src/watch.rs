@@ -94,6 +94,37 @@ fn list_files(root: &Path) -> Vec<PathBuf> {
     out
 }
 
+/// 일반 파일만 읽는다. 목록 작성 이후 심볼릭 링크 등으로 바꿔치기된 경우
+/// (열기 전 lstat 과 연 뒤 fstat 의 파일 식별자가 다르면) 거부한다.
+fn read_regular(path: &Path, limit: usize) -> io::Result<Vec<u8>> {
+    let before = fs::symlink_metadata(path)?;
+    if !before.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "일반 파일이 아님",
+        ));
+    }
+    let mut f = fs::File::open(path)?;
+    let after = f.metadata()?;
+    #[cfg(unix)]
+    let same = {
+        use std::os::unix::fs::MetadataExt;
+        before.dev() == after.dev() && before.ino() == after.ino()
+    };
+    #[cfg(not(unix))]
+    let same = after.is_file() && fs::symlink_metadata(path)?.is_file();
+    if !same || !after.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "처리 중 파일이 바뀜",
+        ));
+    }
+    // 크기 제한보다 1바이트만 더 읽으면 엔진이 크기 초과로 차단한다(거대 파일 전체를 메모리에 올리지 않음)
+    let mut data = Vec::new();
+    io::Read::read_to_end(&mut io::Read::take(&mut f, limit as u64 + 1), &mut data)?;
+    Ok(data)
+}
+
 fn stamp(path: &Path) -> Option<Stamp> {
     let m = fs::symlink_metadata(path).ok()?;
     m.is_file().then(|| Stamp {
@@ -217,7 +248,7 @@ impl<'a> Watcher<'a> {
     }
 
     fn process_one(&self, path: &Path, rel: &Path) -> io::Result<(CdrResult, Option<PathBuf>)> {
-        let data = fs::read(path)?;
+        let data = read_regular(path, self.engine.policy.max_file_size)?;
         let name = path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
