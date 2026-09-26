@@ -33,6 +33,8 @@ pub enum FileType {
     /// 단독 메타파일 (벡터 그림)
     Emf,
     Wmf,
+    /// SVG 벡터 그림 (허용 확장자일 때만, 엔진이 확장자로 결정)
+    Svg,
     /// 텍스트 (허용 확장자일 때만, 엔진이 확장자로 결정)
     Text,
     Csv,
@@ -62,6 +64,7 @@ impl FileType {
             FileType::Bmp => "bmp",
             FileType::Emf => "emf",
             FileType::Wmf => "wmf",
+            FileType::Svg => "svg",
             FileType::Text => "text",
             FileType::Csv => "csv",
             FileType::Tsv => "tsv",
@@ -97,6 +100,7 @@ impl FileType {
             FileType::Gif => Some("gif"),
             FileType::Emf => Some("emf"),
             FileType::Wmf => Some("wmf"),
+            FileType::Svg => Some("svg"),
             _ => None,
         }
     }
@@ -125,6 +129,7 @@ impl FileType {
             FileType::Bmp => &["bmp", "dib"],
             FileType::Emf => &["emf"],
             FileType::Wmf => &["wmf"],
+            FileType::Svg => &["svg"],
             FileType::Text => &["txt", "log"],
             FileType::Csv => &["csv"],
             FileType::Tsv => &["tsv", "tab"],
@@ -149,6 +154,11 @@ pub fn detect_named(data: &[u8], filename: &str, allow_text: bool) -> FileType {
             if extension_of(filename) == "eml" && crate::mail::looks_like_mail(data) =>
         {
             FileType::Eml
+        }
+        FileType::Unknown
+            if extension_of(filename) == "svg" && crate::svg::looks_like_svg(data) =>
+        {
+            FileType::Svg
         }
         FileType::Unknown
             if allow_text && !data.starts_with(b"MZ") && !data.starts_with(b"\x7fELF") =>

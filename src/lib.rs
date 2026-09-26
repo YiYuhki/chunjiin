@@ -22,6 +22,7 @@ pub mod policy;
 pub mod report;
 pub mod rtf;
 pub mod server;
+pub mod svg;
 pub mod text;
 pub mod watch;
 pub mod xml;

@@ -169,6 +169,15 @@ impl Engine {
                 }
                 crate::metafile::reassemble(data, &self.policy, findings)
             }
+            FileType::Svg => {
+                if !self.policy.allow_images {
+                    return Err(CdrError::Blocked {
+                        category: "unsupported",
+                        reason: "단독 이미지 파일 처리가 비활성화되어 있음".into(),
+                    });
+                }
+                crate::svg::reassemble(data, &self.policy, findings)
+            }
             FileType::Text => text::reassemble(data, text::Kind::Text, findings),
             FileType::Csv => text::reassemble(data, text::Kind::Delimited(','), findings),
             FileType::Tsv => text::reassemble(data, text::Kind::Delimited('\t'), findings),
@@ -189,7 +198,7 @@ impl Engine {
     fn verify(&self, output: &[u8], ftype: FileType) -> Option<String> {
         // 텍스트는 내용만으로 판별되지 않으므로 같은 형식으로 다시 해석한다
         let out_type = match ftype {
-            FileType::Text | FileType::Csv | FileType::Tsv | FileType::Eml => ftype,
+            FileType::Text | FileType::Csv | FileType::Tsv | FileType::Eml | FileType::Svg => ftype,
             _ => detect::detect(output),
         };
         if out_type != ftype.output_type() {

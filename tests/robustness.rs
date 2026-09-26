@@ -271,6 +271,8 @@ fn fuzz_archive_and_images() {
     run("a.eml", 24, eml, mutate_bytes);
     run("a.emf", 25, common::metafile::malicious_emf(), mutate_bytes);
     run("a.wmf", 26, common::metafile::malicious_wmf(), mutate_bytes);
+    let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" onload="x()"><style>rect{fill:url(#g)}</style><defs><linearGradient id="g"/></defs><rect width="5" height="5" style="fill:red"/><use xlink:href="#g"/><image href="data:image/gif;base64,R0lGODlhAQABAAAAACw="/><script>a()</script><a href="http://e/"><text>t</text></a></svg>"##.to_vec();
+    run("a.svg", 27, svg, mutate_bytes);
 }
 
 #[test]

@@ -21,6 +21,7 @@ use crate::legacy::blip::PixelBudget;
 use crate::metafile;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
+use crate::svg;
 use crate::xml::{self, Node};
 use crate::zipsafe::{self, Entry};
 
@@ -189,11 +190,25 @@ fn reassemble_at(
                         }
                     }
                 }
+                None if svg::looks_like_svg(data) => {
+                    match svg::rebuild(data, policy, &mut budget, findings, name) {
+                        Ok(bytes) => part.binary = Some(bytes),
+                        Err(e) => {
+                            findings.add(
+                                "svg",
+                                Severity::Medium,
+                                format!("SVG 제외: {e}"),
+                                name.as_str(),
+                            );
+                            dropped.insert(name.clone());
+                        }
+                    }
+                }
                 None => {
                     findings.add(
                         "unsupported-media",
                         Severity::Low,
-                        "재조합 불가 이미지 형식(SVG/TIFF 등) 제외",
+                        "재조합 불가 이미지 형식(TIFF 등) 제외",
                         name.as_str(),
                     );
                     dropped.insert(name.clone());
@@ -366,6 +381,7 @@ fn reassemble_at(
             PartType::Image => ImageKind::sniff(&bytes)
                 .map(|k| k.mime())
                 .or_else(|| metafile::sniff(&bytes).map(|k| k.mime()))
+                .or_else(|| svg::looks_like_svg(&bytes).then_some(svg::MIME))
                 .unwrap_or("application/octet-stream"),
             PartType::Package => package_content_type(&bytes),
         };

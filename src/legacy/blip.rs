@@ -59,7 +59,7 @@ impl PixelBudget {
     }
 
     /// 디코딩 전에 그림 크기만큼 예산을 쓴다. 헤더를 읽을 수 없으면 0 (디코딩 단계에서 실패)
-    fn charge(&mut self, data: &[u8], kind: ImageKind) -> Result<()> {
+    pub fn charge(&mut self, data: &[u8], kind: ImageKind) -> Result<()> {
         let format = match kind {
             ImageKind::Jpeg => image::ImageFormat::Jpeg,
             ImageKind::Png => image::ImageFormat::Png,

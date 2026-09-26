@@ -15,6 +15,7 @@ use crate::metafile;
 use crate::ooxml::content::truncate;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
+use crate::svg;
 use crate::xml::{self, value_is_external, Element, Node, XML_NS};
 use crate::zipsafe::{self, Entry};
 
@@ -49,7 +50,7 @@ enum Kind {
     Xml,
     /// 이미 재인코딩된 이미지 바이트
     Image(Vec<u8>),
-    /// 재조합된 메타파일(EMF/WMF) 바이트
+    /// 재조합된 벡터 그림(EMF/WMF/SVG) 바이트
     Metafile(Vec<u8>),
     Text,
 }
@@ -145,6 +146,23 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                         "image",
                         Severity::Medium,
                         format!("이미지 제외: {e}"),
+                        name.as_str(),
+                    );
+                    dropped_ids.insert(id);
+                }
+            }
+            continue;
+        }
+        if (lower.ends_with(".svg") || media.contains("svg")) && svg::looks_like_svg(data) {
+            match svg::rebuild(data, policy, &mut budget, findings, &name) {
+                Ok(bytes) => {
+                    keep.insert(name.clone(), (name.clone(), Kind::Metafile(bytes)));
+                }
+                Err(e) => {
+                    findings.add(
+                        "svg",
+                        Severity::Medium,
+                        format!("SVG 제외: {e}"),
                         name.as_str(),
                     );
                     dropped_ids.insert(id);
