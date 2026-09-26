@@ -13,14 +13,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Multipart, Query, State};
+use axum::extract::{ConnectInfo, DefaultBodyLimit, Multipart, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
 use serde::Deserialize;
 use tokio::sync::Semaphore;
 
+use crate::audit::Auditor;
 use crate::report::{CdrResult, Status};
 use crate::{Engine, Policy};
 
@@ -30,6 +31,7 @@ pub struct AppState {
     /// CPU 집약 작업 동시 실행 수 제한 (자원 고갈 방지)
     permits: Arc<Semaphore>,
     timeout: Duration,
+    auditor: Arc<Auditor>,
 }
 
 impl AppState {
@@ -38,7 +40,14 @@ impl AppState {
             policy: Arc::new(policy),
             permits: Arc::new(Semaphore::new(concurrency.max(1))),
             timeout,
+            auditor: Arc::new(Auditor::disabled()),
         }
+    }
+
+    /// 감사 로그/격리 보관을 켠다. 기록에 실패한 요청은 결과를 내주지 않는다(fail-closed).
+    pub fn with_auditor(mut self, auditor: Auditor) -> Self {
+        self.auditor = Arc::new(auditor);
+        self
     }
 }
 
@@ -70,11 +79,14 @@ pub fn router(state: AppState) -> Router {
 pub async fn serve(addr: SocketAddr, state: AppState) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     eprintln!("CDR API 서버 시작: http://{addr}");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
+    axum::serve(
+        listener,
+        router(state).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
 }
 
 fn error(status: StatusCode, msg: impl Into<String>) -> Response {
@@ -85,8 +97,9 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
 async fn run(
     state: &AppState,
     opts: &Options,
+    source: String,
     mut multipart: Multipart,
-) -> Result<CdrResult, Response> {
+) -> Result<(CdrResult, Option<String>), Response> {
     let mut file: Option<(String, Vec<u8>)> = None;
     loop {
         match multipart.next_field().await {
@@ -136,9 +149,22 @@ async fn run(
     let Ok(_permit) = state.permits.clone().acquire_owned().await else {
         return Err(error(StatusCode::SERVICE_UNAVAILABLE, "서버 종료 중"));
     };
-    let task = tokio::task::spawn_blocking(move || Engine::new(policy).process(&data, &name));
+    let auditor = state.auditor.clone();
+    let task = tokio::task::spawn_blocking(move || {
+        let started = std::time::Instant::now();
+        let r = Engine::new(policy.clone()).process(&data, &name);
+        let audit = auditor
+            .is_enabled()
+            .then(|| auditor.record(&r, &data, &source, &policy, started.elapsed()));
+        (r, audit)
+    });
     match tokio::time::timeout(state.timeout, task).await {
-        Ok(Ok(r)) => Ok(r),
+        Ok(Ok((r, None))) => Ok((r, None)),
+        Ok(Ok((r, Some(Ok(rec))))) => Ok((r, Some(rec.event_id))),
+        Ok(Ok((_, Some(Err(e))))) => Err(error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("감사 기록 실패로 결과를 제공하지 않습니다: {e}"),
+        )),
         Ok(Err(_)) => Err(error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "처리 중 내부 오류",
@@ -147,13 +173,29 @@ async fn run(
     }
 }
 
+type Peer = Option<Extension<ConnectInfo<SocketAddr>>>;
+
+fn source_of(peer: &Peer) -> String {
+    peer.as_ref()
+        .map(|Extension(ConnectInfo(a))| a.ip().to_string())
+        .unwrap_or_else(|| "api".into())
+}
+
+fn with_event_id(mut resp: Response, event_id: Option<String>) -> Response {
+    if let Some(v) = event_id.and_then(|id| HeaderValue::from_str(&id).ok()) {
+        resp.headers_mut().insert("x-cdr-event-id", v);
+    }
+    resp
+}
+
 async fn scan(
     State(state): State<AppState>,
     Query(opts): Query<Options>,
+    peer: Peer,
     multipart: Multipart,
 ) -> Response {
-    match run(&state, &opts, multipart).await {
-        Ok(r) => Json(r).into_response(),
+    match run(&state, &opts, source_of(&peer), multipart).await {
+        Ok((r, id)) => with_event_id(Json(r).into_response(), id),
         Err(resp) => resp,
     }
 }
@@ -161,15 +203,20 @@ async fn scan(
 async fn sanitize(
     State(state): State<AppState>,
     Query(opts): Query<Options>,
+    peer: Peer,
     multipart: Multipart,
 ) -> Response {
-    let mut r = match run(&state, &opts, multipart).await {
-        Ok(r) => r,
+    let (mut r, event_id) = match run(&state, &opts, source_of(&peer), multipart).await {
+        Ok(v) => v,
         Err(resp) => return resp,
     };
     if r.status == Status::Blocked {
-        return (StatusCode::UNPROCESSABLE_ENTITY, Json(r)).into_response();
+        return with_event_id(
+            (StatusCode::UNPROCESSABLE_ENTITY, Json(r)).into_response(),
+            event_id,
+        );
     }
+    let event_header = event_id.and_then(|id| HeaderValue::from_str(&id).ok());
     let body = r.output.take().unwrap_or_default();
     let name = r
         .output_filename
@@ -177,6 +224,9 @@ async fn sanitize(
         .unwrap_or_else(|| "sanitized".into());
 
     let mut headers = HeaderMap::new();
+    if let Some(v) = event_header {
+        headers.insert("x-cdr-event-id", v);
+    }
     headers.insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/octet-stream"),

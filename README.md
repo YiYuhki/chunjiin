@@ -88,8 +88,14 @@ OLE 복합 파일(CFB)은 **새 컨테이너를 만들어 허용된 스트림만
 |---|---|---|---|
 | **HWP 5.x** | FileHeader(속성 비트 정리), DocInfo, BodyText, 래스터 이미지 BinData(재인코딩), 미리보기 | 문서 스크립트(JScript), **EPS/PostScript**, OLE, DocOptions(연결 문서·DRM·서명), XMLTemplate, 문서 이력. 레코드 재구성으로 외부 파일 연결(BIN_DATA LINK) 경로와 허용되지 않은 하이퍼링크 필드 제거 | 암호, 배포용, DRM, 인증서 암호화 |
 | **doc** | WordDocument, 사용 중인 테이블 스트림, Data, CompObj | VBA(Macros), ObjectPool(OLE, 미리보기 그림은 유지), 사용하지 않는 테이블 스트림(이전 편집 잔재), MsoDataStore. FIB의 명령 사용자 지정·매크로 이름·**첨부 서식 파일 연결** 제거. 조각 테이블을 따라 **DDE/INCLUDE*/LINK/위험 HYPERLINK 필드 코드를 같은 길이 공백으로 덮어씀** | 암호화, Word 6/95 |
-| **xls** | Workbook, 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, 임베디드 OLE, ActiveX |
-| **ppt** | PowerPoint Document, Current User, Pictures, CompObj | 매크로·프로그램 실행·OLE 동작을 "동작 없음"으로, 위험 하이퍼링크 대상을 공백으로 바꿈(제자리) | 암호화, 임베디드 OLE/VBA 저장소, ActiveX, PowerPoint 95 |
+| **xls** | Workbook, 피벗 캐시, CompObj | VBA(_VBA_PROJECT_CUR), 사용자 정의 XML, 이전 형식 스트림, 변경 추적 기록. `--neutralize-ole` 사용 시 임베디드 OLE(MBD*)를 빈 저장소로 대체 | 암호화, **Excel 4.0 매크로 시트**, VB 모듈 시트, DDE/OLE 링크, ActiveX, 임베디드 OLE(기본값) |
+| **ppt** | PowerPoint Document, Current User, Pictures, CompObj | 매크로·프로그램 실행·OLE 동작을 "동작 없음"으로, 위험 하이퍼링크 대상을 공백으로 바꿈(제자리). `--neutralize-ole` 사용 시 OLE/VBA 저장소를 같은 자리의 빈 OLE 파일로 덮어쓰고 매크로 표시를 끔 | 암호화, ActiveX, PowerPoint 95, 임베디드 OLE/VBA(기본값), 레코드 구조 밖에 숨긴 저장소 |
+
+`--neutralize-ole`은 개체 **내용만** 비웁니다. 슬라이드와 시트에 저장된 미리보기 그림은 그대로 남습니다. PPT는 정상 레코드 트리의 최상위 영구 객체만 덮어쓰고, 전수 검색에서만 발견되는 저장소는 은닉 시도로 보고 차단합니다.
+Apache POI 테스트 문서로 확인한 결과는 다음과 같습니다.
+- PPT 차단 57→27건, XLS 차단 41→36건으로 줄었습니다.
+- 대체한 PPT 내장 개체 229개가 모두 정상 OLE 파일로 해제됐고, 텍스트는 원본과 같습니다.
+- Office에서 개체를 활성화했을 때의 동작은 확인하지 못했으므로 기본값은 차단입니다.
 
 PPT의 위험 레코드는 트리 순회에만 의존하지 않습니다. 비정상 컨테이너 속에 숨긴 경우까지 잡도록 **스트림 전체를 레코드 헤더 패턴으로 전수 검색**합니다.
 
@@ -123,8 +129,25 @@ cdr scan 의심문서.docm
 | `--dpi <N>` | 이미지화 해상도(기본 150) |
 | `--max-size <MB>` | 최대 입력 크기(기본 100MB) |
 | `--overwrite` | 출력 파일 덮어쓰기 |
+| `--neutralize-ole` | 레거시 PPT/XLS 임베디드 OLE를 차단하지 않고 빈 개체로 대체 |
+| `--audit-log <FILE>` | 감사 로그(JSONL)에 처리 결과를 한 줄씩 추가 |
+| `--quarantine <DIR>` | 재조합·차단된 파일의 원본을 격리 보관 |
+| `--quarantine-clean` | 정상 파일의 원본도 격리 보관 |
 
-종료 코드: `0` 모두 처리됨, `2` 차단된 파일 있음, `1` 입력 오류
+종료 코드: `0` 모두 처리됨, `2` 차단된 파일 있음, `3` 감사 기록 실패(해당 결과물은 저장하지 않음), `1` 입력 오류
+
+### 감사 로그와 격리 보관
+
+```bash
+cdr sanitize inbox/ -o clean/ --audit-log /var/log/cdr/audit.jsonl --quarantine /srv/cdr/quarantine
+```
+
+- **감사 로그(JSONL)**: 처리한 파일마다 한 줄을 추가합니다. 시각(UTC), 이벤트 ID, 출처(파일 경로 또는 클라이언트 IP), 입출력 SHA-256·크기, 상태, 최고 심각도, 탐지 분류, 적용 정책, 처리 시간이 들어갑니다. SIEM 수집에 바로 쓸 수 있습니다.
+  ```json
+  {"ts":"2026-09-26T08:50:55.673Z","event_id":"d99176fab696be28","source":"/inbox/보고서.docm","filename":"보고서.docm","detected_type":"docx","status":"sanitized","max_severity":"critical","findings":20,"categories":["macro","dde","template-injection",...],"input_sha256":"9236…","output_sha256":"…","quarantine":"2026-09-26/9236….bin","duration_ms":4,"policy":{…}}
+  ```
+- **격리 보관**: 재조합됐거나 차단된 파일의 **원본**을 `<폴더>/<날짜>/<SHA-256>.bin`에 저장하고, 같은 이름의 `.json`에 보고서를 남깁니다. 실수로 실행되지 않도록 확장자를 `.bin`으로 쓰고, 권한은 파일 0600·폴더 0700입니다. 같은 원본은 한 번만 저장합니다.
+- **fail-closed**: 감사 기록에 실패하면 결과물을 내주지 않습니다. CLI는 종료 코드 3, API는 500을 돌려줍니다.
 
 출력 예:
 
@@ -140,7 +163,8 @@ cdr scan 의심문서.docm
 ### REST API 서버
 
 ```bash
-cdr serve --bind 0.0.0.0:8080 [--concurrency 4] [--timeout 120] [--max-size 100]
+cdr serve --bind 0.0.0.0:8080 [--concurrency 4] [--timeout 120] [--max-size 100] \
+          [--audit-log audit.jsonl] [--quarantine quarantine/]
 ```
 
 | 메서드 | 경로 | 설명 |
@@ -150,7 +174,8 @@ cdr serve --bind 0.0.0.0:8080 [--concurrency 4] [--timeout 120] [--max-size 100]
 | `GET` | `/health` | 상태 확인 |
 | `GET` | `/` | 브라우저 업로드 페이지 |
 
-요청마다 정책을 바꿀 수 있습니다: `?rasterize=true&dpi=150&remove_links=true&keep_metadata=true`
+요청마다 정책을 바꿀 수 있습니다: `?rasterize=true&dpi=150&remove_links=true&keep_metadata=true&neutralize_ole=true`
+감사 로그를 켜면 응답 헤더 `X-CDR-Event-Id`가 로그의 `event_id`와 같아 요청을 추적할 수 있습니다.
 
 ```bash
 curl -F "file=@invoice.docm" http://localhost:8080/api/v1/sanitize -OJ
@@ -222,6 +247,7 @@ src/
 │   ├── xls.rs         Excel 97-2003 (BIFF 레코드 판정)
 │   └── ppt.rs         PowerPoint 97-2003 (동작·링크 제자리 무력화)
 ├── server.rs          REST API (axum)
+├── audit.rs           감사 로그(JSONL)·원본 격리 보관
 ├── ooxml/
 │   ├── mod.rs         관계 그래프 탐색 → 파트 재구성 → 새 패키지 조립
 │   ├── rules.rs       관계 유형·콘텐츠 형식·네임스페이스 허용 목록
@@ -243,7 +269,7 @@ cargo test
 
 ## 한계
 
-- 레거시 형식에서 떼어낼 수 없는 능동 콘텐츠(PPT·XLS의 임베디드 OLE, XLS의 Excel 4.0 매크로 시트 등)는 차단합니다. 필요하면 격리 환경에서 OOXML/HWPX로 변환한 뒤 재조합하십시오.
+- 레거시 형식에서 떼어낼 수 없는 능동 콘텐츠(XLS의 Excel 4.0 매크로 시트, ActiveX 등)는 차단합니다. 임베디드 OLE는 기본값이 차단이며 `--neutralize-ole`로 빈 개체로 대체할 수 있습니다. 필요하면 격리 환경에서 OOXML/HWPX로 변환한 뒤 재조합하십시오.
 - XLS에서 VBA 저장소를 빼도 워크북의 VBA 표시 레코드(OBPROJ)는 남습니다(오프셋 보존). 매크로 본체는 없습니다.
 - doc/xls/ppt 이미지(Data, Pictures 스트림)와 PDF 글꼴 프로그램은 재인코딩하지 않고 그대로 옮깁니다.
 - 검증은 실제 문서와 독립 파서로 했습니다. MS Office와 한컴오피스에서 직접 열어 보는 확인은 하지 않았습니다.

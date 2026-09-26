@@ -54,6 +54,8 @@ enum Command {
         /// 최대 파일 크기(MB)
         #[arg(long, default_value_t = 100)]
         max_size: usize,
+        #[command(flatten)]
+        audit: AuditArgs,
     },
 }
 
@@ -74,6 +76,8 @@ struct Common {
     /// PDF 주석/폼 외형을 평면화하지 않고 버림
     #[arg(long)]
     no_flatten: bool,
+    #[command(flatten)]
+    audit: AuditArgs,
     /// 레거시 PPT/XLS 의 임베디드 OLE 개체를 차단하지 않고 빈 개체로 대체
     #[arg(long)]
     neutralize_ole: bool,
@@ -89,6 +93,30 @@ struct Common {
     /// 탐지 항목 상세 출력
     #[arg(short, long)]
     verbose: bool,
+}
+
+#[derive(Args)]
+struct AuditArgs {
+    /// 감사 로그(JSONL) 파일 - 처리한 모든 파일을 한 줄씩 기록
+    #[arg(long)]
+    audit_log: Option<PathBuf>,
+    /// 재조합/차단된 파일의 원본을 보관할 격리 폴더
+    #[arg(long)]
+    quarantine: Option<PathBuf>,
+    /// 위협이 없던(정상) 파일의 원본도 격리 폴더에 보관
+    #[arg(long)]
+    quarantine_clean: bool,
+}
+
+impl AuditArgs {
+    fn open(&self) -> Result<cdr::audit::Auditor, String> {
+        cdr::audit::Auditor::open(&cdr::audit::AuditConfig {
+            log_path: self.audit_log.clone(),
+            quarantine_dir: self.quarantine.clone(),
+            quarantine_clean: self.quarantine_clean,
+        })
+        .map_err(|e| format!("감사 로그/격리 폴더 준비 실패: {e}"))
+    }
 }
 
 fn collect(inputs: &[PathBuf]) -> Vec<PathBuf> {
@@ -167,6 +195,14 @@ fn run(common: &Common, output: Option<(&Path, bool)>) -> ExitCode {
         ..Policy::default()
     };
     let engine = Engine::new(policy);
+    let auditor = match common.audit.open() {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::from(1);
+        }
+    };
+    let mut audit_failed = false;
     let files = collect(&common.inputs);
     if files.is_empty() {
         eprintln!("처리할 파일이 없습니다.");
@@ -192,9 +228,29 @@ fn run(common: &Common, output: Option<(&Path, bool)>) -> ExitCode {
                 continue;
             }
         };
+        let started = std::time::Instant::now();
         let r = engine.process(&data, &name);
-        if let (Some((dir, overwrite)), Some(out), Some(out_name)) =
-            (output, &r.output, &r.output_filename)
+        // 감사 기록에 실패하면 결과물을 저장하지 않는다 (fail-closed)
+        let audited = !auditor.is_enabled()
+            || match auditor.record(
+                &r,
+                &data,
+                &path.display().to_string(),
+                &engine.policy,
+                started.elapsed(),
+            ) {
+                Ok(_) => true,
+                Err(e) => {
+                    eprintln!(
+                        "감사 기록 실패 - 결과물을 저장하지 않음: {} ({e})",
+                        path.display()
+                    );
+                    audit_failed = true;
+                    false
+                }
+            };
+        if let (true, Some((dir, overwrite)), Some(out), Some(out_name)) =
+            (audited, output, &r.output, &r.output_filename)
         {
             let mut target = dir.join(out_name);
             let mut n = 1;
@@ -243,7 +299,9 @@ fn run(common: &Common, output: Option<(&Path, bool)>) -> ExitCode {
         "\n총 {total}건: 정상 {}, 재조합 {sanitized}, 차단 {blocked}",
         total - sanitized - blocked
     );
-    if blocked > 0 {
+    if audit_failed {
+        ExitCode::from(3)
+    } else if blocked > 0 {
         ExitCode::from(2)
     } else {
         ExitCode::SUCCESS
@@ -264,6 +322,7 @@ fn main() -> ExitCode {
             concurrency,
             timeout,
             max_size,
+            audit,
         } => {
             let policy = Policy {
                 max_file_size: max_size * 1024 * 1024,
@@ -279,6 +338,13 @@ fn main() -> ExitCode {
                 workers,
                 std::time::Duration::from_secs(*timeout),
             );
+            let state = match audit.open() {
+                Ok(a) => state.with_auditor(a),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::from(1);
+                }
+            };
             let rt = match tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
