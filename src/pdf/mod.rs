@@ -491,7 +491,23 @@ impl<'a> Copier<'a> {
             return Ok(Some(None));
         };
         if role == Role::FontFile3 && !font::is_truetype(&plain) {
-            return Ok(None);
+            // CFF 계열: 구조를 새로 쓰지는 않고, 모든 글리프 프로그램을 독립 해석기로 검증한 뒤 옮긴다
+            return match font::validate_cff(&plain) {
+                Ok(glyphs) => {
+                    *self.font_stats.entry("cff_fonts_validated").or_default() += 1;
+                    *self.font_stats.entry("cff_glyphs_validated").or_default() += glyphs as u64;
+                    Ok(None)
+                }
+                Err(e) => {
+                    self.findings.add(
+                        "font",
+                        Severity::Medium,
+                        format!("검증을 통과하지 못한 CFF 글꼴 프로그램 제외 ({e})"),
+                        "",
+                    );
+                    Ok(Some(None))
+                }
+            };
         }
         match font::rebuild_truetype(&plain) {
             Ok(rebuilt) => {

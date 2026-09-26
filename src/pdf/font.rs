@@ -238,16 +238,17 @@ fn write_sfnt(tables: &BTreeMap<[u8; 4], Vec<u8>>) -> Vec<u8> {
     out
 }
 
+struct Sink;
+impl ttf_parser::OutlineBuilder for Sink {
+    fn move_to(&mut self, _: f32, _: f32) {}
+    fn line_to(&mut self, _: f32, _: f32) {}
+    fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
+    fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
+    fn close(&mut self) {}
+}
+
 /// 독립 파서로 새 글꼴을 열고 모든 글리프 외곽선을 해석해 본다
 fn validate(data: &[u8], num_glyphs: usize) -> Result<(), String> {
-    struct Sink;
-    impl ttf_parser::OutlineBuilder for Sink {
-        fn move_to(&mut self, _: f32, _: f32) {}
-        fn line_to(&mut self, _: f32, _: f32) {}
-        fn quad_to(&mut self, _: f32, _: f32, _: f32, _: f32) {}
-        fn curve_to(&mut self, _: f32, _: f32, _: f32, _: f32, _: f32, _: f32) {}
-        fn close(&mut self) {}
-    }
     let face =
         ttf_parser::Face::parse(data, 0).map_err(|e| format!("재조합 글꼴 검증 실패: {e}"))?;
     if face.number_of_glyphs() as usize != num_glyphs {
@@ -258,6 +259,49 @@ fn validate(data: &[u8], num_glyphs: usize) -> Result<(), String> {
         let _ = face.outline_glyph(ttf_parser::GlyphId(gid as u16), &mut Sink);
     }
     Ok(())
+}
+
+/// CFF 글꼴 프로그램(FontFile3 의 Type1C/CIDFontType0C, 또는 CFF 기반 OpenType)을 검증한다.
+/// 글리프 프로그램(Type 2 charstring)은 글꼴 엔진이 해석·실행하는 코드이므로, 독립 해석기로
+/// 모든 글리프를 끝까지 해석해 보고 하나라도 비정상(스택·중첩 한도 초과, 잘못된 연산자,
+/// 서브루틴 범위 오류, 범위 밖 읽기 등)이면 거부한다. 반환값: 검증한 글리프 수
+pub fn validate_cff(data: &[u8]) -> Result<usize, String> {
+    let owned;
+    let cff_data: &[u8] = if data.starts_with(b"OTTO") {
+        let face =
+            ttf_parser::RawFace::parse(data, 0).map_err(|e| format!("OpenType 해석 실패: {e}"))?;
+        match face.table(ttf_parser::Tag::from_bytes(b"CFF ")) {
+            Some(t) => {
+                owned = t.to_vec();
+                &owned
+            }
+            None => return Err("CFF 테이블이 없는 OpenType (CFF2 등 미지원)".into()),
+        }
+    } else {
+        data
+    };
+    let table = ttf_parser::cff::Table::parse(cff_data).ok_or("CFF 구조 해석 실패")?;
+    let n = table.number_of_glyphs();
+    if n == 0 {
+        return Err("글리프가 없음".into());
+    }
+    let mut bad = 0usize;
+    let mut first = None;
+    for gid in 0..n {
+        match table.outline(ttf_parser::GlyphId(gid), &mut Sink) {
+            Ok(_) | Err(ttf_parser::CFFError::ZeroBBox) => {}
+            Err(e) => {
+                bad += 1;
+                first.get_or_insert((gid, e));
+            }
+        }
+    }
+    match first {
+        None => Ok(n as usize),
+        Some((gid, e)) => Err(format!(
+            "비정상 글리프 프로그램 {bad}개 (글리프 {gid}: {e:?})"
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -455,5 +499,139 @@ mod tests {
                 assert_eq!(rebuild_truetype(&r.data).unwrap().data, r.data);
             }
         }
+    }
+
+    /// 글리프 2개(.notdef, 사각형)짜리 최소 CFF. `glyph1` 로 두 번째 글리프 프로그램을 바꿀 수 있다
+    pub(crate) fn sample_cff(glyph1: &[u8]) -> Vec<u8> {
+        let index = |items: &[&[u8]]| {
+            let mut v = (items.len() as u16).to_be_bytes().to_vec();
+            v.push(1);
+            let mut off = 1u8;
+            v.push(off);
+            for it in items {
+                off += it.len() as u8;
+                v.push(off);
+            }
+            for it in items {
+                v.extend(*it);
+            }
+            v
+        };
+        let int5 = |n: i32| {
+            let mut v = vec![29];
+            v.extend(n.to_be_bytes());
+            v
+        };
+        let notdef: &[u8] = &[14];
+        let charstrings = index(&[notdef, glyph1]);
+        let private = [139u8, 20]; // defaultWidthX 0
+                                   // 헤더(4) + 이름 INDEX(8) + Top DICT INDEX(22) + 문자열 INDEX(2) + 전역 서브루틴 INDEX(2)
+        let cs_at = 4 + 8 + 22 + 2 + 2;
+        let private_at = cs_at + charstrings.len();
+        let mut top = int5(cs_at as i32);
+        top.push(17);
+        top.extend(int5(private.len() as i32));
+        top.extend(int5(private_at as i32));
+        top.push(18);
+        let mut out = vec![1, 0, 4, 1];
+        out.extend(index(&[b"Box"]));
+        out.extend(index(&[&top]));
+        out.extend([0, 0, 0, 0]);
+        assert_eq!(out.len(), cs_at);
+        out.extend(charstrings);
+        out.extend(private);
+        out
+    }
+
+    const BOX: &[u8] = &[139, 139, 21, 239, 139, 5, 139, 239, 5, 39, 139, 5, 14];
+
+    #[test]
+    fn cff_glyph_programs_are_validated() {
+        assert_eq!(validate_cff(&sample_cff(BOX)), Ok(2));
+        // 로컬 서브루틴이 없는데 callsubr 을 부르는 글리프, 정의되지 않은 연산자
+        for bad in [
+            &[139u8, 139, 21, 139, 10, 14][..],
+            &[139, 139, 21, 2, 14],
+            &[139, 139, 21],
+        ] {
+            let e = validate_cff(&sample_cff(bad)).unwrap_err();
+            assert!(e.contains("글리프 1"), "{e}");
+        }
+        assert!(validate_cff(b"not a font").is_err());
+    }
+
+    #[test]
+    fn mutated_cff_never_panics() {
+        let src = sample_cff(BOX);
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..5000 {
+            let mut d = src.clone();
+            for _ in 0..1 + next() % 4 {
+                let i = (next() % d.len() as u64) as usize;
+                d[i] = next() as u8;
+            }
+            let _ = validate_cff(&d);
+        }
+    }
+
+    #[test]
+    fn invalid_cff_font_program_is_dropped_from_pdf() {
+        use lopdf::{dictionary, Document, Object, Stream};
+        let build = |cff: Vec<u8>| {
+            let mut doc = Document::with_version("1.7");
+            let pages = doc.new_object_id();
+            let ff = doc.add_object(Stream::new(dictionary! { "Subtype" => "Type1C" }, cff));
+            let desc = doc.add_object(dictionary! {
+                "Type" => "FontDescriptor", "FontName" => "Box", "Flags" => 4,
+                "FontBBox" => vec![0.into(), 0.into(), 100.into(), 100.into()],
+                "ItalicAngle" => 0, "Ascent" => 100, "Descent" => 0, "CapHeight" => 100, "StemV" => 10,
+                "FontFile3" => ff,
+            });
+            let f = doc.add_object(dictionary! {
+                "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "Box",
+                "FirstChar" => 65, "LastChar" => 65, "Widths" => vec![500.into()], "FontDescriptor" => desc,
+            });
+            let content = doc.add_object(Stream::new(
+                dictionary! {},
+                b"BT /F1 20 Tf 10 10 Td (A) Tj ET".to_vec(),
+            ));
+            let page = doc.add_object(dictionary! {
+                "Type" => "Page", "Parent" => pages, "Contents" => content,
+                "Resources" => dictionary! { "Font" => dictionary! { "F1" => f } },
+            });
+            doc.objects.insert(
+                pages,
+                Object::Dictionary(dictionary! {
+                    "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+                    "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+                }),
+            );
+            let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+            doc.trailer.set("Root", cat);
+            let mut src = Vec::new();
+            doc.save_to(&mut src).unwrap();
+            let mut findings = crate::report::Findings::default();
+            let out =
+                crate::pdf::reassemble(&src, &crate::policy::Policy::default(), &mut findings)
+                    .unwrap();
+            let out = Document::load_mem(&out).unwrap();
+            let has_program = out
+                .objects
+                .values()
+                .any(|o| o.as_dict().is_ok_and(|d| d.has(b"FontFile3")));
+            (findings, has_program)
+        };
+        let (f, kept) = build(sample_cff(BOX));
+        assert!(kept);
+        assert_eq!(f.stats.get("cff_fonts_validated"), Some(&1));
+        let (f, kept) = build(sample_cff(&[139, 139, 21, 139, 10, 14]));
+        assert!(!kept, "검증 실패 글꼴 프로그램이 남아 있음");
+        assert!(f.items.iter().any(|x| x.category == "font"));
     }
 }
