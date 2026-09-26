@@ -340,3 +340,77 @@ fn legacy_output_is_deterministic() {
         assert!(a == b, "{name}: 출력이 실행마다 다름");
     }
 }
+
+#[test]
+fn ppt_pictures_are_reencoded_and_references_patched() {
+    // 그림 스트림: [숨긴 데이터][PNG(뒤에 페이로드)][메타파일] - FBSE 가 PNG 와 메타파일을 가리킴
+    let png = common::png_with_payload();
+    let blip = |rtype: u16, instance: u16, data: &[u8]| {
+        let mut body = vec![0xAB; 16];
+        body.push(0xFF);
+        body.extend(data);
+        ppt_rec(0, instance, rtype, &body)
+    };
+    let hidden = b"HIDDEN-PAYLOAD-BETWEEN-BLIPS".to_vec();
+    let png_rec = blip(0xF01E, 0x6E0, &png);
+    let meta_rec = ppt_rec(0, 0x216, 0xF01B, &[0x11; 60]);
+    let mut pictures = hidden.clone();
+    pictures.extend(&png_rec);
+    pictures.extend(&meta_rec);
+    let fbse = |size: usize, fo: usize| {
+        let mut b = vec![6u8, 6];
+        b.extend([0u8; 16]);
+        b.extend(0u16.to_le_bytes());
+        b.extend((size as u32).to_le_bytes());
+        b.extend(1u32.to_le_bytes());
+        b.extend((fo as u32).to_le_bytes());
+        b.extend([0u8; 4]);
+        ppt_rec(2, 6, 0xF007, &b)
+    };
+    let mut store = fbse(png_rec.len(), hidden.len());
+    store.extend(fbse(meta_rec.len(), hidden.len() + png_rec.len()));
+    let dgg = ppt_rec(0xF, 0, 0xF000, &ppt_rec(0xF, 2, 0xF001, &store));
+    let doc = ppt_rec(0xF, 0, 0x03E8, &ppt_rec(0xF, 0, 0x040B, &dgg));
+    let src = cfb(&[
+        ("PowerPoint Document", &doc),
+        ("Current User", &[0u8; 28]),
+        ("Pictures", &pictures),
+    ]);
+
+    let r = Engine::default().process(&src, "a.ppt");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    assert_cats(&r, &["hidden-data"]);
+    let out = read_cfb(r.output.as_ref().unwrap());
+    let pics = stream(&out, "Pictures").unwrap();
+    let new_doc = stream(&out, "PowerPoint Document").unwrap();
+    assert_eq!(new_doc.len(), doc.len());
+    assert!(!contains(pics, b"HIDDEN-PAYLOAD") && !contains(pics, b"<?php"));
+
+    // FBSE 가 새 위치·크기를 가리키고, 가리킨 곳의 PNG 가 정상 디코딩된다
+    let fbse_at: Vec<usize> = new_doc
+        .windows(4)
+        .enumerate()
+        .filter(|(_, w)| *w == [0x62, 0x00, 0x07, 0xF0])
+        .map(|(i, _)| i + 8)
+        .collect();
+    assert_eq!(fbse_at.len(), 2);
+    let field = |at: usize| u32::from_le_bytes(new_doc[at..at + 4].try_into().unwrap()) as usize;
+    let (size, fo) = (field(fbse_at[0] + 20), field(fbse_at[0] + 28));
+    assert_eq!(fo, 0);
+    let rec = &pics[fo..fo + size];
+    assert_eq!(&rec[2..4], &0xF01Eu16.to_le_bytes());
+    image::load_from_memory(&rec[8 + 17..]).expect("재인코딩된 PNG");
+    // 메타파일은 그대로, 새 위치로
+    let (size, fo) = (field(fbse_at[1] + 20), field(fbse_at[1] + 28));
+    assert_eq!(&pics[fo..fo + size], meta_rec.as_slice());
+    assert_eq!(fo + size, pics.len());
+
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "a.ppt");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}

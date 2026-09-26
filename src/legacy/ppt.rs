@@ -351,6 +351,23 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         findings.add(cat, sev, format!("{desc} 제거"), "PowerPoint Document");
     }
 
+    // 그림 스트림 재조합: 그림을 새로 인코딩하고 본문의 그림 목록(FBSE) 위치·크기만 제자리에서 고친다
+    let mut pictures = c.stream("Pictures").map(<[u8]>::to_vec);
+    if let Some(p) = &pictures {
+        match super::blip::rebuild(p, &doc, policy, findings, "Pictures") {
+            Some(r) => {
+                doc = r.document;
+                pictures = Some(r.pictures);
+            }
+            None => findings.add(
+                "image",
+                Severity::Low,
+                "그림 목록 구조를 해석할 수 없어 그림을 재인코딩하지 않고 옮김",
+                "Pictures",
+            ),
+        }
+    }
+
     // 새 컨테이너 조립
     let mut out = vec![Node {
         path: "PowerPoint Document".into(),
@@ -358,7 +375,15 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         clsid: [0; 16],
         data: doc,
     }];
-    for keep in ["Current User", "Pictures", "\u{1}CompObj"] {
+    if let Some(p) = pictures {
+        out.push(Node {
+            path: "Pictures".into(),
+            is_storage: false,
+            clsid: [0; 16],
+            data: p,
+        });
+    }
+    for keep in ["Current User", "\u{1}CompObj"] {
         if let Some(d) = c.stream(keep) {
             out.push(Node {
                 path: keep.into(),

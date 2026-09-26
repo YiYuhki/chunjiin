@@ -235,6 +235,7 @@ fn fuzz_legacy() {
         mutate_cfb,
     );
     run("a.ppt", 11, legacy::ppt(false), mutate_cfb);
+    run("p.ppt", 16, legacy::ppt_with_pictures(), mutate_cfb);
 }
 
 #[test]
@@ -244,4 +245,5 @@ fn fuzz_raw_bytes_all_formats() {
     run("r.hwpx", 13, common::malicious_hwpx(), mutate_bytes);
     run("r.doc", 14, legacy::malicious_doc(1 << 9), mutate_bytes);
     run("r.ppt", 15, legacy::ppt(false), mutate_bytes);
+    run("rp.ppt", 17, legacy::ppt_with_pictures(), mutate_bytes);
 }

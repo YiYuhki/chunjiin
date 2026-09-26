@@ -4,6 +4,7 @@
 //! 스트림 내부는 오프셋이 바뀌지 않는 제자리 무력화 또는 (오프셋이 없는 HWP 레코드의 경우)
 //! 레코드 재구성으로 처리하며, 안전하게 떼어낼 수 없는 능동 콘텐츠는 차단한다.
 
+pub mod blip;
 pub mod cfbx;
 pub mod doc;
 pub mod hwp;

@@ -274,3 +274,35 @@ pub fn ppt(with_ole: bool) -> Vec<u8> {
         ("Pictures", b"pics"),
     ])
 }
+
+/// 그림 저장소(FBSE)와 Pictures 스트림(PNG + 메타파일)을 가진 PPT
+pub fn ppt_with_pictures() -> Vec<u8> {
+    let mut png = Vec::new();
+    image::RgbImage::from_pixel(4, 4, image::Rgb([10, 200, 30]))
+        .write_to(&mut Cursor::new(&mut png), image::ImageFormat::Png)
+        .unwrap();
+    let mut body = vec![0u8; 17];
+    body.extend(&png);
+    let png_rec = ppt_rec(0, 0x6E0, 0xF01E, &body);
+    let meta_rec = ppt_rec(0, 0x216, 0xF01B, &[0x11; 40]);
+    let fbse = |size: usize, fo: usize| {
+        let mut b = vec![6u8, 6];
+        b.extend([0u8; 18]);
+        b.extend((size as u32).to_le_bytes());
+        b.extend(1u32.to_le_bytes());
+        b.extend((fo as u32).to_le_bytes());
+        b.extend([0u8; 4]);
+        ppt_rec(2, 6, 0xF007, &b)
+    };
+    let mut store = fbse(png_rec.len(), 0);
+    store.extend(fbse(meta_rec.len(), png_rec.len()));
+    let dgg = ppt_rec(0xF, 0, 0xF000, &ppt_rec(0xF, 2, 0xF001, &store));
+    let doc = ppt_rec(0xF, 0, 0x03E8, &ppt_rec(0xF, 0, 0x040B, &dgg));
+    let mut pictures = png_rec;
+    pictures.extend(meta_rec);
+    cfb(&[
+        ("PowerPoint Document", &doc),
+        ("Current User", &[0u8; 28]),
+        ("Pictures", &pictures),
+    ])
+}
