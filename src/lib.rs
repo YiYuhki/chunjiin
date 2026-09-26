@@ -14,6 +14,7 @@ pub mod error;
 pub mod hwpx;
 pub mod imaging;
 pub mod legacy;
+pub mod mail;
 pub mod ooxml;
 pub mod pdf;
 pub mod policy;

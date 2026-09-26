@@ -23,6 +23,8 @@ pub enum FileType {
     Zip,
     /// 서식 있는 텍스트(RTF)
     Rtf,
+    /// 전자우편 (RFC 5322/MIME, .eml)
+    Eml,
     /// 단독 이미지 파일
     Png,
     Jpeg,
@@ -50,6 +52,7 @@ impl FileType {
             FileType::Ole => "ole",
             FileType::Zip => "zip",
             FileType::Rtf => "rtf",
+            FileType::Eml => "eml",
             FileType::Png => "png",
             FileType::Jpeg => "jpeg",
             FileType::Gif => "gif",
@@ -83,6 +86,7 @@ impl FileType {
             FileType::Ppt => Some("ppt"),
             FileType::Zip => Some("zip"),
             FileType::Rtf => Some("rtf"),
+            FileType::Eml => Some("eml"),
             FileType::Png | FileType::Bmp => Some("png"),
             FileType::Jpeg => Some("jpg"),
             FileType::Gif => Some("gif"),
@@ -107,6 +111,7 @@ impl FileType {
             ],
             FileType::Zip => &["zip"],
             FileType::Rtf => &["rtf"],
+            FileType::Eml => &["eml"],
             FileType::Png => &["png"],
             FileType::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             FileType::Gif => &["gif"],
@@ -131,6 +136,11 @@ pub fn extension_of(filename: &str) -> String {
 /// 내용으로 판별하고, 판별되지 않으면 허용된 텍스트 확장자인 경우에만 텍스트로 본다
 pub fn detect_named(data: &[u8], filename: &str, allow_text: bool) -> FileType {
     match detect(data) {
+        FileType::Unknown
+            if extension_of(filename) == "eml" && crate::mail::looks_like_mail(data) =>
+        {
+            FileType::Eml
+        }
         FileType::Unknown
             if allow_text && !data.starts_with(b"MZ") && !data.starts_with(b"\x7fELF") =>
         {

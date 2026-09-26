@@ -5,7 +5,7 @@ use crate::error::{CdrError, Result};
 use crate::imaging::{self, ImageKind};
 use crate::policy::Policy;
 use crate::report::{sha256_hex, CdrResult, Findings, Severity, Status};
-use crate::{archive, hwpx, legacy, ooxml, pdf, rtf, text};
+use crate::{archive, hwpx, legacy, mail, ooxml, pdf, rtf, text};
 
 #[derive(Default)]
 pub struct Engine {
@@ -142,6 +142,7 @@ impl Engine {
             }),
             FileType::Zip => archive::reassemble(self, self.depth, data, findings),
             FileType::Rtf => rtf::reassemble(data, &self.policy, findings),
+            FileType::Eml => mail::reassemble(self, self.depth, data, findings),
             FileType::Png | FileType::Jpeg | FileType::Gif | FileType::Bmp => {
                 if !self.policy.allow_images {
                     return Err(CdrError::Blocked {
@@ -166,7 +167,7 @@ impl Engine {
                 let reason = if data.starts_with(b"MZ") || data.starts_with(b"\x7fELF") {
                     "실행 파일은 허용되지 않음"
                 } else {
-                    "지원하지 않는 파일 형식 (오피스·한글·PDF·RTF·이미지·ZIP·텍스트 만 지원)"
+                    "지원하지 않는 파일 형식 (오피스·한글·PDF·RTF·메일·이미지·ZIP·텍스트 만 지원)"
                 };
                 Err(CdrError::Blocked {
                     category: "unsupported",
@@ -179,7 +180,7 @@ impl Engine {
     fn verify(&self, output: &[u8], ftype: FileType) -> Option<String> {
         // 텍스트는 내용만으로 판별되지 않으므로 같은 형식으로 다시 해석한다
         let out_type = match ftype {
-            FileType::Text | FileType::Csv | FileType::Tsv => ftype,
+            FileType::Text | FileType::Csv | FileType::Tsv | FileType::Eml => ftype,
             _ => detect::detect(output),
         };
         if out_type != ftype.output_type() {

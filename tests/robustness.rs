@@ -267,6 +267,8 @@ fn fuzz_archive_and_images() {
     run("a.csv", 22, csv, mutate_bytes);
     let rtf = b"{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}{\\*\\datastore 0102}{\\object\\objemb{\\*\\objdata 0105}{\\result{\\pict\\pngblip 89504e47}}}{\\field{\\*\\fldinst DDEAUTO x}{\\fldrslt r}}\\pard text\\'c0\\u1234?\\par}".to_vec();
     run("a.rtf", 23, rtf, mutate_bytes);
+    let eml = b"From: a@b.c\r\nTo: d@e.f\r\nSubject: =?UTF-8?B?7ZWc6riA?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"X\"\r\n\r\n--X\r\nContent-Type: text/html\r\n\r\n<p onclick=x()>hi<script>a()</script><img src=http://t/p></p>\r\n--X\r\nContent-Type: application/pdf\r\nContent-Disposition: attachment; filename=a.pdf\r\nContent-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQK\r\n--X--\r\n".to_vec();
+    run("a.eml", 24, eml, mutate_bytes);
 }
 
 #[test]

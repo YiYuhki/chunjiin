@@ -105,6 +105,11 @@ pub fn strip_spoofing(name: &str) -> String {
         .collect()
 }
 
+/// 제어 문자(탭·줄바꿈 제외)와 양방향 재정의 문자를 제거한다
+pub fn strip_controls(s: &str, findings: &mut Findings) -> String {
+    clean(s, findings)
+}
+
 fn clean(s: &str, findings: &mut Findings) -> String {
     let (mut controls, mut bidi) = (0u64, 0u64);
     let out: String = s
