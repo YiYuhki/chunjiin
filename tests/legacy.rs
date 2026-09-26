@@ -323,3 +323,20 @@ fn ppt_embedded_ole_is_replaced_with_empty_storage() {
     let second = neutralizing().process(r.output.as_ref().unwrap(), "a.ppt");
     assert_eq!(second.status, Status::Clean, "{:#?}", second.findings);
 }
+
+#[test]
+fn legacy_output_is_deterministic() {
+    // 저장소 시각을 고정하므로 같은 입력은 항상 같은 바이트로 재조합된다
+    let e = neutralizing();
+    for (name, data) in [
+        ("a.hwp", malicious_hwp(1 | 8)),
+        ("a.doc", malicious_doc(1 << 9)),
+        ("a.xls", xls(0, &[obproj()])),
+        ("a.ppt", ppt(true)),
+    ] {
+        let a = e.process(&data, name).output.expect(name);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let b = e.process(&data, name).output.expect(name);
+        assert!(a == b, "{name}: 출력이 실행마다 다름");
+    }
+}

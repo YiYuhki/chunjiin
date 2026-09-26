@@ -110,6 +110,16 @@ pub fn write(version: Version, root_clsid: [u8; 16], nodes: &[Node]) -> Result<V
             let mut s = cf.create_stream(&p)?;
             s.write_all(&n.data)?;
         }
+        // 저장소 생성·수정 시각을 고정해 같은 입력이면 항상 같은 결과가 나오게 한다(재현성·중복 제거)
+        let storages: Vec<std::path::PathBuf> = cf
+            .walk()
+            .filter(|e| e.is_storage() && !e.is_root())
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        for p in storages {
+            cf.set_created_time(&p, std::time::UNIX_EPOCH)?;
+            cf.set_modified_time(&p, std::time::UNIX_EPOCH)?;
+        }
         cf.flush()?;
         Ok(cf.into_inner().into_inner())
     })();

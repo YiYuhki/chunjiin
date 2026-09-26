@@ -14,10 +14,11 @@
 //!    파일 끝 덧붙은 데이터는 새 문서에 존재하지 않는다.
 
 mod content;
+mod font;
 mod raster;
 mod scan;
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId, Stream, StringFormat};
@@ -39,6 +40,10 @@ enum Role {
     Generic,
     /// 그리기 연산자 스트림(폼 XObject, 타일링 패턴, Type3 글리프)
     Content,
+    /// 글꼴 기술자의 FontFile2 (TrueType 글꼴 프로그램)
+    TrueType,
+    /// 글꼴 기술자의 FontFile3 (CFF 또는 OpenType)
+    FontFile3,
 }
 
 /// 어떤 사전에서도 복사하지 않는 키: 액션·스크립트·첨부·외부 참조·메타데이터·구조 역참조
@@ -130,6 +135,7 @@ struct Copier<'a> {
     findings: &'a mut Findings,
     copied: usize,
     dropped_ops: HashMap<String, u64>,
+    font_stats: BTreeMap<&'static str, u64>,
 }
 
 impl<'a> Copier<'a> {
@@ -218,10 +224,11 @@ impl<'a> Copier<'a> {
             if is_font && !FONT_KEYS.contains(&k.as_slice()) {
                 continue;
             }
-            let role = if is_type3 && k.as_slice() == b"CharProcs" {
-                Role::Content
-            } else {
-                Role::Generic
+            let role = match k.as_slice() {
+                b"CharProcs" if is_type3 => Role::Content,
+                b"FontFile2" => Role::TrueType,
+                b"FontFile3" => Role::FontFile3,
+                _ => Role::Generic,
             };
             let copied = if role == Role::Content {
                 // CharProcs: 글리프 이름 → 콘텐츠 스트림
@@ -319,6 +326,12 @@ impl<'a> Copier<'a> {
             .filters()
             .map(|f| f.into_iter().map(<[u8]>::to_vec).collect())
             .unwrap_or_default();
+
+        if matches!(role, Role::TrueType | Role::FontFile3) {
+            if let Some(r) = self.font_program(s, role, depth)? {
+                return Ok(r);
+            }
+        }
 
         if is_image {
             if let Some(f) = filters
@@ -460,6 +473,69 @@ impl<'a> Copier<'a> {
         Ok(Some(Stream::new(dict, raw).with_compression(false)))
     }
 
+    /// 글꼴 프로그램 스트림. TrueType 외곽선 글꼴은 새로 조립하고, 조립할 수 없으면 제외한다.
+    /// CFF 계열(FontFile3 의 Type1C/CIDFontType0C/CFF OpenType)은 None 을 돌려 일반 스트림으로 옮긴다.
+    fn font_program(
+        &mut self,
+        s: &Stream,
+        role: Role,
+        depth: usize,
+    ) -> Result<Option<Option<Stream>>> {
+        let Ok(plain) = s.get_plain_content_with_limit(self.policy.max_stream_size) else {
+            self.findings.add(
+                "font",
+                Severity::Low,
+                "해제할 수 없는 글꼴 프로그램 제외",
+                "",
+            );
+            return Ok(Some(None));
+        };
+        if role == Role::FontFile3 && !font::is_truetype(&plain) {
+            return Ok(None);
+        }
+        match font::rebuild_truetype(&plain) {
+            Ok(rebuilt) => {
+                *self.font_stats.entry("fonts_rebuilt").or_default() += 1;
+                *self
+                    .font_stats
+                    .entry("font_glyph_programs_removed")
+                    .or_default() += rebuilt.stripped_glyphs as u64;
+                if rebuilt
+                    .dropped_tables
+                    .iter()
+                    .any(|t| matches!(t.as_str(), "fpgm" | "prep" | "cvt"))
+                {
+                    *self.font_stats.entry("font_hinting_removed").or_default() += 1;
+                }
+                let mut dict = self.copy_dict(&s.dict, depth)?;
+                for k in [
+                    b"Filter".as_slice(),
+                    b"DecodeParms",
+                    b"Length",
+                    b"DL",
+                    b"F",
+                    b"FFilter",
+                    b"FDecodeParms",
+                    b"Length2",
+                    b"Length3",
+                ] {
+                    dict.remove(k);
+                }
+                dict.set("Length1", Object::Integer(rebuilt.data.len() as i64));
+                Ok(Some(Some(Stream::new(dict, rebuilt.data))))
+            }
+            Err(e) => {
+                self.findings.add(
+                    "font",
+                    Severity::Low,
+                    format!("재조합할 수 없는 TrueType 글꼴 프로그램 제외 ({e})"),
+                    "",
+                );
+                Ok(Some(None))
+            }
+        }
+    }
+
     /// 복사된 리소스 사전에서 특정 범주의 이름 목록
     fn resource_names(&self, dict: &Dictionary, category: &[u8]) -> HashSet<Vec<u8>> {
         let Ok(res) = dict.get(b"Resources") else {
@@ -545,6 +621,7 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
         findings,
         copied: 0,
         dropped_ops: HashMap::new(),
+        font_stats: BTreeMap::new(),
         content_tokens: 0,
     };
     let pages_id = copier.dst.new_object_id();
@@ -618,8 +695,14 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
     dropped_list.sort();
     let copied_objects = copier.copied as u64;
     let Copier {
-        mut dst, findings, ..
+        mut dst,
+        findings,
+        font_stats,
+        ..
     } = copier;
+    for (k, v) in font_stats {
+        findings.count(k, v);
+    }
     if dropped_ops > 0 {
         let names: Vec<String> = dropped_list
             .iter()
