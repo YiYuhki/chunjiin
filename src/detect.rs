@@ -10,6 +10,8 @@ pub enum FileType {
     Docx,
     Xlsx,
     Pptx,
+    /// 한컴오피스 OWPML 문서
+    Hwpx,
     /// 레거시 doc/xls/ppt/hwp 또는 암호화된 OOXML
     Ole,
     Zip,
@@ -23,6 +25,7 @@ impl FileType {
             FileType::Docx => "docx",
             FileType::Xlsx => "xlsx",
             FileType::Pptx => "pptx",
+            FileType::Hwpx => "hwpx",
             FileType::Ole => "ole",
             FileType::Zip => "zip",
             FileType::Unknown => "unknown",
@@ -36,6 +39,7 @@ impl FileType {
             FileType::Docx => Some("docx"),
             FileType::Xlsx => Some("xlsx"),
             FileType::Pptx => Some("pptx"),
+            FileType::Hwpx => Some("hwpx"),
             _ => None,
         }
     }
@@ -47,6 +51,7 @@ impl FileType {
             FileType::Docx => &["docx", "docm", "dotx", "dotm"],
             FileType::Xlsx => &["xlsx", "xlsm", "xltx", "xltm", "xlam"],
             FileType::Pptx => &["pptx", "pptm", "potx", "potm", "ppsx", "ppsm", "ppam"],
+            FileType::Hwpx => &["hwpx"],
             FileType::Ole => &[
                 "doc", "dot", "xls", "xlt", "ppt", "pot", "pps", "hwp", "msg",
             ],
@@ -80,9 +85,18 @@ pub fn detect(data: &[u8]) -> FileType {
 }
 
 fn detect_zip(data: &[u8]) -> FileType {
-    let Ok(archive) = zip::ZipArchive::new(Cursor::new(data)) else {
+    let Ok(mut archive) = zip::ZipArchive::new(Cursor::new(data)) else {
         return FileType::Unknown;
     };
+    if let Ok(mut f) = archive.by_name("mimetype") {
+        let mut head = Vec::new();
+        use std::io::Read;
+        if (&mut f).take(64).read_to_end(&mut head).is_ok()
+            && head.trim_ascii().starts_with(b"application/hwp+zip")
+        {
+            return FileType::Hwpx;
+        }
+    }
     let names: Vec<&str> = archive.file_names().collect();
     if !names.contains(&"[Content_Types].xml") {
         return FileType::Zip;

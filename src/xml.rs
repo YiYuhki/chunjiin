@@ -357,6 +357,40 @@ fn push_text(stack: &mut [Element], s: &str, name: &str) -> Result<()> {
     }
 }
 
+const DANGEROUS_ATTR_SCHEMES: &[&str] = &[
+    "file",
+    "http",
+    "https",
+    "ftp",
+    "smb",
+    "mhtml",
+    "javascript",
+    "vbscript",
+    "data",
+];
+
+/// 속성 값이 외부 자원(URL, UNC 경로, ms-* 프로토콜 핸들러)을 가리키는지 판단한다.
+pub fn value_is_external(value: &str) -> bool {
+    let v = value.trim_start();
+    if v.starts_with("\\\\") || v.starts_with("//") {
+        return true;
+    }
+    let Some((scheme, _)) = v.split_once(':') else {
+        return false;
+    };
+    if scheme.is_empty()
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
+    {
+        return false;
+    }
+    let scheme = scheme.to_ascii_lowercase();
+    DANGEROUS_ATTR_SCHEMES.contains(&scheme.as_str())
+        || scheme.starts_with("ms-")
+        || scheme == "search-ms"
+}
+
 // ----------------------------------------------------------------------------- 직렬화
 
 pub fn serialize(doc: &Document) -> Vec<u8> {

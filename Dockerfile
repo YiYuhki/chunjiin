@@ -8,5 +8,6 @@ FROM debian:bookworm-slim
 RUN useradd --system --no-create-home cdr
 COPY --from=build /src/target/release/cdr /usr/local/bin/cdr
 USER cdr
+EXPOSE 8080
 ENTRYPOINT ["cdr"]
 CMD ["--help"]

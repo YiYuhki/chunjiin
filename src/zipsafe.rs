@@ -97,12 +97,23 @@ fn safe_name(name: &str) -> bool {
 }
 
 pub fn write_entries(entries: &[Entry]) -> Result<Vec<u8>> {
+    write_entries_with(entries, &[])
+}
+
+/// `stored` 에 있는 엔트리는 압축하지 않고 저장한다 (예: OCF 의 mimetype).
+pub fn write_entries_with(entries: &[Entry], stored: &[&str]) -> Result<Vec<u8>> {
     let mut writer = ZipWriter::new(Cursor::new(Vec::new()));
     let opts = SimpleFileOptions::default()
         .compression_method(CompressionMethod::Deflated)
         .last_modified_time(zip::DateTime::default())
         .unix_permissions(0o644);
+    let stored_opts = opts.compression_method(CompressionMethod::Stored);
     for e in entries {
+        let opts = if stored.contains(&e.name.as_str()) {
+            stored_opts
+        } else {
+            opts
+        };
         let r = writer
             .start_file(e.name.as_str(), opts)
             .map_err(|e| e.to_string())

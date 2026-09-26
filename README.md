@@ -17,7 +17,8 @@
 | Word | docx, docm, dotx, dotm | docx |
 | Excel | xlsx, xlsm, xltx, xltm, xlam | xlsx |
 | PowerPoint | pptx, pptm, ppsx, ppsm, potx, potm | pptx |
-| PDF | pdf | pdf |
+| 한글 | hwpx | hwpx |
+| PDF | pdf | pdf (선택: 페이지 이미지화) |
 | 레거시 doc/xls/ppt/hwp, 암호화 문서, 실행 파일, 기타 | — | **차단** |
 
 ## 재조합 방식
@@ -52,6 +53,25 @@
 5. 주석과 폼 필드는 외형(appearance)을 페이지 본문에 **평면화**합니다. 링크는 허용된 URI와 문서 안 페이지 이동만 새로 만듭니다.
 6. 카탈로그는 `Pages`와 `Outlines`(책갈피: 제목 + 페이지 이동만)로만 새로 구성합니다. JavaScript, OpenAction, 추가 액션(/AA), 첨부 파일, XFA/AcroForm, 포트폴리오, XMP/문서 정보 메타데이터, 증분 업데이트 이력, 참조되지 않은 객체, `%%EOF` 뒤에 붙은 데이터는 새 문서에 존재하지 않습니다.
 
+### PDF 최고 보안 모드 (`--rasterize`)
+
+구조 재조합을 끝낸 PDF를 순수 Rust 렌더러([hayro](https://crates.io/crates/hayro), `unsafe` 금지)로 페이지마다 렌더링합니다. 그 이미지만으로 PDF를 다시 만듭니다.
+글꼴 프로그램, 벡터 그래픽, 원본 이미지 코덱 데이터 등 **원본에서 온 바이트가 하나도 남지 않습니다.** 텍스트 선택, 검색, 링크, 책갈피는 사라집니다.
+렌더러는 원본이 아니라 이미 재조합된 문서를 입력으로 받습니다. 기본값은 150DPI이고, 페이지당 4천만 화소를 넘지 않게 해상도를 자동으로 낮춥니다.
+
+### 한글 (HWPX)
+
+1. `mimetype`(`application/hwp+zip`)과 패키지 매니페스트(`Contents/content.hpf`)를 확인합니다.
+2. 매니페스트 항목 중 허용된 것만 새 패키지에 조립합니다.
+   - 조립함: XML 파트(헤더·섹션·설정·차트 등, 허용 네임스페이스로 재구성), 이미지(재인코딩), 미리보기
+   - 조립하지 않음: 문서 스크립트(`Scripts/`, JScript 매크로), OLE 개체, 실행 파일·글꼴 등 비이미지 바이너리, 외부 경로 항목(`C:\…`, URL), 매니페스트에 없는 은닉 파일
+   - 한컴이 모든 문서에 넣는 **빈 기본 스크립트 템플릿**은 Info로 보고합니다. 실제 코드가 있는 스크립트만 Critical로 구분합니다.
+3. 본문을 이렇게 재구성합니다.
+   - `hp:ole`와 `hp:video`를 제거합니다.
+   - 제외된 바이너리를 가리키는 그림은 제거하고, 임베디드 글꼴 참조는 해제합니다.
+   - 허용되지 않은 하이퍼링크 필드(`file:`, UNC 등)는 대상을 비웁니다. 한컴 형식(`http\://…;1;0;0;`, 스킴 없는 `www.…`)도 해석합니다.
+4. `mimetype`을 무압축 첫 엔트리로 둔 새 OCF 패키지를 작성합니다. 매니페스트와 `META-INF` 목록은 조립된 파일에 맞게 정리합니다.
+
 ### 공통
 
 - 확장자가 아니라 내용으로 형식을 판별합니다. 확장자 위장은 탐지해서 교정합니다.
@@ -78,6 +98,8 @@ cdr scan 의심문서.docm
 | `--remove-links` | 허용 스킴(http/https/mailto)의 하이퍼링크까지 모두 제외 |
 | `--keep-metadata` | 작성자 등 메타데이터 유지 |
 | `--no-flatten` | PDF 주석/폼 외형을 평면화하지 않고 버림 |
+| `--rasterize` | PDF 최고 보안 모드(페이지 이미지화) |
+| `--dpi <N>` | 이미지화 해상도(기본 150) |
 | `--max-size <MB>` | 최대 입력 크기(기본 100MB) |
 | `--overwrite` | 출력 파일 덮어쓰기 |
 
@@ -93,6 +115,28 @@ cdr scan 의심문서.docm
     ...
     · images_reencoded=1, input_parts=15, output_parts=9
 ```
+
+### REST API 서버
+
+```bash
+cdr serve --bind 0.0.0.0:8080 [--concurrency 4] [--timeout 120] [--max-size 100]
+```
+
+| 메서드 | 경로 | 설명 |
+|---|---|---|
+| `POST` | `/api/v1/sanitize` | multipart `file`을 받아 재조합된 파일을 돌려줍니다. 응답 헤더: `X-CDR-Status`, `X-CDR-Findings`, `X-CDR-Max-Severity`, `X-CDR-Detected-Type`, `X-CDR-Output-SHA256`. 차단되면 **422**와 JSON 보고서를 돌려줍니다. |
+| `POST` | `/api/v1/scan` | multipart `file`을 받아 JSON 보고서를 돌려줍니다. |
+| `GET` | `/health` | 상태 확인 |
+| `GET` | `/` | 브라우저 업로드 페이지 |
+
+요청마다 정책을 바꿀 수 있습니다: `?rasterize=true&dpi=150&remove_links=true&keep_metadata=true`
+
+```bash
+curl -F "file=@invoice.docm" http://localhost:8080/api/v1/sanitize -OJ
+curl -F "file=@report.pdf" "http://localhost:8080/api/v1/scan?rasterize=true"
+```
+
+재조합 작업은 별도 스레드 풀에서 실행합니다. 동시 처리 수(세마포어), 요청 크기, 처리 시간으로 자원 고갈을 막습니다.
 
 ### 라이브러리로 사용
 
@@ -112,7 +156,10 @@ println!("{}", serde_json::to_string_pretty(&result)?);
 
 ```bash
 docker build -t cdr .
+# 일괄 처리
 docker run --rm -v "$PWD/in:/in:ro" -v "$PWD/out:/out" cdr sanitize /in -o /out --report /out/report.json
+# API 서버
+docker run --rm -p 8080:8080 cdr serve --bind 0.0.0.0:8080
 ```
 
 ## 보고서(JSON)
@@ -146,6 +193,8 @@ src/
 ├── xml.rs             재조합용 최소 XML DOM (DTD 불허, 네임스페이스 해석)
 ├── zipsafe.rs         안전한 압축 해제 / 결정적 재압축
 ├── imaging.rs         이미지 디코딩 → 재인코딩
+├── hwpx.rs            HWPX 매니페스트 기반 재조합
+├── server.rs          REST API (axum)
 ├── ooxml/
 │   ├── mod.rs         관계 그래프 탐색 → 파트 재구성 → 새 패키지 조립
 │   ├── rules.rs       관계 유형·콘텐츠 형식·네임스페이스 허용 목록
@@ -153,6 +202,7 @@ src/
 ├── pdf/
 │   ├── mod.rs         새 PDF 생성, 리소스 복사, 주석 평면화, 링크·책갈피 재생성
 │   ├── content.rs     콘텐츠 스트림 연산자 허용 목록 / 재인코딩
+│   ├── raster.rs      최고 보안 모드: 페이지 렌더링 → 이미지 PDF
 │   └── scan.rs        원본 위협 요소 분석(보고용)
 └── main.rs            CLI
 tests/                 악성 샘플을 코드로 생성해 검증하는 통합 테스트
@@ -166,7 +216,9 @@ cargo test
 
 ## 한계
 
-- 레거시 바이너리 형식(doc/xls/ppt/hwp)은 차단합니다. 필요하면 격리 환경에서 OOXML/PDF로 변환한 뒤 재조합하십시오.
+- 레거시 바이너리 형식(doc/xls/ppt/hwp)은 차단합니다. 필요하면 격리 환경에서 OOXML/HWPX/PDF로 변환한 뒤 재조합하십시오.
+- HWPX 결과물은 실제 한컴 문서 49종으로 검증했습니다. 구조 무결성, 본문 텍스트 일치, 독립 파서(hwpxlib)의 읽기·쓰기를 확인했습니다. 한컴오피스에서 직접 열어 보는 확인은 하지 않았습니다.
+- 래스터화 모드는 hayro 렌더러의 지원 범위를 따릅니다(일부 블렌딩/녹아웃 그룹 미지원).
 - PDF 글꼴 프로그램(TrueType/CFF)은 구조를 재작성하지 않고 그대로 옮깁니다. 글꼴 파서 취약점까지 막으려면 글꼴 재생성이나 페이지 래스터화 모드를 추가로 고려해야 합니다.
 - PDF 인라인 이미지 중 필터가 걸린 것은 파서가 지원하지 않아 제외됩니다.
 - Office의 EMF/WMF/SVG 이미지와 GIF 애니메이션(첫 프레임만 남음)은 재조합하지 않습니다.

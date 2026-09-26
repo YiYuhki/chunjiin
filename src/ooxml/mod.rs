@@ -9,7 +9,7 @@
 //! 데이터 연결, customUI, 사용자 정의 XML, 참조되지 않은 은닉 파트 등은
 //! "제거"되는 것이 아니라 애초에 새 문서에 조립되지 않는다.
 
-mod content;
+pub(crate) mod content;
 pub mod rules;
 
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};

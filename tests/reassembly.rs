@@ -409,3 +409,115 @@ fn chart_workbook_is_reassembled_recursively() {
     assert!(!inner_parts.iter().any(|(n, _)| n.contains("macrosheets")));
     assert!(part(&parts, "[Content_Types].xml").contains("spreadsheetml.sheet\""));
 }
+
+// ============================================================================ HWPX
+
+#[test]
+fn hwpx_is_reassembled() {
+    let r = Engine::default().process(&malicious_hwpx(), "공문.hwpx");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    assert_eq!(r.output_filename.as_deref(), Some("공문.hwpx"));
+    assert_cats(
+        &r,
+        &[
+            "macro",
+            "embedded-object",
+            "executable",
+            "external-resource",
+            "dangerous-link",
+            "orphan-part",
+            "foreign-xml",
+            "metadata",
+        ],
+    );
+
+    let out = r.output.as_ref().unwrap();
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(out.as_slice())).unwrap();
+    {
+        let first = archive.by_index(0).unwrap();
+        assert_eq!(first.name(), "mimetype");
+        assert_eq!(first.compression(), zip::CompressionMethod::Stored);
+    }
+    let parts = unzip(out);
+    let mut names: Vec<&str> = parts.iter().map(|(n, _)| n.as_str()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            "BinData/image1.png",
+            "Contents/content.hpf",
+            "Contents/header.xml",
+            "Contents/section0.xml",
+            "META-INF/container.xml",
+            "Preview/PrvText.txt",
+            "mimetype",
+            "version.xml",
+        ]
+    );
+
+    let manifest = part(&parts, "Contents/content.hpf");
+    for bad in ["ole1", "tool.bin", "evil.example", "Scripts", "홍길동"] {
+        assert!(!manifest.contains(bad), "{bad}");
+    }
+    assert!(
+        manifest.contains("image1") && manifest.contains("section0") && manifest.contains("공문")
+    );
+
+    let section = part(&parts, "Contents/section0.xml");
+    assert!(
+        section.contains("안전한 본문 &amp; 기호")
+            && section.contains("악성 링크")
+            && section.contains("정상 링크")
+    );
+    assert!(!section.contains("attacker"));
+    assert!(section.contains("https://example.com/"));
+    assert!(section.contains(r#"binaryItemIDRef="image1""#));
+    assert!(!section.contains("remote") && !section.contains(r#"<hp:pic id="21""#));
+    assert!(!section.contains("hp:ole") && !section.contains("evil:payload"));
+
+    let header = part(&parts, "Contents/header.xml");
+    assert!(!header.contains("exe1") && header.contains(r#"isEmbedded="0""#));
+    assert!(!part(&parts, "META-INF/container.xml").contains("Scripts"));
+    assert!(!part(&parts, "Preview/PrvText.txt").contains('\u{0007}'));
+}
+
+#[test]
+fn reassembled_hwpx_is_clean_on_second_pass() {
+    let engine = Engine::default();
+    let first = engine.process(&malicious_hwpx(), "a.hwpx");
+    let second = engine.process(first.output.as_ref().unwrap(), "a.hwpx");
+    assert_eq!(second.status, Status::Clean, "{:#?}", second.findings);
+}
+
+// ============================================================================ 래스터화
+
+#[test]
+fn pdf_rasterize_mode_leaves_only_images() {
+    let engine = Engine::new(Policy {
+        pdf_rasterize: true,
+        raster_dpi: 72.0,
+        ..Policy::default()
+    });
+    let r = engine.process(&malicious_pdf(), "a.pdf");
+    assert_eq!(r.status, Status::Sanitized, "{}", r.reason);
+    assert_eq!(r.stats.get("pages_rasterized"), Some(&2));
+    let doc = Document::load_mem(r.output.as_ref().unwrap()).unwrap();
+    assert_eq!(doc.get_pages().len(), 2);
+    for obj in doc.objects.values() {
+        let dict = match obj {
+            Object::Dictionary(d) => d,
+            Object::Stream(s) => &s.dict,
+            _ => continue,
+        };
+        assert!(!dict.has(b"Font") && !dict.has(b"Annots") && !dict.has(b"Outlines"));
+        if let Ok(sub) = dict.get(b"Subtype").and_then(Object::as_name) {
+            assert_eq!(sub, b"Image");
+        }
+    }
+}

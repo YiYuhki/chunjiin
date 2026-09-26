@@ -51,39 +51,7 @@ const DANGEROUS_FORMULA_FUNCS: &[&str] = &[
     "RTD",
 ];
 
-const DANGEROUS_ATTR_SCHEMES: &[&str] = &[
-    "file",
-    "http",
-    "https",
-    "ftp",
-    "smb",
-    "mhtml",
-    "javascript",
-    "vbscript",
-    "data",
-];
-
-/// 속성 값이 외부 자원(URL, UNC 경로, ms-* 프로토콜 핸들러)을 가리키는지 판단한다.
-fn attr_is_external(value: &str) -> bool {
-    let v = value.trim_start();
-    if v.starts_with("\\\\") || v.starts_with("//") {
-        return true;
-    }
-    let Some((scheme, _)) = v.split_once(':') else {
-        return false;
-    };
-    if scheme.is_empty()
-        || !scheme
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "+-.".contains(c))
-    {
-        return false;
-    }
-    let scheme = scheme.to_ascii_lowercase();
-    DANGEROUS_ATTR_SCHEMES.contains(&scheme.as_str())
-        || scheme.starts_with("ms-")
-        || scheme == "search-ms"
-}
+use crate::xml::value_is_external as attr_is_external;
 
 pub struct Ctx<'a> {
     pub kind: DocKind,
@@ -91,6 +59,8 @@ pub struct Ctx<'a> {
     pub valid_ids: &'a HashSet<String>,
     pub policy: &'a Policy,
     notes: BTreeMap<(&'static str, Severity, String), u32>,
+    /// 현재 요소의 조상 이름 (조상 제거 요청이 실제 조상이 있을 때만 올라가도록)
+    ancestors: Vec<String>,
 }
 
 impl<'a> Ctx<'a> {
@@ -106,6 +76,7 @@ impl<'a> Ctx<'a> {
             valid_ids,
             policy,
             notes: BTreeMap::new(),
+            ancestors: Vec::new(),
         }
     }
 
@@ -165,6 +136,15 @@ fn rebuild_children(
     Ok(out)
 }
 
+/// 제거 대상이 특정 조상 안에 있으면 그 조상째, 아니면 자신만 제거한다.
+fn remove_up_to(ctx: &Ctx, ancestor: &'static str) -> Action {
+    if ctx.ancestors.iter().any(|a| a == ancestor) {
+        Action::RemoveAncestor(ancestor)
+    } else {
+        Action::Remove
+    }
+}
+
 fn sanitize_element(el: &mut Element, ctx: &mut Ctx) -> Action {
     // 1) 네임스페이스 허용 목록
     if !rules::namespace_allowed(&el.ns) {
@@ -196,7 +176,7 @@ fn sanitize_element(el: &mut Element, ctx: &mut Ctx) -> Action {
     if dangling {
         return match el.local.as_str() {
             "hyperlink" if el.has_element_children() => Action::Unwrap,
-            "oleObj" => Action::RemoveAncestor("graphicFrame"),
+            "oleObj" => remove_up_to(ctx, "graphicFrame"),
             _ => Action::Remove,
         };
     }
@@ -266,7 +246,10 @@ fn sanitize_element(el: &mut Element, ctx: &mut Ctx) -> Action {
 
     // 6) 자식 재구성
     let children = std::mem::take(&mut el.children);
-    match rebuild_children(el, children, ctx) {
+    ctx.ancestors.push(el.local.clone());
+    let rebuilt = rebuild_children(el, children, ctx);
+    ctx.ancestors.pop();
+    match rebuilt {
         Ok(c) => el.children = c,
         Err("__remove_self__") => return Action::Remove,
         Err(name) => return Action::RemoveAncestor(name),
@@ -312,7 +295,7 @@ fn deny_rule(el: &Element, ctx: &mut Ctx) -> Option<Action> {
         return match l {
             "oleObj" => {
                 ctx.note("embedded-object", Severity::High, "OLE 개체 프레임 제거");
-                Some(Action::RemoveAncestor("graphicFrame"))
+                Some(remove_up_to(ctx, "graphicFrame"))
             }
             "control" | "controls" => {
                 ctx.note("activex", Severity::High, "ActiveX 컨트롤 제거");

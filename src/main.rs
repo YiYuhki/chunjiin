@@ -40,6 +40,21 @@ enum Command {
         #[command(flatten)]
         common: Common,
     },
+    /// REST API 서버 실행
+    Serve {
+        /// 바인드 주소
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        bind: std::net::SocketAddr,
+        /// 동시 처리 수 (기본: CPU 수)
+        #[arg(long)]
+        concurrency: Option<usize>,
+        /// 요청당 처리 제한 시간(초)
+        #[arg(long, default_value_t = 120)]
+        timeout: u64,
+        /// 최대 파일 크기(MB)
+        #[arg(long, default_value_t = 100)]
+        max_size: usize,
+    },
 }
 
 #[derive(Args)]
@@ -59,6 +74,12 @@ struct Common {
     /// PDF 주석/폼 외형을 평면화하지 않고 버림
     #[arg(long)]
     no_flatten: bool,
+    /// 최고 보안 모드: PDF 페이지를 이미지로 렌더링하여 재구성
+    #[arg(long)]
+    rasterize: bool,
+    /// 래스터화 해상도(DPI)
+    #[arg(long, default_value_t = 150.0)]
+    dpi: f32,
     /// 최대 파일 크기(MB)
     #[arg(long, default_value_t = 100)]
     max_size: usize,
@@ -136,6 +157,8 @@ fn run(common: &Common, output: Option<(&Path, bool)>) -> ExitCode {
         remove_hyperlinks: common.remove_links,
         strip_metadata: !common.keep_metadata,
         flatten_pdf_annotations: !common.no_flatten,
+        pdf_rasterize: common.rasterize,
+        raster_dpi: common.dpi,
         max_file_size: common.max_size * 1024 * 1024,
         ..Policy::default()
     };
@@ -232,5 +255,43 @@ fn main() -> ExitCode {
             overwrite,
         } => run(common, Some((output, *overwrite))),
         Command::Scan { common } => run(common, None),
+        Command::Serve {
+            bind,
+            concurrency,
+            timeout,
+            max_size,
+        } => {
+            let policy = Policy {
+                max_file_size: max_size * 1024 * 1024,
+                ..Policy::default()
+            };
+            let workers = concurrency.unwrap_or_else(|| {
+                std::thread::available_parallelism()
+                    .map(|n| n.get())
+                    .unwrap_or(2)
+            });
+            let state = cdr::server::AppState::new(
+                policy,
+                workers,
+                std::time::Duration::from_secs(*timeout),
+            );
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    eprintln!("런타임 생성 실패: {e}");
+                    return ExitCode::from(1);
+                }
+            };
+            match rt.block_on(cdr::server::serve(*bind, state)) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("서버 오류: {e}");
+                    ExitCode::from(1)
+                }
+            }
+        }
     }
 }

@@ -4,7 +4,7 @@ use crate::detect::{self, FileType, OLE_MAGIC};
 use crate::error::{CdrError, Result};
 use crate::policy::Policy;
 use crate::report::{sha256_hex, CdrResult, Findings, Severity, Status};
-use crate::{ooxml, pdf};
+use crate::{hwpx, ooxml, pdf};
 
 #[derive(Default)]
 pub struct Engine {
@@ -117,6 +117,7 @@ impl Engine {
             FileType::Docx | FileType::Xlsx | FileType::Pptx => {
                 ooxml::reassemble(data, ftype, &self.policy, findings)
             }
+            FileType::Hwpx => hwpx::reassemble(data, &self.policy, findings),
             FileType::Ole => Err(CdrError::Blocked {
                 category: "legacy-format",
                 reason: ole_reason(data),
@@ -144,8 +145,13 @@ impl Engine {
         if out_type != ftype {
             return Some(format!("재조합 결과 형식 불일치({})", out_type.name()));
         }
+        // 재검증은 구조 재조합만 수행한다(래스터화 결과를 다시 렌더링할 필요는 없음)
+        let verifier = Engine::new(Policy {
+            pdf_rasterize: false,
+            ..self.policy.clone()
+        });
         let mut f = Findings::default();
-        if let Err(e) = self.reassemble(output, ftype, &mut f) {
+        if let Err(e) = verifier.reassemble(output, ftype, &mut f) {
             return Some(e.to_string());
         }
         let residual: Vec<String> = f

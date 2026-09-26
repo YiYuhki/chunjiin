@@ -63,7 +63,7 @@ pub fn report_threats(data: &[u8], doc: &Document, policy: &Policy, findings: &m
             note(
                 "form",
                 Severity::Info,
-                "대화형 폼(AcroForm) - 필드 외형만 평면화".into(),
+                "대화형 폼 필드(AcroForm, 외형은 본문에 평면화하여 보존)".into(),
             );
         }
         if catalog.has(b"Collection") {

@@ -14,6 +14,7 @@
 //!    파일 끝 덧붙은 데이터는 새 문서에 존재하지 않는다.
 
 mod content;
+mod raster;
 mod scan;
 
 use std::collections::{HashMap, HashSet};
@@ -367,6 +368,15 @@ impl<'a> Copier<'a> {
 }
 
 pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<u8>> {
+    let rebuilt = rebuild(data, policy, findings)?;
+    if policy.pdf_rasterize {
+        // 렌더러가 원본의 악성 구조를 보지 않도록 재조합된 문서를 렌더링한다
+        return raster::rasterize(&rebuilt, policy, findings);
+    }
+    Ok(rebuilt)
+}
+
+fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<u8>> {
     let mut opts = LoadOptions::with_max_decompressed_size(policy.max_stream_size);
     opts.strict = false;
     let src = match Document::load_mem_with_options(data, opts) {

@@ -7,11 +7,13 @@
 pub mod detect;
 pub mod engine;
 pub mod error;
+pub mod hwpx;
 pub mod imaging;
 pub mod ooxml;
 pub mod pdf;
 pub mod policy;
 pub mod report;
+pub mod server;
 pub mod xml;
 pub mod zipsafe;
 

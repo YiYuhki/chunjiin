@@ -30,6 +30,14 @@ pub struct Policy {
 
     /// PDF 주석(폼 필드 포함)의 외형을 페이지 본문에 평면화하여 보존
     pub flatten_pdf_annotations: bool,
+
+    /// 최고 보안 모드: PDF 를 재조합한 뒤 각 페이지를 이미지로 렌더링하여
+    /// 이미지만으로 된 PDF 를 다시 만든다 (텍스트 선택·링크는 사라진다)
+    pub pdf_rasterize: bool,
+    /// 래스터화 해상도(DPI)
+    pub raster_dpi: f32,
+    /// 래스터화 JPEG 품질(1~100)
+    pub raster_jpeg_quality: u8,
 }
 
 impl Default for Policy {
@@ -48,6 +56,9 @@ impl Default for Policy {
             remove_hyperlinks: false,
             strip_metadata: true,
             flatten_pdf_annotations: true,
+            pdf_rasterize: false,
+            raster_dpi: 150.0,
+            raster_jpeg_quality: 85,
         }
     }
 }
