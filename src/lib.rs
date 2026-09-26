@@ -18,6 +18,7 @@ pub mod ooxml;
 pub mod pdf;
 pub mod policy;
 pub mod report;
+pub mod rtf;
 pub mod server;
 pub mod text;
 pub mod watch;

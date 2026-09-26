@@ -21,6 +21,8 @@ pub enum FileType {
     /// 레거시 doc/xls/ppt/hwp 또는 암호화된 OOXML
     Ole,
     Zip,
+    /// 서식 있는 텍스트(RTF)
+    Rtf,
     /// 단독 이미지 파일
     Png,
     Jpeg,
@@ -47,6 +49,7 @@ impl FileType {
             FileType::Ppt => "ppt",
             FileType::Ole => "ole",
             FileType::Zip => "zip",
+            FileType::Rtf => "rtf",
             FileType::Png => "png",
             FileType::Jpeg => "jpeg",
             FileType::Gif => "gif",
@@ -79,6 +82,7 @@ impl FileType {
             FileType::Xls => Some("xls"),
             FileType::Ppt => Some("ppt"),
             FileType::Zip => Some("zip"),
+            FileType::Rtf => Some("rtf"),
             FileType::Png | FileType::Bmp => Some("png"),
             FileType::Jpeg => Some("jpg"),
             FileType::Gif => Some("gif"),
@@ -102,6 +106,7 @@ impl FileType {
                 "doc", "dot", "xls", "xlt", "ppt", "pot", "pps", "hwp", "msg",
             ],
             FileType::Zip => &["zip"],
+            FileType::Rtf => &["rtf"],
             FileType::Png => &["png"],
             FileType::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             FileType::Gif => &["gif"],
@@ -144,6 +149,9 @@ pub fn detect(data: &[u8]) -> FileType {
     let head = &data[..data.len().min(1024)];
     if find(head, b"%PDF-").is_some() {
         return FileType::Pdf;
+    }
+    if crate::rtf::is_rtf(data) {
+        return FileType::Rtf;
     }
     if data.starts_with(OLE_MAGIC) {
         use crate::legacy::Kind;

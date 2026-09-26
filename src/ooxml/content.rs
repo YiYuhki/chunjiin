@@ -564,6 +564,10 @@ pub(crate) fn hyperlink_is_dangerous(code: &str, policy: &Policy) -> bool {
             after_switch = false;
         } else {
             let url = token.replace("\\\\", "\\");
+            // "#책갈피" 는 문서 안 이동
+            if url.starts_with('#') {
+                return false;
+            }
             return !url.is_empty() && (!policy.uri_allowed(&url) || policy.remove_hyperlinks);
         }
         rest = next;

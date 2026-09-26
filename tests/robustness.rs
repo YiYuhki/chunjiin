@@ -265,6 +265,8 @@ fn fuzz_archive_and_images() {
         .as_bytes()
         .to_vec();
     run("a.csv", 22, csv, mutate_bytes);
+    let rtf = b"{\\rtf1\\ansi{\\fonttbl{\\f0 Arial;}}{\\*\\datastore 0102}{\\object\\objemb{\\*\\objdata 0105}{\\result{\\pict\\pngblip 89504e47}}}{\\field{\\*\\fldinst DDEAUTO x}{\\fldrslt r}}\\pard text\\'c0\\u1234?\\par}".to_vec();
+    run("a.rtf", 23, rtf, mutate_bytes);
 }
 
 #[test]

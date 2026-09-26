@@ -5,7 +5,7 @@ use crate::error::{CdrError, Result};
 use crate::imaging::{self, ImageKind};
 use crate::policy::Policy;
 use crate::report::{sha256_hex, CdrResult, Findings, Severity, Status};
-use crate::{archive, hwpx, legacy, ooxml, pdf, text};
+use crate::{archive, hwpx, legacy, ooxml, pdf, rtf, text};
 
 #[derive(Default)]
 pub struct Engine {
@@ -141,6 +141,7 @@ impl Engine {
                 reason: ole_reason(data),
             }),
             FileType::Zip => archive::reassemble(self, self.depth, data, findings),
+            FileType::Rtf => rtf::reassemble(data, &self.policy, findings),
             FileType::Png | FileType::Jpeg | FileType::Gif | FileType::Bmp => {
                 if !self.policy.allow_images {
                     return Err(CdrError::Blocked {
@@ -165,7 +166,7 @@ impl Engine {
                 let reason = if data.starts_with(b"MZ") || data.starts_with(b"\x7fELF") {
                     "실행 파일은 허용되지 않음"
                 } else {
-                    "지원하지 않는 파일 형식 (오피스·한글·PDF·이미지·ZIP·텍스트 만 지원)"
+                    "지원하지 않는 파일 형식 (오피스·한글·PDF·RTF·이미지·ZIP·텍스트 만 지원)"
                 };
                 Err(CdrError::Blocked {
                     category: "unsupported",
