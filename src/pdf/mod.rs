@@ -432,7 +432,7 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
     // 1차: 페이지 ID 예약 (문서 내 이동 링크/책갈피 대상 매핑용)
     let mut page_map: HashMap<ObjectId, ObjectId> = HashMap::new();
     let mut order: Vec<(ObjectId, ObjectId)> = Vec::new();
-    for (_, src_id) in pages.iter() {
+    for src_id in pages.values() {
         let new_id = copier.dst.new_object_id();
         page_map.insert(*src_id, new_id);
         order.push((*src_id, new_id));

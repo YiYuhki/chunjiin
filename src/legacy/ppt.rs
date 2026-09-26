@@ -295,8 +295,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
 
     // 2차: 제자리 무력화
     for (at, len, url) in &bad_strings {
-        for b in doc[*at..*at + *len].chunks_exact_mut(2) {
-            b.copy_from_slice(&[0x20, 0]);
+        for b in doc[*at..*at + *len].as_chunks_mut::<2>().0 {
+            *b = [0x20, 0];
         }
         let (cat, sev) = if policy.uri_allowed(url) {
             ("hyperlink", Severity::Low)

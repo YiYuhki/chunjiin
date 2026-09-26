@@ -91,14 +91,12 @@ pub fn filter(
                     continue;
                 }
             }
-            "BI" => {
-                // 해석 불가(필터 사용 등)한 인라인 이미지는 파서가 피연산자 없이 돌려준다
-                if !matches!(op.operands.first(), Some(Object::Stream(_))) {
-                    *dropped
-                        .entry("BI(해석 불가 인라인 이미지)".into())
-                        .or_default() += 1;
-                    continue;
-                }
+            // 해석 불가(필터 사용 등)한 인라인 이미지는 파서가 피연산자 없이 돌려준다
+            "BI" if !matches!(op.operands.first(), Some(Object::Stream(_))) => {
+                *dropped
+                    .entry("BI(해석 불가 인라인 이미지)".into())
+                    .or_default() += 1;
+                continue;
             }
             _ => {}
         }

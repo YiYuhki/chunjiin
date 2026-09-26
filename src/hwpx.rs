@@ -685,12 +685,14 @@ pub(crate) fn report_script_text(findings: &mut Findings, name: &str, text: &str
 fn decode_script(data: &[u8]) -> String {
     let utf16 = |bytes: &[u8], le: bool| {
         let units: Vec<u16> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|c| {
                 if le {
-                    u16::from_le_bytes([c[0], c[1]])
+                    u16::from_le_bytes(*c)
                 } else {
-                    u16::from_be_bytes([c[0], c[1]])
+                    u16::from_be_bytes(*c)
                 }
             })
             .collect();
@@ -729,10 +731,7 @@ fn text_is_default_script(text: &str) -> bool {
         "",
     );
     // 빈 이벤트 처리기 function OnXxx(){} 제거
-    loop {
-        let Some(start) = code.find("function") else {
-            break;
-        };
+    while let Some(start) = code.find("function") {
         let after = &code[start + "function".len()..];
         let name_len = after
             .chars()

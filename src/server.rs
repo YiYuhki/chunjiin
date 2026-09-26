@@ -93,13 +93,18 @@ fn error(status: StatusCode, msg: impl Into<String>) -> Response {
     (status, Json(serde_json::json!({ "error": msg.into() }))).into_response()
 }
 
+/// 오류 응답을 상자에 담는다 (Result 의 Err 크기를 줄이기 위함)
+fn fail(status: StatusCode, msg: impl Into<String>) -> Box<Response> {
+    Box::new(error(status, msg))
+}
+
 /// 업로드를 받아 재조합한다. 실패 시 HTTP 오류 응답을 돌려준다.
 async fn run(
     state: &AppState,
     opts: &Options,
     source: String,
     mut multipart: Multipart,
-) -> Result<(CdrResult, Option<String>), Response> {
+) -> Result<(CdrResult, Option<String>), Box<Response>> {
     let mut file: Option<(String, Vec<u8>)> = None;
     loop {
         match multipart.next_field().await {
@@ -108,7 +113,7 @@ async fn run(
                 match field.bytes().await {
                     Ok(b) => file = Some((name, b.to_vec())),
                     Err(e) => {
-                        return Err(error(
+                        return Err(fail(
                             StatusCode::PAYLOAD_TOO_LARGE,
                             format!("업로드 읽기 실패: {e}"),
                         ))
@@ -118,7 +123,7 @@ async fn run(
             Ok(Some(_)) => continue,
             Ok(None) => break,
             Err(e) => {
-                return Err(error(
+                return Err(fail(
                     StatusCode::BAD_REQUEST,
                     format!("multipart 해석 실패: {e}"),
                 ))
@@ -126,7 +131,7 @@ async fn run(
         }
     }
     let Some((name, data)) = file else {
-        return Err(error(StatusCode::BAD_REQUEST, "'file' 필드가 없습니다"));
+        return Err(fail(StatusCode::BAD_REQUEST, "'file' 필드가 없습니다"));
     };
 
     let mut policy = (*state.policy).clone();
@@ -147,7 +152,7 @@ async fn run(
     }
 
     let Ok(_permit) = state.permits.clone().acquire_owned().await else {
-        return Err(error(StatusCode::SERVICE_UNAVAILABLE, "서버 종료 중"));
+        return Err(fail(StatusCode::SERVICE_UNAVAILABLE, "서버 종료 중"));
     };
     let auditor = state.auditor.clone();
     let task = tokio::task::spawn_blocking(move || {
@@ -161,15 +166,12 @@ async fn run(
     match tokio::time::timeout(state.timeout, task).await {
         Ok(Ok((r, None))) => Ok((r, None)),
         Ok(Ok((r, Some(Ok(rec))))) => Ok((r, Some(rec.event_id))),
-        Ok(Ok((_, Some(Err(e))))) => Err(error(
+        Ok(Ok((_, Some(Err(e))))) => Err(fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("감사 기록 실패로 결과를 제공하지 않습니다: {e}"),
         )),
-        Ok(Err(_)) => Err(error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "처리 중 내부 오류",
-        )),
-        Err(_) => Err(error(StatusCode::SERVICE_UNAVAILABLE, "처리 시간 초과")),
+        Ok(Err(_)) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, "처리 중 내부 오류")),
+        Err(_) => Err(fail(StatusCode::SERVICE_UNAVAILABLE, "처리 시간 초과")),
     }
 }
 
@@ -196,7 +198,7 @@ async fn scan(
 ) -> Response {
     match run(&state, &opts, source_of(&peer), multipart).await {
         Ok((r, id)) => with_event_id(Json(r).into_response(), id),
-        Err(resp) => resp,
+        Err(resp) => *resp,
     }
 }
 
@@ -208,7 +210,7 @@ async fn sanitize(
 ) -> Response {
     let (mut r, event_id) = match run(&state, &opts, source_of(&peer), multipart).await {
         Ok(v) => v,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     if r.status == Status::Blocked {
         return with_event_id(
