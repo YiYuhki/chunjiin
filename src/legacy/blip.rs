@@ -6,7 +6,8 @@
 //!
 //! - JPEG/PNG: 픽셀만 디코딩해 같은 형식으로 새로 인코딩
 //! - DIB(비트맵): 24비트 비트맵으로 새로 인코딩
-//! - 메타파일(EMF/WMF/PICT)·기타: 그대로 옮김 (형식 변환 불가)
+//! - 메타파일(EMF/WMF): 압축을 풀어 레코드 단위로 재조합한 뒤 다시 압축
+//! - PICT·TIFF 등 재조합할 수 없는 형식: 빈 PNG 로 대체
 //! - 어떤 FBSE 도 가리키지 않는 그림 레코드와 레코드 사이·끝의 데이터는 옮기지 않음
 //! - 디코딩할 수 없는 래스터 그림은 같은 형식의 1×1 빈 그림으로 대체
 
@@ -15,6 +16,7 @@ use std::io::Cursor;
 
 use crate::error::{blocked, Result};
 use crate::imaging::{self, ImageKind};
+use crate::metafile;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
 
@@ -26,8 +28,8 @@ const RT_JPEG: u16 = 0xF01D;
 const RT_PNG: u16 = 0xF01E;
 const RT_DIB: u16 = 0xF01F;
 const RT_JPEG_CMYK: u16 = 0xF02A;
-/// 형식 변환 없이 옮기는 메타파일 (EMF, WMF, PICT)
-const METAFILES: [u16; 3] = [0xF01A, 0xF01B, 0xF01C];
+const RT_EMF: u16 = 0xF01A;
+const RT_WMF: u16 = 0xF01B;
 /// FBSE 의 그림 형식 값 (btWin32/btMacOS)
 const BT_JPEG: u8 = 5;
 const BT_PNG: u8 = 6;
@@ -47,6 +49,15 @@ impl PixelBudget {
         }
     }
 
+    /// 화소 수만큼 예산을 쓴다
+    pub fn charge_pixels(&mut self, px: u64) -> Result<()> {
+        if px > self.left {
+            return blocked("resource", "문서 안 그림의 총 화소 수가 한도를 넘음");
+        }
+        self.left -= px;
+        Ok(())
+    }
+
     /// 디코딩 전에 그림 크기만큼 예산을 쓴다. 헤더를 읽을 수 없으면 0 (디코딩 단계에서 실패)
     fn charge(&mut self, data: &[u8], kind: ImageKind) -> Result<()> {
         let format = match kind {
@@ -59,11 +70,7 @@ impl PixelBudget {
             .into_dimensions()
             .map(|(w, h)| w as u64 * h as u64)
             .unwrap_or(0);
-        if px > self.left {
-            return blocked("resource", "문서 안 그림의 총 화소 수가 한도를 넘음");
-        }
-        self.left -= px;
-        Ok(())
+        self.charge_pixels(px)
     }
 }
 
@@ -164,7 +171,8 @@ pub fn rebuild(
     let mut out = Vec::with_capacity(pictures.len());
     // 원래 위치 → (새 위치, 새 크기, 바뀐 그림 형식)
     let mut moved: HashMap<u32, (u32, u32, Option<u8>)> = HashMap::new();
-    let (mut reencoded, mut kept, mut replaced, mut unsupported) = (0u64, 0u64, 0u64, 0u64);
+    let (mut reencoded, mut replaced, mut unsupported) = (0u64, 0u64, 0u64);
+    let mut mstats = metafile::Stats::default();
     for &old in referenced.keys() {
         let Some(h) = header(pictures, old as usize)
             .filter(|h| (RT_BLIP_FIRST..=RT_BLIP_LAST).contains(&h.rtype))
@@ -180,11 +188,25 @@ pub fn rebuild(
             .take(16)
             .collect();
         // (버전·인스턴스, 형식, 본문, 바뀐 FBSE 그림 형식)
+        let metafile = match h.rtype {
+            RT_EMF | RT_WMF => rebuild_metafile(
+                body,
+                h.rtype,
+                h.instance,
+                policy,
+                &mut budget,
+                &mut mstats,
+                None,
+            )?,
+            _ => None,
+        };
         let (vi, rtype, new_body, retype) = match raster_prefix(h.rtype, h.instance) {
-            _ if METAFILES.contains(&h.rtype) => {
-                kept += 1;
-                ((h.instance << 4) | h.ver, h.rtype, body.to_vec(), None)
-            }
+            _ if metafile.is_some() => (
+                (h.instance << 4) | h.ver,
+                h.rtype,
+                metafile.unwrap_or_default(),
+                None,
+            ),
             Some(prefix) if body.len() > prefix => {
                 let (head, image) = body.split_at(prefix);
                 let rebuilt = match h.rtype {
@@ -207,8 +229,8 @@ pub fn rebuild(
                 ((h.instance << 4) | h.ver, h.rtype, b, None)
             }
             _ => {
-                // CMYK JPEG 는 일반 JPEG 로, 그 밖의 형식(TIFF, 규격 외 인스턴스, 정의되지 않은
-                // 형식)은 빈 PNG 로 바꾸고 FBSE 의 그림 형식도 맞춘다
+                // CMYK JPEG 는 일반 JPEG 로, 그 밖의 형식(PICT, TIFF, 재조합할 수 없는 메타파일,
+                // 규격 외 인스턴스, 정의되지 않은 형식)은 빈 PNG 로 바꾸고 FBSE 의 그림 형식도 맞춘다
                 let cmyk = if h.rtype == RT_JPEG_CMYK && body.len() > 17 {
                     let start = if h.instance & 1 == 1 { 33 } else { 17 };
                     match body.get(start..) {
@@ -259,9 +281,7 @@ pub fn rebuild(
     }
 
     findings.count("images_reencoded", reencoded);
-    if kept > 0 {
-        findings.count("metafiles_passthrough", kept);
-    }
+    mstats.report(findings, location);
     if replaced > 0 {
         findings.add(
             "image",
@@ -296,6 +316,135 @@ pub fn rebuild(
         pictures: out,
         document,
     }))
+}
+
+/// 메타파일 그림 본문: rgbUid(1~2개) + OfficeArtMetafileHeader(34) + 데이터(압축 가능)
+fn metafile_layout(rtype: u16, instance: u16) -> Option<usize> {
+    match (rtype, instance) {
+        (RT_EMF, 0x3D4) | (RT_WMF, 0x216) => Some(16),
+        (RT_EMF, 0x3D5) | (RT_WMF, 0x217) => Some(32),
+        _ => None,
+    }
+}
+
+/// 메타파일 그림 본문을 재조합한다: 압축을 풀고 레코드 단위로 다시 쓴 뒤 같은 방식으로 압축.
+/// 해석할 수 없으면 None (호출 측이 대체), 화소 예산 초과는 차단 오류.
+fn rebuild_metafile(
+    body: &[u8],
+    rtype: u16,
+    instance: u16,
+    policy: &Policy,
+    budget: &mut PixelBudget,
+    stats: &mut metafile::Stats,
+    slot: Option<usize>,
+) -> Result<Option<Vec<u8>>> {
+    let Some(uids) = metafile_layout(rtype, instance) else {
+        return Ok(None);
+    };
+    let Some(head) = body.get(uids..uids + 34) else {
+        return Ok(None);
+    };
+    let cb_save = u32::from_le_bytes(head[28..32].try_into().unwrap()) as usize;
+    let compression = head[32];
+    let Some(data) = body.get(uids + 34..).and_then(|d| d.get(..cb_save)) else {
+        return Ok(None);
+    };
+    let (plain, consumed) = match compression {
+        0 => match inflate_zlib(data, policy.max_stream_size) {
+            Some(p) => p,
+            None => return Ok(None),
+        },
+        0xFE => (data.to_vec(), data.len()),
+        _ => return Ok(None),
+    };
+    let expected = if rtype == RT_EMF {
+        metafile::Kind::Emf
+    } else {
+        metafile::Kind::Wmf
+    };
+    let mf = match metafile::rebuild(&plain, policy, budget, stats) {
+        Ok((mf, kind)) if kind == expected => mf,
+        Ok(_) => return Ok(None),
+        Err(e) if e.category() == "resource" => return Err(e),
+        Err(_) => return Ok(None),
+    };
+    let room = slot.map(|r| r.saturating_sub(uids + 34));
+    let mut packed = if compression == 0 {
+        let mut p = deflate_zlib(&mf, 9);
+        // 자리가 모자라면 다른 압축 단계도 시도해 가장 작은 것을 쓴다
+        if room.is_some_and(|r| p.len() > r) {
+            for level in [8, 7, 6, 5, 4] {
+                let q = deflate_zlib(&mf, level);
+                if q.len() < p.len() {
+                    p = q;
+                }
+            }
+        }
+        p
+    } else {
+        mf.clone()
+    };
+    // 제자리 처리에서 새 압축이 원래 자리보다 크면(압축기 차이), 재조합 결과가 원본을 푼 내용과
+    // 바이트 단위로 같고 압축 스트림이 선언된 길이를 남김없이 쓴 경우에만 원래 압축 스트림을 둔다.
+    // 이때 읽는 쪽이 푸는 내용은 재조합 결과와 정확히 같다.
+    if room.is_some_and(|r| packed.len() > r)
+        && compression == 0
+        && mf == plain
+        && consumed == data.len()
+    {
+        packed = data.to_vec();
+    }
+    let mut out = body[..uids].to_vec();
+    out.extend((mf.len() as u32).to_le_bytes());
+    out.extend(&head[4..28]); // rcBounds, ptSize
+    out.extend((packed.len() as u32).to_le_bytes());
+    out.extend([compression, 0xFE]);
+    out.extend(packed);
+    Ok(Some(out))
+}
+
+/// 제자리 처리할 메타파일 그림인지 구조로 확인한다 (rgbUid 길이). 머리의 압축 방식·필터 값과
+/// 압축 크기가 맞아야 한다 — 우연히 비슷한 바이트를 건드리지 않도록.
+fn metafile_slot(body: &[u8], rtype: u16, instance: u16) -> Option<usize> {
+    let uids = metafile_layout(rtype, instance)?;
+    let head = body.get(uids..uids + 34)?;
+    let cb_save = u32::from_le_bytes(head[28..32].try_into().unwrap()) as usize;
+    (matches!(head[32], 0 | 0xFE) && head[33] == 0xFE && cb_save <= body.len() - uids - 34)
+        .then_some(uids)
+}
+
+/// 같은 형식의 빈 메타파일을 담은 그림 본문
+fn empty_metafile_body(body: &[u8], uids: usize, rtype: u16) -> Vec<u8> {
+    let kind = if rtype == RT_EMF {
+        metafile::Kind::Emf
+    } else {
+        metafile::Kind::Wmf
+    };
+    let mf = metafile::empty(kind);
+    let packed = deflate_zlib(&mf, 9);
+    let mut out = body[..uids].to_vec();
+    out.extend((mf.len() as u32).to_le_bytes());
+    out.extend(&body[uids + 4..uids + 28]);
+    out.extend((packed.len() as u32).to_le_bytes());
+    out.extend([0, 0xFE]);
+    out.extend(packed);
+    out
+}
+
+/// zlib 압축을 푼다: (내용, 압축 스트림에서 읽은 바이트 수)
+fn inflate_zlib(data: &[u8], limit: usize) -> Option<(Vec<u8>, usize)> {
+    use std::io::Read;
+    let mut out = Vec::new();
+    let mut z = flate2::read::ZlibDecoder::new(data);
+    (&mut z).take(limit as u64 + 1).read_to_end(&mut out).ok()?;
+    (out.len() <= limit).then_some((out, z.total_in() as usize))
+}
+
+fn deflate_zlib(data: &[u8], level: u32) -> Vec<u8> {
+    use std::io::Write;
+    let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(level));
+    let _ = e.write_all(data);
+    e.finish().unwrap_or_default()
 }
 
 fn reencode(
@@ -384,6 +533,7 @@ pub struct InPlace {
     pub cleared: u64,
     /// 디코딩할 수 없어 빈 그림으로 대체한 그림
     pub replaced: u64,
+    pub metafiles: metafile::Stats,
 }
 
 /// 오프셋이 얽힌 스트림(doc 의 Data·WordDocument, xls 의 Workbook) 안의 래스터 그림 레코드를
@@ -404,6 +554,36 @@ pub fn reencode_in_place(
     }
     let mut p = 0;
     while p + 8 <= stream.len() {
+        if let Some(h) = header(stream, p).filter(|h| h.ver == 0 && allowed(p, h.body + h.len)) {
+            if let Some(uids) = metafile_slot(&stream[h.body..h.body + h.len], h.rtype, h.instance)
+            {
+                let end = h.body + h.len;
+                let body = &stream[h.body..end];
+                let rebuilt = rebuild_metafile(
+                    body,
+                    h.rtype,
+                    h.instance,
+                    policy,
+                    budget,
+                    &mut stats.metafiles,
+                    Some(body.len()),
+                )?
+                .filter(|b| b.len() <= body.len());
+                let new = match rebuilt {
+                    Some(b) => b,
+                    None => {
+                        // 자리에 맞지 않거나 해석할 수 없으면 빈 메타파일로 바꾼다
+                        stats.cleared += 1;
+                        empty_metafile_body(body, uids, h.rtype)
+                    }
+                };
+                let slot = &mut stream[h.body..end];
+                slot[..new.len()].copy_from_slice(&new);
+                slot[new.len()..].fill(0);
+                p = end;
+                continue;
+            }
+        }
         let found = header(stream, p).and_then(|h| {
             let kind = match h.rtype {
                 RT_JPEG => ImageKind::Jpeg,
@@ -464,6 +644,7 @@ impl InPlace {
         self.downscaled += o.downscaled;
         self.cleared += o.cleared;
         self.replaced += o.replaced;
+        self.metafiles.add(&o.metafiles);
     }
 }
 
@@ -706,6 +887,7 @@ fn reduced_png(img: &image::DynamicImage) -> Option<Vec<u8>> {
 
 /// 제자리 재인코딩 결과를 보고서에 기록한다
 pub fn report(stats: &InPlace, findings: &mut Findings, location: &str) {
+    stats.metafiles.report(findings, location);
     if stats.reencoded > 0 {
         findings.count("images_reencoded", stats.reencoded);
     }

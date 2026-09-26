@@ -126,6 +126,10 @@ pub fn malicious_hwp(props: u32) -> Vec<u8> {
         ("BodyText/Section0", &c(&body)),
         ("BinData/BIN0001.png", &deflate(&png)),
         (
+            "BinData/BIN0004.emf",
+            &deflate(&crate::common::metafile::malicious_emf()),
+        ),
+        (
             "BinData/BIN0002.eps",
             &deflate(b"%!PS-Adobe-3.0 EPSF-3.0\n/exploit { } def"),
         ),

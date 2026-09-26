@@ -10,6 +10,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::error::{blocked, Result};
 use crate::imaging::{self, ImageKind};
+use crate::legacy::blip::PixelBudget;
+use crate::metafile;
 use crate::ooxml::content::truncate;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
@@ -47,6 +49,8 @@ enum Kind {
     Xml,
     /// 이미 재인코딩된 이미지 바이트
     Image(Vec<u8>),
+    /// 재조합된 메타파일(EMF/WMF) 바이트
+    Metafile(Vec<u8>),
     Text,
 }
 
@@ -81,6 +85,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     let mut renamed: HashMap<String, String> = HashMap::new();
     let mut reported: HashSet<String> = HashSet::new();
 
+    let mut budget = PixelBudget::new(policy);
+    let mut metafiles = metafile::Stats::default();
     let mut items: Vec<(String, String, String, bool)> = Vec::new(); // id, href, media-type, embedded
     collect_items(&manifest.root, &mut items);
     for (id, href, media, embedded) in items {
@@ -146,6 +152,23 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             }
             continue;
         }
+        if metafile::sniff(data).is_some() {
+            match metafile::rebuild(data, policy, &mut budget, &mut metafiles) {
+                Ok((bytes, _)) => {
+                    keep.insert(name.clone(), (name.clone(), Kind::Metafile(bytes)));
+                }
+                Err(e) => {
+                    findings.add(
+                        "metafile",
+                        Severity::Medium,
+                        format!("메타파일 제외: {e}"),
+                        name.as_str(),
+                    );
+                    dropped_ids.insert(id);
+                }
+            }
+            continue;
+        }
         let (cat, sev, desc) = if data.starts_with(crate::detect::OLE_MAGIC) {
             ("embedded-object", Severity::High, "OLE 개체")
         } else if data.starts_with(b"MZ") || data.starts_with(b"\x7fELF") {
@@ -167,6 +190,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         );
         dropped_ids.insert(id);
     }
+
+    metafiles.report(findings, manifest_name);
 
     for fixed in FIXED_PARTS {
         if let Some(e) = files.get(&fixed.to_ascii_lowercase()) {
@@ -259,6 +284,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                 findings.count("images_reencoded", 1);
                 bytes.clone()
             }
+            Kind::Metafile(bytes) => bytes.clone(),
             Kind::Text => {
                 let text = String::from_utf8_lossy(data);
                 text.chars()

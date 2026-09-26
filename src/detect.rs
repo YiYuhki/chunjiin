@@ -30,6 +30,9 @@ pub enum FileType {
     Jpeg,
     Gif,
     Bmp,
+    /// 단독 메타파일 (벡터 그림)
+    Emf,
+    Wmf,
     /// 텍스트 (허용 확장자일 때만, 엔진이 확장자로 결정)
     Text,
     Csv,
@@ -57,6 +60,8 @@ impl FileType {
             FileType::Jpeg => "jpeg",
             FileType::Gif => "gif",
             FileType::Bmp => "bmp",
+            FileType::Emf => "emf",
+            FileType::Wmf => "wmf",
             FileType::Text => "text",
             FileType::Csv => "csv",
             FileType::Tsv => "tsv",
@@ -90,6 +95,8 @@ impl FileType {
             FileType::Png | FileType::Bmp => Some("png"),
             FileType::Jpeg => Some("jpg"),
             FileType::Gif => Some("gif"),
+            FileType::Emf => Some("emf"),
+            FileType::Wmf => Some("wmf"),
             _ => None,
         }
     }
@@ -116,6 +123,8 @@ impl FileType {
             FileType::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             FileType::Gif => &["gif"],
             FileType::Bmp => &["bmp", "dib"],
+            FileType::Emf => &["emf"],
+            FileType::Wmf => &["wmf"],
             FileType::Text => &["txt", "log"],
             FileType::Csv => &["csv"],
             FileType::Tsv => &["tsv", "tab"],
@@ -181,7 +190,11 @@ pub fn detect(data: &[u8]) -> FileType {
         Some(crate::imaging::ImageKind::Jpeg) => FileType::Jpeg,
         Some(crate::imaging::ImageKind::Gif) => FileType::Gif,
         Some(crate::imaging::ImageKind::Bmp) => FileType::Bmp,
-        None => FileType::Unknown,
+        None => match crate::metafile::sniff(data) {
+            Some(crate::metafile::Kind::Emf) => FileType::Emf,
+            Some(crate::metafile::Kind::Wmf) => FileType::Wmf,
+            None => FileType::Unknown,
+        },
     }
 }
 

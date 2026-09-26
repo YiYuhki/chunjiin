@@ -5,7 +5,8 @@
 //!   (수식 편집기 CVE-2017-11882, OLE 링크 CVE-2017-0199 등 RTF 공격의 대부분이 여기에 실린다)
 //! - 알 수 없는 `\*` 목적지 그룹(`\*\datastore`, `\*\template`, `\*\themedata`, 글꼴 내장 등)은 버린다.
 //!   `\*` 는 "모르면 건너뛰라"는 표시이므로 버려도 정상 문서의 표시에는 영향이 없다
-//! - 그림: PNG/JPEG 는 픽셀만 디코딩해 새로 인코딩하고, 메타파일(WMF/EMF)·비트맵·기타 형식은 버린다
+//! - 그림: PNG/JPEG 는 픽셀만 디코딩해 새로 인코딩하고, 메타파일(EMF/WMF)은 레코드 단위로 재조합한다.
+//!   비트맵·PICT 등 기타 형식은 버린다
 //! - 필드: DDE·INCLUDE·LINK·허용되지 않은 대상의 HYPERLINK 등 위험한 필드는 결과 텍스트만 남긴다
 //! - 그림 밖의 이진 데이터(`\bin`), 비정상 제어어(과도한 길이·매개변수)는 버리고,
 //!   중첩 깊이가 한도를 넘으면 차단한다
@@ -13,6 +14,8 @@
 
 use crate::error::{blocked, Result};
 use crate::imaging::{self, ImageKind};
+use crate::legacy::blip::PixelBudget;
+use crate::metafile;
 use crate::ooxml::content::word_field_is_dangerous;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
@@ -240,6 +243,10 @@ struct Sanitizer<'a> {
     fields: u64,
     bins: u64,
     info: bool,
+    budget: PixelBudget,
+    metafiles: metafile::Stats,
+    /// 그림 처리 중 난 차단 오류 (화소 예산 초과)
+    error: Option<crate::error::CdrError>,
 }
 
 impl Sanitizer<'_> {
@@ -307,11 +314,17 @@ impl Sanitizer<'_> {
         out
     }
 
-    /// 그림: PNG/JPEG 만 재인코딩해 남긴다
+    /// 그림: PNG/JPEG 는 재인코딩, EMF/WMF 는 레코드 단위로 재조합해 남긴다
     fn pict(&mut self, g: Vec<Node>) -> Option<Vec<Node>> {
+        enum Pic {
+            Raster(ImageKind),
+            Meta(metafile::Kind),
+        }
         let kind = g.iter().find_map(|n| match n {
-            Node::Word(w, _) if w == "pngblip" => Some(ImageKind::Png),
-            Node::Word(w, _) if w == "jpegblip" => Some(ImageKind::Jpeg),
+            Node::Word(w, _) if w == "pngblip" => Some(Pic::Raster(ImageKind::Png)),
+            Node::Word(w, _) if w == "jpegblip" => Some(Pic::Raster(ImageKind::Jpeg)),
+            Node::Word(w, _) if w == "emfblip" => Some(Pic::Meta(metafile::Kind::Emf)),
+            Node::Word(w, _) if w == "wmetafile" => Some(Pic::Meta(metafile::Kind::Wmf)),
             _ => None,
         });
         let Some(kind) = kind else {
@@ -337,16 +350,28 @@ impl Sanitizer<'_> {
                 .filter_map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok())
                 .collect(),
         };
-        let reencoded = if ImageKind::sniff(&data) == Some(kind) {
-            imaging::reencode_same(&data, kind, self.policy).ok()
-        } else {
-            None
+        let rebuilt = match kind {
+            Pic::Raster(k) if ImageKind::sniff(&data) == Some(k) => {
+                imaging::reencode_same(&data, k, self.policy).ok()
+            }
+            Pic::Meta(k) => {
+                match metafile::rebuild(&data, self.policy, &mut self.budget, &mut self.metafiles) {
+                    Ok((mf, got)) if got == k => Some(mf),
+                    Ok(_) => None,
+                    Err(e) if e.category() == "resource" => {
+                        self.error = Some(e);
+                        None
+                    }
+                    Err(_) => None,
+                }
+            }
+            _ => None,
         };
-        let Some(image) = reencoded else {
+        let Some(image) = rebuilt else {
             self.pictures_dropped += 1;
             return None;
         };
-        self.pictures_reencoded += 1;
+        self.pictures_reencoded += matches!(kind, Pic::Raster(_)) as u64;
         let mut out: Vec<Node> = g
             .into_iter()
             .filter(|n| match n {
@@ -396,6 +421,8 @@ const PICT_WORDS: &[&str] = &[
     "pict",
     "pngblip",
     "jpegblip",
+    "emfblip",
+    "wmetafile",
     "picw",
     "pich",
     "picwgoal",
@@ -487,8 +514,15 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         fields: 0,
         bins: 0,
         info: false,
+        budget: PixelBudget::new(policy),
+        metafiles: metafile::Stats::default(),
+        error: None,
     };
     let root = s.children(root);
+    if let Some(e) = s.error.take() {
+        return Err(e);
+    }
+    s.metafiles.report(findings, "");
     let (objects, pictures_dropped, fields, bins, info, starred, reencoded) = (
         s.objects,
         s.pictures_dropped,
@@ -548,7 +582,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         findings.add(
             "image",
             Severity::Low,
-            format!("재조합할 수 없는 그림(WMF/EMF 등) {pictures_dropped}개 제거"),
+            format!("재조합할 수 없는 그림 {pictures_dropped}개 제거"),
             "",
         );
     }

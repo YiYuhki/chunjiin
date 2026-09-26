@@ -55,6 +55,7 @@ fn hwp_is_reassembled() {
             "dangerous-link",
             "external-resource",
             "metadata",
+            "metafile",
         ],
     );
 
@@ -63,6 +64,7 @@ fn hwp_is_reassembled() {
         names(&out),
         vec![
             "BinData/BIN0001.png",
+            "BinData/BIN0004.emf",
             "BodyText/Section0",
             "DocInfo",
             "FileHeader",
@@ -87,6 +89,11 @@ fn hwp_is_reassembled() {
         contains(&body, &utf16("www.daum.net")),
         "스킴 없는 한컴 링크는 http 로 간주해 유지"
     );
+
+    // 메타파일은 레코드 단위로 재조합 (주석·이스케이프 제거, 압축 유지)
+    let emf = inflate(stream(&out, "BinData/BIN0004.emf").unwrap());
+    assert_eq!(common::metafile::emf_types(&emf), [39, 37, 43, 81, 84, 14]);
+    assert!(!contains(&emf, common::metafile::PAYLOAD));
 
     let png = inflate(stream(&out, "BinData/BIN0001.png").unwrap());
     assert!(
@@ -353,7 +360,12 @@ fn ppt_pictures_are_reencoded_and_references_patched() {
     };
     let hidden = b"HIDDEN-PAYLOAD-BETWEEN-BLIPS".to_vec();
     let png_rec = blip(0xF01E, 0x6E0, &png);
-    let meta_rec = ppt_rec(0, 0x216, 0xF01B, &[0x11; 60]);
+    let meta_rec = ppt_rec(
+        0,
+        0x216,
+        0xF01B,
+        &common::metafile::officeart_metafile_body(&common::metafile::malicious_wmf_raw()),
+    );
     let mut pictures = hidden.clone();
     pictures.extend(&png_rec);
     pictures.extend(&meta_rec);
@@ -406,10 +418,17 @@ fn ppt_pictures_are_reencoded_and_references_patched() {
     let rec = &pics[fo..fo + size];
     assert_eq!(&rec[2..4], &0xF01Eu16.to_le_bytes());
     image::load_from_memory(&rec[8 + 17..]).expect("재인코딩된 PNG");
-    // 메타파일은 그대로, 새 위치로
+    // 메타파일은 레코드 단위로 재조합되어 새 위치로 (이스케이프·없는 개체 선택 제거)
     let (size, fo) = (field(fbse_at[1] + 20), field(fbse_at[1] + 28));
-    assert_eq!(&pics[fo..fo + size], meta_rec.as_slice());
     assert_eq!(fo + size, pics.len());
+    let rec = &pics[fo..fo + size];
+    assert_eq!(&rec[2..4], &0xF01Bu16.to_le_bytes());
+    let wmf = common::metafile::officeart_metafile_data(&rec[8..]);
+    assert!(!contains(&wmf, common::metafile::PAYLOAD));
+    assert_eq!(
+        common::metafile::wmf_functions(&wmf),
+        [0x02FC, 0x012D, 0x041B, 0x0521, 0x0000]
+    );
 
     let again = Engine::default().process(r.output.as_ref().unwrap(), "a.ppt");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);

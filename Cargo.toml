@@ -33,7 +33,7 @@ read-fonts = "0.39"
 axum = { version = "0.8", features = ["multipart"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync", "time"] }
 cfb = "0.15"
-flate2 = "1"
+flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 uuid = "1"
 toml = "1"
 

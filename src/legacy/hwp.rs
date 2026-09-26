@@ -12,11 +12,13 @@
 
 use std::collections::BTreeMap;
 
+use super::blip::PixelBudget;
 use super::cfbx::{self, deflate_raw, inflate_raw, utf16le, Node};
 use crate::detect::OLE_MAGIC;
 use crate::error::{blocked, Result};
 use crate::hwpx::{normalize_link, report_script_text};
 use crate::imaging::{self, ImageKind};
+use crate::metafile;
 use crate::ooxml::content::truncate;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
@@ -247,7 +249,9 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
         return blocked("structure", "본문(BodyText) 없음");
     }
 
-    // BinData: 래스터 이미지만 재인코딩하여 조립
+    // BinData: 래스터 이미지는 재인코딩, 메타파일은 재조합
+    let mut budget = PixelBudget::new(policy);
+    let mut metafiles = metafile::Stats::default();
     for n in c
         .nodes
         .iter()
@@ -255,7 +259,10 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     {
         let (plain, was_compressed) = match inflate_raw(&n.data, limit) {
             Some(d)
-                if !d.is_empty() && (ImageKind::sniff(&d).is_some() || !is_known_raw(&n.data)) =>
+                if !d.is_empty()
+                    && (ImageKind::sniff(&d).is_some()
+                        || metafile::sniff(&d).is_some()
+                        || !is_known_raw(&n.data)) =>
             {
                 (d, true)
             }
@@ -284,6 +291,22 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                     n.path.as_str(),
                 ),
             },
+            None if metafile::sniff(&plain).is_some() => {
+                match metafile::rebuild(&plain, policy, &mut budget, &mut metafiles) {
+                    Ok((mf, _)) => out.push(Node {
+                        path: n.path.clone(),
+                        is_storage: false,
+                        clsid: [0; 16],
+                        data: if was_compressed { deflate_raw(&mf) } else { mf },
+                    }),
+                    Err(e) => findings.add(
+                        "metafile",
+                        Severity::Medium,
+                        format!("메타파일 제외: {e}"),
+                        n.path.as_str(),
+                    ),
+                }
+            }
             None => {
                 let (cat, sev, desc) = classify_bin(&plain);
                 findings.add(
@@ -295,6 +318,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
             }
         }
     }
+
+    metafiles.report(findings, "BinData");
 
     // 미리보기
     if let Some(t) = c.stream("PrvText") {
@@ -448,6 +473,7 @@ fn read_wstr(data: &[u8], at: usize) -> Option<String> {
 /// 압축되지 않은 상태로 알아볼 수 있는 형식인지 (압축 여부 판단 보조)
 fn is_known_raw(data: &[u8]) -> bool {
     ImageKind::sniff(data).is_some()
+        || metafile::sniff(data).is_some()
         || data.starts_with(OLE_MAGIC)
         || data.starts_with(b"%!PS")
         || data.starts_with(b"\xc5\xd0\xd3\xc6")
@@ -465,14 +491,6 @@ fn classify_bin(data: &[u8]) -> (&'static str, Severity, &'static str) {
         )
     } else if data.starts_with(b"MZ") {
         ("executable", Severity::Critical, "실행 파일")
-    } else if data.starts_with(b"\x01\x00\x00\x00") && data.get(40..44) == Some(b" EMF")
-        || data.starts_with(b"\xd7\xcd\xc6\x9a")
-    {
-        (
-            "unsupported-media",
-            Severity::Low,
-            "재조합 불가 이미지 형식(EMF/WMF)",
-        )
     } else {
         (
             "binary-part",

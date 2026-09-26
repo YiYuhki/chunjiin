@@ -2,6 +2,7 @@
 #![allow(dead_code)]
 
 pub mod legacy;
+pub mod metafile;
 
 use std::io::{Cursor, Read, Write};
 

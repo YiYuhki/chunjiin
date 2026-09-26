@@ -160,6 +160,15 @@ impl Engine {
                 findings.count("images_reencoded", 1);
                 Ok(bytes)
             }
+            FileType::Emf | FileType::Wmf => {
+                if !self.policy.allow_images {
+                    return Err(CdrError::Blocked {
+                        category: "unsupported",
+                        reason: "단독 이미지 파일 처리가 비활성화되어 있음".into(),
+                    });
+                }
+                crate::metafile::reassemble(data, &self.policy, findings)
+            }
             FileType::Text => text::reassemble(data, text::Kind::Text, findings),
             FileType::Csv => text::reassemble(data, text::Kind::Delimited(','), findings),
             FileType::Tsv => text::reassemble(data, text::Kind::Delimited('\t'), findings),

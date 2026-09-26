@@ -17,6 +17,8 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use crate::detect::FileType;
 use crate::error::{blocked, CdrError, Result};
 use crate::imaging::{self, ImageKind};
+use crate::legacy::blip::PixelBudget;
+use crate::metafile;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
 use crate::xml::{self, Node};
@@ -167,15 +169,31 @@ fn reassemble_at(
 
     // ---------------------------------------------------------------- 2. 파트 내용 해석/재인코딩
     let mut dropped: HashSet<String> = HashSet::new();
+    let mut budget = PixelBudget::new(policy);
+    let mut metafiles = metafile::Stats::default();
     for (name, part) in parts.iter_mut() {
         let data = &files[&name.to_ascii_lowercase()].data;
         match part.ptype {
             PartType::Image => match ImageKind::sniff(data) {
+                None if metafile::sniff(data).is_some() => {
+                    match metafile::rebuild(data, policy, &mut budget, &mut metafiles) {
+                        Ok((bytes, _)) => part.binary = Some(bytes),
+                        Err(e) => {
+                            findings.add(
+                                "metafile",
+                                Severity::Medium,
+                                format!("메타파일 제외: {e}"),
+                                name.as_str(),
+                            );
+                            dropped.insert(name.clone());
+                        }
+                    }
+                }
                 None => {
                     findings.add(
                         "unsupported-media",
                         Severity::Low,
-                        "재조합 불가 이미지 형식(EMF/WMF/SVG/TIFF 등) 제외",
+                        "재조합 불가 이미지 형식(SVG/TIFF 등) 제외",
                         name.as_str(),
                     );
                     dropped.insert(name.clone());
@@ -272,6 +290,8 @@ fn reassemble_at(
         return blocked("structure", "메인 문서 파트를 재조합할 수 없음");
     }
 
+    metafiles.report(findings, "/");
+
     // ---------------------------------------------------------------- 3. 제외된 파트 정리 및 도달성 재계산
     let root_rels: Vec<Rel> = root_rels
         .into_iter()
@@ -345,6 +365,7 @@ fn reassemble_at(
             PartType::Vml => rules::VML_CT,
             PartType::Image => ImageKind::sniff(&bytes)
                 .map(|k| k.mime())
+                .or_else(|| metafile::sniff(&bytes).map(|k| k.mime()))
                 .unwrap_or("application/octet-stream"),
             PartType::Package => package_content_type(&bytes),
         };
