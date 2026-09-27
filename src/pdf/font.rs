@@ -8,8 +8,9 @@
 //!   나머지 테이블은 규격 길이로 잘라 옮긴다. name 등 그 밖의 테이블은 버린다
 //! - 결과물은 독립 파서(ttf-parser)로 모든 글리프 외곽선을 해석해 검증한다
 //!
-//! CFF(Type1C/CIDFontType0C)와 Type 1(FontFile) 글꼴은 모든 글리프 프로그램(charstring)을
-//! 독립 해석기로 끝까지 실행해 보고, 하나라도 비정상이면 거부한다.
+//! CFF(Type1C/CIDFontType0C)와 Type 1(FontFile) 글꼴은 독립 해석기로 모든 글리프를 실행해 얻은
+//! 외곽선에서 새 CFF 를 만든다([`super::cffw`]). 새로 만들 수 없으면 모든 글리프 프로그램을
+//! 끝까지 실행해 보고, 하나라도 비정상이면 거부한다.
 
 use std::collections::BTreeMap;
 
@@ -656,7 +657,12 @@ pub fn rebuild_opentype_cff(data: &[u8]) -> Result<Rebuilt, String> {
     let glyphs = validate_cff(cff)?;
     let mut out: BTreeMap<[u8; 4], Vec<u8>> = BTreeMap::new();
     rebuild_common(&tables, glyphs, false, &mut out)?;
-    out.insert(*b"CFF ", cff.to_vec());
+    // CFF 테이블도 외곽선에서 새로 만든다 (실패하면 검증한 원본)
+    let cff = match rebuild_cff(cff) {
+        Ok((new, _)) => new,
+        Err(_) => cff.to_vec(),
+    };
+    out.insert(*b"CFF ", cff);
     let data = write_sfnt(&out, u32::from_be_bytes(*b"OTTO"));
     ttf_parser::Face::parse(&data, 0).map_err(|e| format!("재조합 글꼴 검증 실패: {e}"))?;
     Ok(Rebuilt {
@@ -730,6 +736,204 @@ pub fn validate_type1(data: &[u8]) -> Result<usize, String> {
             "비정상 글리프 프로그램 {bad}개 (글리프 {gid}: {e})"
         )),
     }
+}
+
+/// 새로 만든 CFF 를 독립 파서로 다시 열어, 글리프마다 외곽 경계와 폭이 원본과 같은지 확인한다
+fn verify_cff(data: &[u8], glyphs: &[super::cffw::Glyph]) -> Result<(), String> {
+    use super::cffw::{bounds, PathSink};
+    let t = ttf_parser::cff::Table::parse(data).ok_or("재조합 CFF 해석 실패")?;
+    if t.number_of_glyphs() as usize != glyphs.len() {
+        return Err("재조합 CFF 글리프 수 불일치".into());
+    }
+    for (gid, g) in glyphs.iter().enumerate() {
+        let mut sink = PathSink::default();
+        match t.outline(ttf_parser::GlyphId(gid as u16), &mut sink) {
+            Ok(_) | Err(ttf_parser::CFFError::ZeroBBox) => {}
+            Err(e) => return Err(format!("재조합 글리프 {gid} 해석 실패: {e:?}")),
+        }
+        let same = match (bounds(&sink.path), bounds(&g.path)) {
+            (None, None) => true,
+            (Some(a), Some(b)) => a.iter().zip(b).all(|(x, y)| (x - y).abs() < 0.05),
+            _ => false,
+        };
+        if !same {
+            return Err(format!("재조합 글리프 {gid} 외곽선 불일치"));
+        }
+    }
+    Ok(())
+}
+
+/// CFF 글꼴 프로그램(Type1C / CIDFontType0C)을 외곽선에서 새로 만든다. 반환: (CFF, 글리프 수)
+pub fn rebuild_cff(cff_data: &[u8]) -> Result<(Vec<u8>, usize), String> {
+    use super::cffw::{bounds, Font, Glyph, PathSink};
+    let t = ttf_parser::cff::Table::parse(cff_data).ok_or("CFF 구조 해석 실패")?;
+    let n = t.number_of_glyphs();
+    if n == 0 {
+        return Err("글리프가 없음".into());
+    }
+    let cid = t.glyph_cid(ttf_parser::GlyphId(0)).is_some();
+    let mut glyphs = Vec::with_capacity(n as usize);
+    let mut bbox: Option<[f64; 4]> = None;
+    for gid in 0..n {
+        let id = ttf_parser::GlyphId(gid);
+        let mut sink = PathSink::default();
+        match t.outline(id, &mut sink) {
+            Ok(_) | Err(ttf_parser::CFFError::ZeroBBox) => {}
+            Err(e) => return Err(format!("비정상 글리프 프로그램 (글리프 {gid}: {e:?})")),
+        }
+        if let Some(b) = bounds(&sink.path) {
+            let u = bbox.get_or_insert(b);
+            *u = [
+                u[0].min(b[0]),
+                u[1].min(b[1]),
+                u[2].max(b[2]),
+                u[3].max(b[3]),
+            ];
+        }
+        glyphs.push(Glyph {
+            name: if gid == 0 {
+                ".notdef".into()
+            } else {
+                t.glyph_name(id)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("g{gid}"))
+            },
+            cid: t.glyph_cid(id).unwrap_or(gid),
+            width: t.glyph_width(id).map_or(0.0, f64::from),
+            path: sink.path,
+        });
+    }
+    let encoding = if cid {
+        Vec::new()
+    } else {
+        (0..=255u8)
+            .filter_map(|c| t.glyph_index(c).map(|g| (c, g.0)))
+            .filter(|&(_, g)| g != 0)
+            .collect()
+    };
+    // CID 글꼴은 FD 마다 행렬이 다를 수 있다: 0번 글리프의 FD 행렬로 맞추고 나머지는 좌표를 옮긴다
+    let m = t.matrix();
+    let mut matrix = super::cffw::top_matrix(cff_data)
+        .unwrap_or([m.sx, m.ky, m.kx, m.sy, m.tx, m.ty].map(f64::from));
+    if cid {
+        let per =
+            super::cffw::cid_matrices(cff_data, n as usize).ok_or("CID 글꼴 FD 행렬 해석 실패")?;
+        matrix = per[0];
+        let inv = super::cffw::invert(&matrix).ok_or("비정상 FontMatrix")?;
+        for (g, fm) in glyphs.iter_mut().zip(&per) {
+            if fm.iter().zip(&matrix).any(|(a, b)| (a - b).abs() > 1e-12) {
+                super::cffw::transform(&mut g.path, &super::cffw::mul(fm, &inv));
+            }
+        }
+        // 경계도 다시 계산
+        bbox = None;
+        for g in &glyphs {
+            if let Some(b) = bounds(&g.path) {
+                let u = bbox.get_or_insert(b);
+                *u = [
+                    u[0].min(b[0]),
+                    u[1].min(b[1]),
+                    u[2].max(b[2]),
+                    u[3].max(b[3]),
+                ];
+            }
+        }
+    }
+    let font = Font {
+        name: super::cffw::font_name(cff_data).unwrap_or_else(|| "CDRFont".into()),
+        matrix,
+        bbox: bbox.unwrap_or([0.0; 4]),
+        glyphs,
+        encoding,
+        cid,
+    };
+    let data = super::cffw::write(&font);
+    verify_cff(&data, &font.glyphs)?;
+    Ok((data, n as usize))
+}
+
+/// Type 1 글꼴 프로그램(FontFile)을 외곽선에서 CFF(Type1C)로 새로 만든다. 반환: (CFF, 글리프 수)
+pub fn rebuild_type1(data: &[u8]) -> Result<(Vec<u8>, usize), String> {
+    use super::cffw::{bounds, Font, Glyph, PathSink};
+    use read_fonts::ps::cs::CommandSink;
+    use read_fonts::ps::type1::Type1Font;
+    use read_fonts::types::{Fixed, GlyphId};
+    struct Sink<'a>(&'a mut PathSink);
+    impl CommandSink for Sink<'_> {
+        fn move_to(&mut self, x: Fixed, y: Fixed) {
+            self.0.move_to(x.to_f64(), y.to_f64());
+        }
+        fn line_to(&mut self, x: Fixed, y: Fixed) {
+            self.0.line_to(x.to_f64(), y.to_f64());
+        }
+        fn curve_to(&mut self, a: Fixed, b: Fixed, c: Fixed, d: Fixed, x: Fixed, y: Fixed) {
+            self.0.curve_to(
+                a.to_f64(),
+                b.to_f64(),
+                c.to_f64(),
+                d.to_f64(),
+                x.to_f64(),
+                y.to_f64(),
+            );
+        }
+        fn close(&mut self) {}
+    }
+    let font = Type1Font::new(data).map_err(|_| "Type 1 구조 해석 실패".to_string())?;
+    let n = font.num_glyphs();
+    if n == 0 || n > 65_535 {
+        return Err("글리프 수 오류".into());
+    }
+    if font.glyph_name(GlyphId::new(0)) != Some(".notdef") {
+        return Err(".notdef 가 첫 글리프가 아님".into());
+    }
+    let mut glyphs = Vec::with_capacity(n as usize);
+    let mut bbox: Option<[f64; 4]> = None;
+    for gid in 0..n {
+        let mut path = PathSink::default();
+        let width = font
+            .evaluate_charstring(GlyphId::new(gid), &mut Sink(&mut path))
+            .map_err(|e| format!("비정상 글리프 프로그램 (글리프 {gid}: {e:?})"))?;
+        if let Some(b) = bounds(&path.path) {
+            let u = bbox.get_or_insert(b);
+            *u = [
+                u[0].min(b[0]),
+                u[1].min(b[1]),
+                u[2].max(b[2]),
+                u[3].max(b[3]),
+            ];
+        }
+        glyphs.push(Glyph {
+            name: font
+                .glyph_name(GlyphId::new(gid))
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("g{gid}")),
+            cid: gid as u16,
+            width: width.map_or(0.0, |w| w.to_f64()),
+            path: path.path,
+        });
+    }
+    let encoding = font
+        .encoding()
+        .map(|e| {
+            (0..=255u8)
+                .filter_map(|c| e.map(c).map(|g| (c, g.to_u32() as u16)))
+                .filter(|&(_, g)| g != 0)
+                .collect()
+        })
+        .unwrap_or_default();
+    let upem = f64::from(font.upem().max(1));
+    let m = font.matrix();
+    let cff = Font {
+        name: font.name().unwrap_or("CDRFont").to_string(),
+        matrix: [m.xx, m.yx, m.xy, m.yy, m.dx, m.dy].map(|v| v.to_f64() / upem),
+        bbox: bbox.unwrap_or([0.0; 4]),
+        glyphs,
+        encoding,
+        cid: false,
+    };
+    let data = super::cffw::write(&cff);
+    verify_cff(&data, &cff.glyphs)?;
+    Ok((data, n as usize))
 }
 
 #[cfg(test)]
@@ -1018,6 +1222,18 @@ mod tests {
                 d[i] = next() as u8;
             }
             let _ = validate_cff(&d);
+            let _ = rebuild_cff(&d);
+        }
+        // Type 1 도 (eexec 부분을 변조)
+        let src = sample_type1();
+        let start = src.windows(6).position(|w| w == b"eexec\n").unwrap() + 6;
+        for _ in 0..2000 {
+            let mut d = src.clone();
+            for _ in 0..1 + next() % 3 {
+                let i = start + (next() % (d.len() - start) as u64) as usize;
+                d[i] = b"0123456789abcdef"[(next() % 16) as usize];
+            }
+            let _ = rebuild_type1(&d);
         }
     }
 
@@ -1070,7 +1286,8 @@ mod tests {
         };
         let (f, kept) = build(sample_cff(BOX));
         assert!(kept);
-        assert_eq!(f.stats.get("fonts_validated"), Some(&1));
+        assert_eq!(f.stats.get("fonts_rebuilt"), Some(&1), "{:?}", f.stats);
+        assert_eq!(f.stats.get("fonts_validated"), None);
         let (f, kept) = build(sample_cff(&[139, 139, 21, 139, 10, 14]));
         assert!(!kept, "검증 실패 글꼴 프로그램이 남아 있음");
         assert!(f.items.iter().any(|x| x.category == "font"));
@@ -1141,6 +1358,170 @@ mod tests {
         // 비정상 글리프 프로그램을 가진 CFF 는 거부
         t.insert(*b"CFF ", sample_cff(&[139, 139, 21, 139, 10, 14]));
         assert!(rebuild_opentype_cff(&write_sfnt(&t, u32::from_be_bytes(*b"OTTO"))).is_err());
+    }
+
+    /// eexec 로 암호화한 최소 Type 1 글꼴 (PFA): .notdef, A(사각형), B(서브루틴 호출)
+    fn sample_type1() -> Vec<u8> {
+        fn enc(data: &[u8], mut r: u16) -> Vec<u8> {
+            data.iter()
+                .map(|&p| {
+                    let c = p ^ (r >> 8) as u8;
+                    r = (u16::from(c).wrapping_add(r))
+                        .wrapping_mul(52845)
+                        .wrapping_add(22719);
+                    c
+                })
+                .collect()
+        }
+        fn num(v: i32, out: &mut Vec<u8>) {
+            match v {
+                -107..=107 => out.push((v + 139) as u8),
+                108..=1131 => {
+                    out.push(((v - 108) / 256 + 247) as u8);
+                    out.push(((v - 108) % 256) as u8);
+                }
+                _ => {
+                    out.push(255);
+                    out.extend(v.to_be_bytes());
+                }
+            }
+        }
+        let cs = |ops: &[(&[i32], u8)]| {
+            let mut v = vec![0u8; 4]; // lenIV
+            for (args, op) in ops {
+                for a in *args {
+                    num(*a, &mut v);
+                }
+                v.push(*op);
+            }
+            enc(&v, 4330)
+        };
+        let notdef = cs(&[(&[0, 500], 13), (&[], 14)]);
+        let a = cs(&[
+            (&[0, 600], 13),
+            (&[50, 0], 21),
+            (&[400, 0], 5),
+            (&[0, 700], 5),
+            (&[-400, 0], 5),
+            (&[], 9),
+            (&[], 14),
+        ]);
+        // B: 서브루틴 0 이 사각형을 그린다
+        let sub = cs(&[
+            (&[100, 100], 21),
+            (&[200, 0], 5),
+            (&[0, 200], 5),
+            (&[], 9),
+            (&[], 11),
+        ]);
+        let b = cs(&[(&[0, 400], 13), (&[0], 10), (&[], 14)]);
+        let mut private: Vec<u8> = Vec::new();
+        private.extend(b"dup /Private 8 dict dup begin\n/RD{string currentfile exch readstring pop}executeonly def\n/ND{noaccess def}executeonly def\n/NP{noaccess put}executeonly def\n/lenIV 4 def\n/Subrs 1 array\n");
+        private.extend(format!("dup 0 {} RD ", sub.len()).as_bytes());
+        private.extend(&sub);
+        private.extend(b" NP\nND\n2 index /CharStrings 3 dict dup begin\n");
+        for (name, c) in [(".notdef", &notdef), ("A", &a), ("B", &b)] {
+            private.extend(format!("/{name} {} RD ", c.len()).as_bytes());
+            private.extend(c.iter());
+            private.extend(b" ND\n");
+        }
+        private.extend(b"end\nend\nreadonly put\nnoaccess put\ndup/FontName get exch definefont pop\nmark currentfile closefile\n");
+        let mut plain = vec![0u8; 4];
+        plain.extend(private);
+        let hex: String = enc(&plain, 55665)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let mut out = b"%!PS-AdobeFont-1.0: T1Test 001\n11 dict begin\n/FontName /T1Test def\n/PaintType 0 def\n/FontType 1 def\n/FontMatrix [0.001 0 0 0.001 0 0] readonly def\n/Encoding StandardEncoding def\n/FontBBox {0 0 500 700} readonly def\ncurrentdict end\ncurrentfile eexec\n".to_vec();
+        for line in hex.as_bytes().chunks(64) {
+            out.extend(line);
+            out.push(b'\n');
+        }
+        for _ in 0..8 {
+            out.extend([b'0'; 64]);
+            out.push(b'\n');
+        }
+        out.extend(b"cleartomark\n");
+        out
+    }
+
+    #[test]
+    fn type1_is_rebuilt_as_cff() {
+        let t1 = sample_type1();
+        validate_type1(&t1).expect("표본 Type 1");
+        let (cff, n) = rebuild_type1(&t1).unwrap();
+        assert_eq!(n, 3);
+        let t = ttf_parser::cff::Table::parse(&cff).unwrap();
+        assert_eq!(t.glyph_name(ttf_parser::GlyphId(1)), Some("A"));
+        assert_eq!(t.glyph_width(ttf_parser::GlyphId(1)), Some(600));
+        // 표준 인코딩 그대로: 65 → A, 66 → B
+        assert_eq!(t.glyph_index(65), Some(ttf_parser::GlyphId(1)));
+        assert_eq!(t.glyph_index(66), Some(ttf_parser::GlyphId(2)));
+        let mut sink = super::super::cffw::PathSink::default();
+        let r = t.outline(ttf_parser::GlyphId(2), &mut sink).unwrap();
+        // 서브루틴이 펼쳐져 같은 사각형이 된다
+        assert_eq!((r.x_min, r.y_min, r.x_max, r.y_max), (100, 100, 300, 300));
+        assert!((t.matrix().sx - 0.001).abs() < 1e-7);
+        // CFF 로 다시 만든 것도 다시 만들면 같은 결과
+        let (again, _) = rebuild_cff(&cff).unwrap();
+        assert_eq!(again, cff, "고정점");
+    }
+
+    #[test]
+    fn type1_font_file_becomes_type1c_in_pdf() {
+        use lopdf::{dictionary, Document, Object, Stream};
+        let mut doc = Document::with_version("1.7");
+        let pages = doc.new_object_id();
+        let ff = doc.add_object(Stream::new(dictionary! {}, sample_type1()));
+        let desc = doc.add_object(dictionary! {
+            "Type" => "FontDescriptor", "FontName" => "T1Test", "Flags" => 32,
+            "FontBBox" => vec![0.into(), 0.into(), 500.into(), 700.into()],
+            "ItalicAngle" => 0, "Ascent" => 700, "Descent" => 0, "CapHeight" => 700, "StemV" => 10,
+            "FontFile" => ff,
+        });
+        let f = doc.add_object(dictionary! {
+            "Type" => "Font", "Subtype" => "Type1", "BaseFont" => "T1Test",
+            "FirstChar" => 65, "LastChar" => 66,
+            "Widths" => vec![600.into(), 400.into()], "FontDescriptor" => desc,
+        });
+        let content = doc.add_object(Stream::new(
+            dictionary! {},
+            b"BT /F1 20 Tf 10 10 Td (AB) Tj ET".to_vec(),
+        ));
+        let page = doc.add_object(dictionary! {
+            "Type" => "Page", "Parent" => pages, "Contents" => content,
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => f } },
+        });
+        doc.objects.insert(
+            pages,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+                "MediaBox" => vec![0.into(), 0.into(), 200.into(), 200.into()],
+            }),
+        );
+        let cat = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+        doc.trailer.set("Root", cat);
+        let mut src = Vec::new();
+        doc.save_to(&mut src).unwrap();
+        let mut findings = crate::report::Findings::default();
+        let out =
+            crate::pdf::reassemble(&src, &crate::policy::Policy::default(), &mut findings).unwrap();
+        let out = Document::load_mem(&out).unwrap();
+        let desc = out
+            .objects
+            .values()
+            .find_map(|o| o.as_dict().ok().filter(|d| d.has(b"FontName")))
+            .unwrap();
+        assert!(!desc.has(b"FontFile") && desc.has(b"FontFile3"), "{desc:?}");
+        let id = desc.get(b"FontFile3").unwrap().as_reference().unwrap();
+        let s = out.get_object(id).unwrap().as_stream().unwrap();
+        assert_eq!(
+            s.dict.get(b"Subtype").unwrap().as_name().unwrap(),
+            b"Type1C"
+        );
+        let cff = s.get_plain_content().unwrap();
+        assert!(ttf_parser::cff::Table::parse(&cff).is_some());
+        assert_eq!(findings.stats.get("fonts_rebuilt"), Some(&1));
     }
 
     #[test]

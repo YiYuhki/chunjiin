@@ -14,6 +14,7 @@
 //!    파일 끝 덧붙은 데이터는 새 문서에 존재하지 않는다.
 
 mod ccitt;
+mod cffw;
 mod content;
 mod font;
 mod inline;
@@ -299,7 +300,18 @@ impl<'a> Copier<'a> {
                 self.copy(v, role, depth + 1)?
             };
             if let Some(o) = copied {
-                out.set(k.clone(), o);
+                // Type 1 을 CFF 로 새로 만들었으면 FontFile3 로 옮긴다
+                let converted = k.as_slice() == b"FontFile"
+                    && matches!(&o, Object::Reference(id)
+                        if self.dst.get_object(*id).ok()
+                            .and_then(|x| x.as_stream().ok())
+                            .and_then(|st| st.dict.get(b"Subtype").ok())
+                            .and_then(|v| v.as_name().ok()) == Some(b"Type1C"));
+                if converted {
+                    out.set("FontFile3", o);
+                } else {
+                    out.set(k.clone(), o);
+                }
             }
         }
         Ok(out)
@@ -755,7 +767,40 @@ impl<'a> Copier<'a> {
             Role::FontFile3 if !font::is_truetype(&plain) => "CFF",
             _ => "TrueType",
         };
-        // 검증만 하고 옮기는 형식
+        // CFF·Type 1: 외곽선에서 새 CFF 를 만든다 (Type 1 은 FontFile3/Type1C 로 바뀜)
+        let rebuilt_ps = match kind {
+            "Type 1" => Some(font::rebuild_type1(&plain)),
+            "CFF" => Some(font::rebuild_cff(&plain)),
+            _ => None,
+        };
+        let fallback = match rebuilt_ps {
+            Some(Ok((data, glyphs))) => {
+                *self.font_stats.entry("fonts_rebuilt").or_default() += 1;
+                *self.font_stats.entry("font_glyphs_rebuilt").or_default() += glyphs as u64;
+                let mut dict = self.copy_dict(&s.dict, depth)?;
+                for k in [
+                    b"Filter".as_slice(),
+                    b"DecodeParms",
+                    b"Length",
+                    b"DL",
+                    b"F",
+                    b"FFilter",
+                    b"FDecodeParms",
+                    b"Length1",
+                    b"Length2",
+                    b"Length3",
+                ] {
+                    dict.remove(k);
+                }
+                if role == Role::Type1 {
+                    dict.set("Subtype", Object::Name(b"Type1C".to_vec()));
+                }
+                return Ok(Some(Some(Stream::new(dict, data))));
+            }
+            Some(Err(e)) => Some(e),
+            None => None,
+        };
+        // 새로 만들 수 없으면 전 글리프를 검증한 뒤 원본을 옮긴다
         let validated = match kind {
             "Type 1" => Some(font::validate_type1(&plain)),
             "CFF" => Some(font::validate_cff(&plain)),
@@ -766,6 +811,16 @@ impl<'a> Copier<'a> {
                 Ok(glyphs) => {
                     *self.font_stats.entry("fonts_validated").or_default() += 1;
                     *self.font_stats.entry("font_glyphs_validated").or_default() += glyphs as u64;
+                    if let Some(e) = fallback {
+                        self.findings.add(
+                            "font",
+                            Severity::Low,
+                            format!(
+                                "{kind} 글꼴을 새로 만들 수 없어 전 글리프 검증 후 원본 유지 ({e})"
+                            ),
+                            "",
+                        );
+                    }
                     Ok(None)
                 }
                 Err(e) => {
