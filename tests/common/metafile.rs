@@ -1,0 +1,405 @@
+//! 메타파일(EMF/WMF) 테스트 표본. 공격용 레코드는 모두 여기서 만든다.
+#![allow(dead_code)]
+
+/// 공격 레코드에 심는 표식
+pub const PAYLOAD: &[u8] = b"HIDDEN-METAFILE-PAYLOAD";
+
+fn emf_rec(t: u32, body: &[u8]) -> Vec<u8> {
+    let size = (body.len() + 8).div_ceil(4) * 4;
+    let mut v = t.to_le_bytes().to_vec();
+    v.extend((size as u32).to_le_bytes());
+    v.extend(body);
+    v.resize(size, 0);
+    v
+}
+
+fn le32(vals: &[i32]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// 2×2 24비트 DIB (BITMAPINFOHEADER + 화소)
+fn dib_2x2() -> (Vec<u8>, Vec<u8>) {
+    let mut info = le32(&[40, 2, 2]);
+    info.extend(1u16.to_le_bytes());
+    info.extend(24u16.to_le_bytes());
+    info.extend(le32(&[0, 16, 0, 0, 0, 0]));
+    let bits = vec![
+        0, 0, 255, 0, 255, 0, 0, 0, // 빨강, 초록 + 채움
+        255, 0, 0, 255, 255, 255, 0, 0,
+    ];
+    (info, bits)
+}
+
+/// 정상 그리기 + 주석(페이로드)·이스케이프·범위 밖 개체 선택·비트맵(뒤에 덧붙은 페이로드)을 담은 EMF
+pub fn malicious_emf() -> Vec<u8> {
+    let mut recs = Vec::new();
+    // 브러시 생성(1번) → 선택 → 사각형
+    recs.push(emf_rec(39, &le32(&[1, 0, 0x0000FF, 0])));
+    recs.push(emf_rec(37, &le32(&[1])));
+    recs.push(emf_rec(43, &le32(&[10, 10, 90, 90])));
+    // 주석 레코드의 페이로드
+    let mut c = (PAYLOAD.len() as u32).to_le_bytes().to_vec();
+    c.extend(PAYLOAD);
+    recs.push(emf_rec(70, &c));
+    // 이스케이프(EXTESCAPE)
+    let mut e = le32(&[0x1001, PAYLOAD.len() as i32]);
+    e.extend(PAYLOAD);
+    recs.push(emf_rec(106, &e));
+    // 개체 표 밖의 번호를 선택 (GDI 취약점 유형)
+    recs.push(emf_rec(37, &le32(&[0x7FFF_0000])));
+    // StretchDIBits: 화소 뒤에 페이로드를 덧붙이고 cbBits 를 부풀림
+    let (info, mut bits) = dib_2x2();
+    bits.extend(PAYLOAD);
+    let fixed = 72usize;
+    let mut body = le32(&[0, 0, 10, 10, 20, 20, 0, 0, 2, 2]);
+    let at_info = 8 + fixed;
+    let at_bits = at_info + info.len();
+    body.extend(le32(&[
+        at_info as i32,
+        info.len() as i32,
+        at_bits as i32,
+        bits.len() as i32,
+        0,
+        0x00CC_0020,
+        4,
+        4,
+    ]));
+    assert_eq!(body.len(), fixed);
+    body.extend(&info);
+    body.extend(&bits);
+    recs.push(emf_rec(81, &body));
+    // 글자 (ExtTextOutW)
+    let text: Vec<u8> = "안녕".encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let mut t = le32(&[0, 0, 100, 20, 1]);
+    t.extend(1f32.to_le_bytes());
+    t.extend(1f32.to_le_bytes());
+    t.extend(le32(&[5, 5, 2, 76, 0, 0, 0, 0, 0, 0]));
+    t.extend(&text);
+    recs.push(emf_rec(84, &t));
+
+    let body: Vec<u8> = recs.concat();
+    let eof = emf_rec(14, &le32(&[0, 16, 20]));
+    let mut desc: Vec<u8> = "EvilApp\0\0"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    desc.extend(PAYLOAD);
+    while !desc.len().is_multiple_of(4) {
+        desc.push(0);
+    }
+    let hsize = 108 + desc.len();
+    let total = hsize + body.len() + eof.len();
+    let mut h = le32(&[1, hsize as i32, 0, 0, 100, 100, 0, 0, 2646, 2646]);
+    h.extend(0x464D_4520u32.to_le_bytes());
+    h.extend(0x0001_0000u32.to_le_bytes());
+    h.extend((total as u32).to_le_bytes());
+    h.extend(((recs.len() + 2) as u32).to_le_bytes());
+    h.extend(2u16.to_le_bytes());
+    h.extend(0u16.to_le_bytes());
+    h.extend(le32(&[
+        (desc.len() / 2) as i32,
+        108,
+        0,
+        1024,
+        768,
+        320,
+        240,
+        0,
+        0,
+        0,
+    ]));
+    h.extend(le32(&[320_000, 240_000]));
+    assert_eq!(h.len(), 108);
+    [h, desc, body, eof].concat()
+}
+
+fn wmf_rec(f: u16, params: &[u8]) -> Vec<u8> {
+    let mut p = params.to_vec();
+    if p.len() % 2 == 1 {
+        p.push(0);
+    }
+    let mut v = ((3 + p.len() / 2) as u32).to_le_bytes().to_vec();
+    v.extend(f.to_le_bytes());
+    v.extend(p);
+    v
+}
+
+fn le16(vals: &[i16]) -> Vec<u8> {
+    vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+}
+
+/// 정상 그리기 + 이스케이프(SETABORTPROC 유형)·존재하지 않는 개체 선택을 담은 WMF (배치 머리글 없음)
+pub fn malicious_wmf_raw() -> Vec<u8> {
+    let mut recs = Vec::new();
+    recs.push(wmf_rec(0x02FC, &le16(&[0, 0xFF, 0, 0]))); // 브러시 → 0번
+    recs.push(wmf_rec(0x012D, &le16(&[0])));
+    recs.push(wmf_rec(0x041B, &le16(&[90, 90, 10, 10]))); // Rectangle
+    let mut esc = le16(&[9, PAYLOAD.len() as i16]); // SETABORTPROC
+    esc.extend(PAYLOAD);
+    recs.push(wmf_rec(0x0626, &esc));
+    recs.push(wmf_rec(0x012D, &le16(&[40]))); // 없는 개체
+    let mut text = le16(&[5]);
+    text.extend(b"hello\0");
+    text.extend(le16(&[20, 20]));
+    recs.push(wmf_rec(0x0521, &text));
+    recs.push(wmf_rec(0x0000, &[]));
+    let body = recs.concat();
+    let words = 9 + body.len() / 2;
+    let max = recs.iter().map(|r| r.len() / 2).max().unwrap();
+    let mut h = le16(&[1, 9, 0x0300]);
+    h.extend((words as u32).to_le_bytes());
+    h.extend(1u16.to_le_bytes());
+    h.extend((max as u32).to_le_bytes());
+    h.extend(0u16.to_le_bytes());
+    [h, body].concat()
+}
+
+/// 배치 머리글(Aldus Placeable) 이 붙은 WMF
+pub fn malicious_wmf() -> Vec<u8> {
+    let mut h = 0x9AC6_CDD7u32.to_le_bytes().to_vec();
+    h.extend(le16(&[0, 0, 0, 100, 100, 1440]));
+    h.extend([0; 4]);
+    let sum = h
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .fold(0u16, |s, w| s ^ u16::from_le_bytes(*w));
+    h.extend(sum.to_le_bytes());
+    [h, malicious_wmf_raw()].concat()
+}
+
+/// EMF 레코드 종류 목록 (머리글 뒤부터)
+pub fn emf_types(d: &[u8]) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut p = u32::from_le_bytes(d[4..8].try_into().unwrap()) as usize;
+    while p + 8 <= d.len() {
+        let t = u32::from_le_bytes(d[p..p + 4].try_into().unwrap());
+        let s = u32::from_le_bytes(d[p + 4..p + 8].try_into().unwrap()) as usize;
+        out.push(t);
+        if s < 8 || t == 14 {
+            break;
+        }
+        p += s;
+    }
+    out
+}
+
+/// WMF 레코드 함수 목록
+pub fn wmf_functions(d: &[u8]) -> Vec<u16> {
+    let base = if d.starts_with(&0x9AC6_CDD7u32.to_le_bytes()) {
+        22
+    } else {
+        0
+    };
+    let mut out = Vec::new();
+    let mut p = base + 18;
+    while p + 6 <= d.len() {
+        let s = u32::from_le_bytes(d[p..p + 4].try_into().unwrap()) as usize;
+        let f = u16::from_le_bytes(d[p + 4..p + 6].try_into().unwrap());
+        out.push(f);
+        if s < 3 || f == 0 {
+            break;
+        }
+        p += s * 2;
+    }
+    out
+}
+
+/// OfficeArt 메타파일 그림 레코드 본문 (식별자 16 + OfficeArtMetafileHeader + zlib 압축 데이터)
+pub fn officeart_metafile_body(data: &[u8]) -> Vec<u8> {
+    use std::io::Write;
+    let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+    z.write_all(data).unwrap();
+    let packed = z.finish().unwrap();
+    let mut b = vec![0xAB; 16];
+    b.extend((data.len() as u32).to_le_bytes());
+    b.extend(le32(&[0, 0, 100, 100, 1000, 1000]));
+    b.extend((packed.len() as u32).to_le_bytes());
+    b.extend([0, 0xFE]);
+    b.extend(packed);
+    b
+}
+
+/// OfficeArt 메타파일 그림 레코드 본문에서 메타파일을 꺼낸다
+pub fn officeart_metafile_data(body: &[u8]) -> Vec<u8> {
+    let cb = u32::from_le_bytes(body[16 + 28..16 + 32].try_into().unwrap()) as usize;
+    let mut out = Vec::new();
+    std::io::Read::read_to_end(
+        &mut flate2::read::ZlibDecoder::new(&body[16 + 34..16 + 34 + cb]),
+        &mut out,
+    )
+    .unwrap();
+    out
+}
+
+/// 머리글만 새로 붙인 EMF (설명 없음)
+pub fn emf_from(recs: &[Vec<u8>]) -> Vec<u8> {
+    let body: Vec<u8> = recs.concat();
+    let eof = emf_rec(14, &le32(&[0, 16, 20]));
+    let total = 108 + body.len() + eof.len();
+    let mut h = le32(&[1, 108, 0, 0, 100, 100, 0, 0, 2646, 2646]);
+    h.extend(0x464D_4520u32.to_le_bytes());
+    h.extend(0x0001_0000u32.to_le_bytes());
+    h.extend((total as u32).to_le_bytes());
+    h.extend(((recs.len() + 2) as u32).to_le_bytes());
+    h.extend(2u16.to_le_bytes());
+    h.extend(0u16.to_le_bytes());
+    h.extend(le32(&[0, 0, 0, 1024, 768, 320, 240, 0, 0, 0]));
+    h.extend(le32(&[320_000, 240_000]));
+    [h, body, eof].concat()
+}
+
+/// EMF+ 레코드 하나
+pub fn plus_rec(t: u16, flags: u16, data: &[u8]) -> Vec<u8> {
+    let padded = data.len().div_ceil(4) * 4;
+    let mut v = t.to_le_bytes().to_vec();
+    v.extend(flags.to_le_bytes());
+    v.extend(((12 + padded) as u32).to_le_bytes());
+    v.extend((data.len() as u32).to_le_bytes());
+    v.extend(data);
+    v.resize(12 + padded, 0);
+    v
+}
+
+/// EMF+ 레코드들을 담은 EMR_COMMENT
+pub fn plus_comment(recs: &[Vec<u8>]) -> Vec<u8> {
+    let data: Vec<u8> = recs.concat();
+    let mut c = ((data.len() + 4) as u32).to_le_bytes().to_vec();
+    c.extend(b"EMF+");
+    c.extend(data);
+    emf_rec(70, &c)
+}
+
+/// 이중(EMF+ + GDI) EMF. `brush` 는 FillRects 가 가리키는 브러시 번호 (0 이면 정상)
+pub fn dual_emf(brush: u32) -> Vec<u8> {
+    let ver = 0xDBC0_1002u32.to_le_bytes();
+    let mut header = ver.to_vec();
+    header.extend(le32(&[1, 96, 96]));
+    let mut solid = ver.to_vec();
+    solid.extend(le32(&[0, 0xFF00_00FFu32 as i32]));
+    let mut fill = brush.to_le_bytes().to_vec();
+    fill.extend(le32(&[1]));
+    fill.extend([0, 0, 0, 0, 50, 0, 50, 0]); // 압축 좌표 사각형
+    let mut comment = PAYLOAD.to_vec();
+    comment.extend(b"-in-EMF+-comment");
+    let plus = plus_comment(&[
+        plus_rec(0x4001, 1, &header),
+        plus_rec(0x4008, 0x0100, &solid),
+        plus_rec(0x400A, 0x4000, &fill),
+        plus_rec(0x4003, 0, &comment),
+    ]);
+    emf_from(&[
+        plus,
+        emf_rec(39, &le32(&[1, 0, 0x0000FF, 0])),
+        emf_rec(37, &le32(&[1])),
+        emf_rec(43, &le32(&[0, 0, 50, 50])),
+    ])
+}
+
+/// EMF+ 메타파일 이미지(안에 `inner`, 형식 `mtype`)를 그리는 이중 EMF
+pub fn plus_metafile_image_emf(mtype: u32, inner: &[u8]) -> Vec<u8> {
+    let ver = 0xDBC0_1002u32.to_le_bytes();
+    let mut header = ver.to_vec();
+    header.extend(le32(&[1, 96, 96]));
+    let mut image = ver.to_vec();
+    image.extend(le32(&[2, mtype as i32, inner.len() as i32]));
+    image.extend(inner);
+    // DrawImage: 속성 없음, 단위 픽셀, 원본 사각형, 대상 사각형(압축 아님)
+    let mut draw = le32(&[-1, 2]);
+    for v in [0f32, 0.0, 100.0, 100.0, 0.0, 0.0, 50.0, 50.0] {
+        draw.extend(v.to_le_bytes());
+    }
+    emf_from(&[
+        plus_comment(&[
+            plus_rec(0x4001, 1, &header),
+            plus_rec(0x4008, 0x0500, &image),
+            plus_rec(0x401A, 0x0000, &draw),
+        ]),
+        emf_rec(39, &le32(&[1, 0, 0x0000FF, 0])),
+        emf_rec(37, &le32(&[1])),
+        emf_rec(43, &le32(&[0, 0, 50, 50])),
+    ])
+}
+
+/// 레코드들로 WMF 를 만든다 (배치 머리글 없음, 끝 레코드 포함)
+pub fn wmf_from(recs: &[Vec<u8>], objects: u16) -> Vec<u8> {
+    let mut recs = recs.to_vec();
+    recs.push(wmf_rec(0x0000, &[]));
+    let body = recs.concat();
+    let words = 9 + body.len() / 2;
+    let max = recs.iter().map(|r| r.len() / 2).max().unwrap();
+    let mut h = le16(&[1, 9, 0x0300]);
+    h.extend((words as u32).to_le_bytes());
+    h.extend(objects.to_le_bytes());
+    h.extend((max as u32).to_le_bytes());
+    h.extend(0u16.to_le_bytes());
+    [h, body].concat()
+}
+
+/// META_ESCAPE_ENHANCED_METAFILE 레코드들 (EMF 를 `parts` 조각으로)
+pub fn embedded_emf_escapes(emf: &[u8], parts: usize) -> Vec<Vec<u8>> {
+    let size = emf.len().div_ceil(parts);
+    let mut remaining = emf.len();
+    emf.chunks(size)
+        .map(|c| {
+            remaining -= c.len();
+            let mut p = le16(&[0x000F, (34 + c.len()) as i16]);
+            p.extend(0x4346_4D57u32.to_le_bytes());
+            p.extend(1u32.to_le_bytes());
+            p.extend(0x0001_0000u32.to_le_bytes());
+            p.extend(0x1234u16.to_le_bytes());
+            p.extend(0u32.to_le_bytes());
+            p.extend((parts as u32).to_le_bytes());
+            p.extend((c.len() as u32).to_le_bytes());
+            p.extend((remaining as u32).to_le_bytes());
+            p.extend((emf.len() as u32).to_le_bytes());
+            p.extend(c);
+            wmf_rec(0x0626, &p)
+        })
+        .collect()
+}
+
+/// CreateRegion 매개변수. `swap` 이면 스캔의 왼쪽·오른쪽을 뒤집어 깨뜨린다
+pub fn wmf_region(swap: bool) -> Vec<u8> {
+    let mut scans = Vec::new();
+    for (top, bottom, l, r) in [(0i16, 10i16, 0i16, 20i16), (10, 20, 5, 15)] {
+        let (l, r) = if swap { (r, l) } else { (l, r) };
+        scans.extend(le16(&[2, top, bottom, l, r, 2]));
+    }
+    // nextInChain·ObjectCount 에 쓰레기 값
+    let mut p = le16(&[0x7777, 6]);
+    p.extend(0x5555_5555u32.to_le_bytes());
+    p.extend(le16(&[(22 + scans.len()) as i16, 2, 1, 0, 0, 20, 20]));
+    p.extend(scans);
+    p
+}
+
+/// CreatePatternBrush 매개변수 (8×8 1비트, 예약 영역에 페이로드)
+pub fn wmf_pattern_brush() -> Vec<u8> {
+    let mut p = le16(&[0, 8, 8, 2]);
+    p.extend([1, 1]);
+    p.extend(0xDEAD_BEEFu32.to_le_bytes());
+    p.extend(&PAYLOAD[..18]);
+    p.extend([0xAA, 0, 0x55, 0].repeat(4));
+    p
+}
+
+/// 내장 EMF·영역·무늬 브러시를 담은 WMF
+pub fn wmf_with_extras() -> Vec<u8> {
+    let mut recs = embedded_emf_escapes(&malicious_emf(), 2);
+    recs.push(wmf_rec(0x02FC, &le16(&[0, 0xFF, 0, 0]))); // 브러시 → 0
+    recs.push(wmf_rec(0x06FF, &wmf_region(false))); // 영역 → 1
+    recs.push(wmf_rec(0x0228, &le16(&[1, 0]))); // FillRegion
+    recs.push(wmf_rec(0x01F9, &wmf_pattern_brush())); // 무늬 브러시 → 2
+    recs.push(wmf_rec(0x012D, &le16(&[2])));
+    recs.push(wmf_rec(0x041B, &le16(&[90, 90, 10, 10])));
+    recs.push(wmf_rec(0x06FF, &wmf_region(true))); // 깨진 영역 → 3 (빈 브러시로)
+    let mut esc = le16(&[9, PAYLOAD.len() as i16]); // SETABORTPROC
+    esc.extend(PAYLOAD);
+    recs.push(wmf_rec(0x0626, &esc));
+    wmf_from(&recs, 4)
+}
+
+pub fn wmf_rec_pub(f: u16, params: &[u8]) -> Vec<u8> {
+    wmf_rec(f, params)
+}
