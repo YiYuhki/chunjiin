@@ -239,3 +239,79 @@ fn svg_reference_bombs_are_blocked() {
     let r = Engine::default().process(ok.as_bytes(), "a.svg");
     assert_ne!(r.status, Status::Blocked, "{:#?}", r.findings);
 }
+
+#[test]
+fn svg_rendering_cost_is_limited() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="3000000" height="1500000" viewBox="0 0 1000 500">
+  <style>.d{stroke-dasharray: 0.001 0.001 ; stroke:red} .e{stroke-dasharray:4 2}</style>
+  <defs>
+    <filter id="f" x="-50000%" y="-10" width="100000%" height="999"><feGaussianBlur stdDeviation="1e9 5"/><feMorphology radius="100000000"/></filter>
+    <filter id="u" filterUnits="userSpaceOnUse" x="0" y="0" width="1e12mm" height="100"><feDropShadow stdDeviation="3"/></filter>
+  </defs>
+  <rect width="10" height="10" filter="url(#f)"/>
+  <path d="M0 0L1000000 0" stroke="#000" stroke-dasharray="0.01,0.02"/>
+  <path class="d" d="M0 0L9 9" style="stroke-dasharray:0.01;fill:none"/>
+  <path class="e" d="M0 0L9 9" stroke-dasharray="5 5" filter="url(#u)"/>
+</svg>"##;
+    let r = Engine::default().process(svg.as_bytes(), "a.svg");
+    assert_eq!(r.status, Status::Sanitized, "{} {:#?}", r.reason, r.findings);
+    assert!(
+        r.findings
+            .iter()
+            .any(|f| f.category == "resource" && f.description.contains("렌더링")),
+        "{:#?}",
+        r.findings
+    );
+    let out = String::from_utf8(r.output.clone().unwrap()).unwrap();
+    for want in [
+        // 캔버스는 긴 변 20000px 로 (viewBox 는 그대로)
+        r#"width="20000" height="10000" viewBox="0 0 1000 500""#,
+        // 필터 영역은 대상 상자 앞뒤로 10배까지 (대상은 계속 덮음)
+        r#"<filter id="f" x="-10" y="-10" width="21" height="21">"#,
+        // 흐림·모폴로지 반경은 뷰포트 긴 변까지
+        r#"stdDeviation="1000 5""#,
+        r#"radius="1000""#,
+        // 사용자 좌표 필터 영역은 뷰포트의 10배
+        r#"x="0" y="0" width="10000" height="100""#,
+        // 지나치게 촘촘한 점선은 실선으로
+        r#"stroke-dasharray="none""#,
+        ".d{stroke-dasharray:none; stroke:red}",
+        "stroke-dasharray:none;fill:none",
+        // 평범한 값은 그대로
+        "stroke-dasharray:4 2",
+        r#"stroke-dasharray="5 5""#,
+        r#"stdDeviation="3""#,
+    ] {
+        assert!(out.contains(want), "{want} 가 없음:\n{out}");
+    }
+    let again = Engine::default().process(out.as_bytes(), "a.svg");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+    assert_eq!(again.output.as_deref(), Some(out.as_bytes()), "고정점");
+
+    // 필터 폭탄: 필터를 건 요소를 use 로 펼쳐 필터 계산을 수만 번 반복
+    let mut s = String::from(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><defs><filter id="b"><feGaussianBlur stdDeviation="2"/><feOffset dx="1"/><feMerge><feMergeNode/></feMerge></filter><rect id="a0" width="1" height="1" filter="url(#b)"/>"#,
+    );
+    for i in 1..=4 {
+        s += &format!(r#"<g id="a{i}">"#);
+        for _ in 0..10 {
+            s += &format!(r##"<use href="#a{}"/>"##, i - 1);
+        }
+        s += "</g>";
+    }
+    s += r##"</defs><use href="#a4"/></svg>"##;
+    let r = Engine::default().process(s.as_bytes(), "a.svg");
+    assert_eq!(r.status, Status::Blocked, "{:#?}", r.findings);
+    assert!(r.reason.contains("필터"), "{}", r.reason);
+
+    // viewBox 가 없는 큰 캔버스는 원래 좌표계를 viewBox 로 적고 줄인다
+    let big = r#"<svg xmlns="http://www.w3.org/2000/svg" width="100000" height="50cm"><rect width="9" height="9"/></svg>"#;
+    let r = Engine::default().process(big.as_bytes(), "a.svg");
+    let out = String::from_utf8(r.output.clone().unwrap()).unwrap();
+    assert!(
+        out.contains(r#"width="20000" height="377.952755" viewBox="0 0 100000 1889.763779""#),
+        "{out}"
+    );
+    let again = Engine::default().process(out.as_bytes(), "a.svg");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
