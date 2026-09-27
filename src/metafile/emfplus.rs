@@ -2,10 +2,11 @@
 //!
 //! EMF+ 레코드는 EMF 주석(EMR_COMMENT) 안에 들어 있다. 레코드를 하나씩 해석해 허용된 종류만
 //! 크기·개체 번호·좌표 개수·경로·영역 구조를 검증한 정규형으로 다시 쓴다.
-//! - 개체(브러시·펜·경로·영역·이미지·글꼴·문자열 형식·이미지 속성)는 정의된 필드만 옮기고,
-//!   그리기 레코드가 가리키는 개체는 그 종류가 맞아야 한다
-//! - 이미지 개체의 압축 비트맵(PNG/JPEG/GIF/BMP)은 재인코딩하고, 원시 화소는 크기를 검증한다.
-//!   내장 메타파일·텍스처 브러시·경로 그라데이션·사용자 선 끝·여러 레코드로 나뉜 개체는 옮기지 않는다
+//! - 개체(브러시·펜·경로·영역·이미지·글꼴·문자열 형식·이미지 속성·사용자 선 끝)는 정의된 필드만
+//!   옮기고, 그리기 레코드가 가리키는 개체는 그 종류가 맞아야 한다
+//! - 이미지 개체(텍스처 브러시 안 포함)의 압축 비트맵(PNG/JPEG/GIF/BMP)은 재인코딩하고, 원시 화소는
+//!   크기를 검증한다. 내장 메타파일 이미지는 옮기지 않는다
+//! - 여러 레코드로 나뉜 개체는 조각을 모아 전체 크기를 검증한 뒤 하나로 합쳐 쓴다
 //! - 주석·직렬화 개체(효과)·원격 데스크톱 상태·다중 형식 구획은 옮기지 않는다
 //!
 //! 그리기에 영향을 주는 레코드를 하나라도 옮길 수 없으면 그 메타파일의 EMF+ 는 모두 빼고
@@ -27,6 +28,7 @@ const OBJ_IMAGE: u8 = 5;
 const OBJ_FONT: u8 = 6;
 const OBJ_STRING_FORMAT: u8 = 7;
 const OBJ_IMAGE_ATTRIBUTES: u8 = 8;
+const OBJ_CUSTOM_LINE_CAP: u8 = 9;
 
 /// 순서대로 읽는 커서 (범위를 벗어나면 None)
 struct Cur<'a> {
@@ -69,12 +71,16 @@ pub struct PlusCtx<'a> {
     pub policy: &'a Policy,
     pub budget: &'a mut PixelBudget,
     objects: [u8; MAX_OBJECTS],
+    /// 개체 레코드가 한 번이라도 온 번호 (옮기지 못한 개체 포함)
+    defined: [bool; MAX_OBJECTS],
     /// 그리기에 영향을 주는 레코드를 모두 옮겼는지
     pub faithful: bool,
     pub kept: u64,
     pub removed: u64,
     pub invalid: u64,
     pub images: u64,
+    /// 여러 레코드로 나뉜 개체를 모으는 중: (C 를 뺀 플래그, 전체 크기, 모은 데이터)
+    cont: Option<(u16, usize, Vec<u8>)>,
 }
 
 impl<'a> PlusCtx<'a> {
@@ -83,11 +89,13 @@ impl<'a> PlusCtx<'a> {
             policy,
             budget,
             objects: [0; MAX_OBJECTS],
+            defined: [false; MAX_OBJECTS],
             faithful: true,
             kept: 0,
             removed: 0,
             invalid: 0,
             images: 0,
+            cont: None,
         }
     }
 
@@ -116,6 +124,21 @@ impl<'a> PlusCtx<'a> {
             }
             let body = &data[p + 12..p + 12 + dsize];
             p += size;
+            // 나뉜 개체: 조각마다 앞 4바이트가 전체 크기. C 플래그가 없는 같은 개체 레코드가 마지막 조각
+            let assembled;
+            let (flags, body) = match self.continued(t, flags, body) {
+                Cont::No => (flags, body),
+                Cont::Pending => continue,
+                Cont::Done(buf) => {
+                    assembled = buf;
+                    (flags & 0x7FFF, assembled.as_slice())
+                }
+                Cont::Broken => {
+                    self.invalid += 1;
+                    self.faithful = false;
+                    continue;
+                }
+            };
             match self.record(t, flags, body) {
                 Rec::Keep(flags, b) => {
                     let mut b = b;
@@ -131,6 +154,14 @@ impl<'a> PlusCtx<'a> {
                     self.kept += 1;
                 }
                 Rec::Harmless => self.removed += 1,
+                // 정의된 적 없는 개체를 가리키는 그리기는 렌더러도 건너뛰므로 그림에 영향이 없다
+                Rec::Invalid
+                    if uses_flag_object(t)
+                        && usize::from(flags & 0xFF) < MAX_OBJECTS
+                        && !self.defined[usize::from(flags & 0xFF)] =>
+                {
+                    self.removed += 1;
+                }
                 Rec::Invalid => {
                     self.invalid += 1;
                     self.faithful = false;
@@ -141,6 +172,51 @@ impl<'a> PlusCtx<'a> {
             self.faithful = false;
         }
         (!out.is_empty()).then_some(out)
+    }
+
+    /// 나뉜 개체 조각을 모은다
+    fn continued(&mut self, t: u16, flags: u16, body: &[u8]) -> Cont {
+        const MAX_TOTAL: usize = 64 << 20;
+        let pending = self.cont.as_ref().map(|(k, _, _)| *k);
+        let is_part = t == 0x4008 && (flags & 0x8000 != 0 || pending == Some(flags & 0x7FFF));
+        if !is_part {
+            if pending.is_some() {
+                // 조각이 끝나기 전에 다른 레코드가 왔다
+                self.cont = None;
+                return Cont::Broken;
+            }
+            return Cont::No;
+        }
+        let (Some(total), Some(part)) = (
+            body.get(..4)
+                .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize),
+            body.get(4..),
+        ) else {
+            self.cont = None;
+            return Cont::Broken;
+        };
+        let key = flags & 0x7FFF;
+        let entry = match &mut self.cont {
+            Some((k, tot, buf)) if *k == key && *tot == total => buf,
+            _ => {
+                if total > MAX_TOTAL {
+                    self.cont = None;
+                    return Cont::Broken;
+                }
+                self.cont = Some((key, total, Vec::with_capacity(total.min(1 << 20))));
+                &mut self.cont.as_mut().unwrap().2
+            }
+        };
+        entry.extend_from_slice(part);
+        if entry.len() > total {
+            self.cont = None;
+            return Cont::Broken;
+        }
+        if flags & 0x8000 != 0 {
+            return Cont::Pending;
+        }
+        let (_, _, buf) = self.cont.take().unwrap();
+        Cont::Done(buf)
     }
 
     fn record(&mut self, t: u16, flags: u16, b: &[u8]) -> Rec {
@@ -176,8 +252,11 @@ impl<'a> PlusCtx<'a> {
             // 주석, 다중 형식, 직렬화 개체(효과), 원격 데스크톱 상태
             0x4003 | 0x4005..=0x4007 | 0x4038..=0x403A => Rec::Harmless,
             0x4008 => {
-                // 여러 레코드로 나뉜 개체(C 플래그)는 옮기지 않는다
+                // 나뉜 개체는 comment() 에서 모아 C 플래그 없이 넘어온다
                 let obj = (flags >> 8 & 0x7F) as u8;
+                if (id as usize) < MAX_OBJECTS {
+                    self.defined[id as usize] = true;
+                }
                 if flags & 0x8000 != 0 || id as usize >= MAX_OBJECTS {
                     if (id as usize) < MAX_OBJECTS {
                         self.objects[id as usize] = 0;
@@ -289,7 +368,8 @@ impl<'a> PlusCtx<'a> {
                 keep((|| {
                     self.is(id, OBJ_IMAGE).then_some(())?;
                     let attr = c.u32()?;
-                    if attr != 0 && !self.is(attr, OBJ_IMAGE_ATTRIBUTES) {
+                    // 0xFFFFFFFF(없음)·0 이 아니면 이미지 속성 개체여야 한다
+                    if attr != 0 && attr != u32::MAX && !self.is(attr, OBJ_IMAGE_ATTRIBUTES) {
                         return None;
                     }
                     c.u32()?; // SrcUnit
@@ -364,16 +444,12 @@ impl<'a> PlusCtx<'a> {
     fn object(&mut self, kind: u8, b: &[u8]) -> Option<Vec<u8>> {
         let mut c = Cur::new(b);
         match kind {
-            OBJ_BRUSH => {
-                brush(&mut c)?;
-                Some(c.done().to_vec())
-            }
+            OBJ_BRUSH => self.brush_out(&mut c),
             OBJ_PEN => {
                 version(&mut c)?;
                 (c.u32()? == 0).then_some(())?;
                 let fl = c.u32()?;
-                // 사용자 선 끝(CustomStartCap/EndCap)은 옮기지 않는다
-                if fl & !0x07FF != 0 {
+                if fl & !0x1FFF != 0 {
                     return None;
                 }
                 c.u32()?; // 단위
@@ -397,8 +473,15 @@ impl<'a> PlusCtx<'a> {
                     let n = c.u32()?;
                     array(&mut c, n, 4)?;
                 }
-                brush(&mut c)?;
-                Some(c.done().to_vec())
+                // 사용자 선 끝(시작·끝): 크기 + 선 끝 개체 (크기와 해석한 길이가 같아야 함)
+                for bit in [0x800, 0x1000] {
+                    if fl & bit != 0 {
+                        sized(&mut c, custom_cap)?;
+                    }
+                }
+                let mut out = c.done().to_vec();
+                out.extend(self.brush_out(&mut c)?);
+                Some(out)
             }
             OBJ_PATH => {
                 path(&mut c)?;
@@ -434,6 +517,10 @@ impl<'a> PlusCtx<'a> {
                 array(&mut c, ranges, 8)?;
                 Some(c.done().to_vec())
             }
+            OBJ_CUSTOM_LINE_CAP => {
+                custom_cap(&mut c)?;
+                Some(c.done().to_vec())
+            }
             OBJ_IMAGE_ATTRIBUTES => {
                 version(&mut c)?;
                 c.take(20)?;
@@ -441,6 +528,30 @@ impl<'a> PlusCtx<'a> {
             }
             _ => None,
         }
+    }
+
+    /// 브러시 개체를 옮긴다. 텍스처 브러시는 안의 이미지를 재인코딩한다
+    fn brush_out(&mut self, c: &mut Cur) -> Option<Vec<u8>> {
+        let start = c.p;
+        version(c)?;
+        let kind = c.u32()?;
+        if kind != 2 {
+            brush_body(c, kind)?;
+            return Some(c.d[start..c.p].to_vec());
+        }
+        // 텍스처: 플래그·WrapMode·(변환)·이미지
+        let fl = c.u32()?;
+        if fl & !(0x02 | 0x40 | 0x80) != 0 {
+            return None;
+        }
+        c.u32()?;
+        if fl & 0x02 != 0 {
+            c.take(24)?;
+        }
+        let mut out = c.d[start..c.p].to_vec();
+        out.extend(self.image(c)?);
+        c.p = c.d.len();
+        Some(out)
     }
 
     /// 이미지 개체: 압축 비트맵은 재인코딩, 원시 화소는 크기 검증. 메타파일은 옮기지 않는다
@@ -453,7 +564,8 @@ impl<'a> PlusCtx<'a> {
         let format = c.u32()?;
         let kind = c.u32()?;
         let px = u64::from(w).checked_mul(u64::from(h))?;
-        if w == 0 || h == 0 || px > self.policy.max_image_pixels {
+        // 압축 비트맵은 크기를 압축 데이터에서 읽으므로 머리글의 폭·높이가 0 일 수 있다
+        if (kind != 1 && (w == 0 || h == 0)) || px > self.policy.max_image_pixels {
             return None;
         }
         let rest = &c.d[c.p..];
@@ -506,6 +618,22 @@ impl<'a> PlusCtx<'a> {
     }
 }
 
+/// 플래그의 하위 바이트로 개체를 가리키는 레코드
+fn uses_flag_object(t: u16) -> bool {
+    matches!(
+        t,
+        0x400B | 0x400D | 0x400F | 0x4011..=0x4015 | 0x4017..=0x401C | 0x4033 | 0x4034
+            | 0x4036 | 0x4037
+    )
+}
+
+enum Cont {
+    No,
+    Pending,
+    Done(Vec<u8>),
+    Broken,
+}
+
 enum Rec {
     Keep(u16, Vec<u8>),
     /// 옮기지 않아도 그림이 달라지지 않는 레코드
@@ -513,20 +641,54 @@ enum Rec {
     Invalid,
 }
 
-/// 브러시: 단색·해치·선형 그라데이션만
-fn brush(c: &mut Cur) -> Option<()> {
-    version(c)?;
-    match c.u32()? {
+/// 브러시 본체 (단색·해치·선형 그라데이션·경로 그라데이션). 텍스처는 [`PlusCtx::brush_out`]
+fn brush_body(c: &mut Cur, kind: u32) -> Option<()> {
+    match kind {
         0 => {
             c.u32()?;
         }
         1 => {
             c.take(12)?;
         }
+        // 경로 그라데이션
+        3 => {
+            let fl = c.u32()?;
+            // 경계 경로·변환·미리 정한 색·혼합 계수·초점 배율·감마·변환 안 함
+            if fl & !(0x01 | 0x02 | 0x04 | 0x08 | 0x20 | 0x40 | 0x80) != 0 {
+                return None;
+            }
+            c.u32()?; // WrapMode
+            c.u32()?; // 중심 색
+            c.f32()?;
+            c.f32()?; // 중심점
+            let n = c.u32()?;
+            array(c, n, 4)?; // 둘레 색
+            if fl & 0x01 != 0 {
+                sized(c, path)?;
+            } else {
+                let n = c.u32()?;
+                array(c, n, 8)?;
+            }
+            if fl & 0x02 != 0 {
+                c.take(24)?;
+            }
+            for bit in [0x04, 0x08] {
+                if fl & bit != 0 {
+                    let n = c.u32()?;
+                    array(c, n, 4)?;
+                    array(c, n, 4)?;
+                }
+            }
+            if fl & 0x20 != 0 {
+                (c.u32()? == 2).then_some(())?;
+                c.f32()?;
+                c.f32()?;
+            }
+        }
         4 => {
             let fl = c.u32()?;
-            // 변환·미리 정한 색·혼합 계수·감마 보정만
-            if fl & !(0x02 | 0x04 | 0x08 | 0x10 | 0x40) != 0 {
+            // 변환·미리 정한 색·혼합 계수·감마 보정·변환 안 함만
+            if fl & !(0x02 | 0x04 | 0x08 | 0x10 | 0x40 | 0x80) != 0 {
                 return None;
             }
             c.u32()?; // WrapMode
@@ -550,7 +712,54 @@ fn brush(c: &mut Cur) -> Option<()> {
                 }
             }
         }
-        // 텍스처(이미지 포함)·경로 그라데이션은 옮기지 않는다
+        _ => return None,
+    }
+    Some(())
+}
+
+/// 크기(u32) 뒤에 오는 하위 구조: 해석한 길이가 선언 크기와 정확히 같아야 한다
+fn sized(c: &mut Cur, parse: fn(&mut Cur) -> Option<()>) -> Option<()> {
+    let len = c.u32()? as usize;
+    let sub = c.take(len)?;
+    let mut s = Cur::new(sub);
+    parse(&mut s)?;
+    (s.p == len).then_some(())
+}
+
+/// 사용자 선 끝: 기본형(채움·선 경로 선택)과 화살표형
+fn custom_cap(c: &mut Cur) -> Option<()> {
+    version(c)?;
+    match c.u32()? {
+        0 => {
+            let fl = c.u32()?;
+            if fl & !0x03 != 0 {
+                return None;
+            }
+            c.u32()?; // BaseCap
+            c.f32()?; // BaseInset
+            c.take(12)?; // 시작·끝 선 끝, 이음
+            c.f32()?; // 이음 한도
+            c.f32()?; // 폭 배율
+            for _ in 0..4 {
+                c.f32()?; // 채움·선 기준점
+            }
+            for bit in [0x01, 0x02] {
+                if fl & bit != 0 {
+                    sized(c, path)?;
+                }
+            }
+        }
+        1 => {
+            for _ in 0..3 {
+                c.f32()?; // 폭·높이·가운데 들임
+            }
+            c.take(16)?; // 채움 여부, 선 시작·끝, 이음
+            c.f32()?; // 이음 한도
+            c.f32()?; // 폭 배율
+            for _ in 0..4 {
+                c.f32()?;
+            }
+        }
         _ => return None,
     }
     Some(())
@@ -661,6 +870,36 @@ mod tests {
         bad.extend(1u32.to_le_bytes());
         bad.extend([0; 8]);
         ctx.comment(&rec(0x400A, 0x4000, &bad));
+        assert!(!ctx.faithful);
+    }
+
+    #[test]
+    fn continued_objects_are_assembled() {
+        let policy = Policy::default();
+        let mut budget = PixelBudget::new(&policy);
+        let mut ctx = PlusCtx::new(&policy, &mut budget);
+        let mut brush = ver();
+        brush.extend(0u32.to_le_bytes());
+        brush.extend(0xFF00_00FFu32.to_le_bytes());
+        let total = (brush.len() as u32).to_le_bytes();
+        let part = |d: &[u8]| [&total[..], d].concat();
+        let mut fill = 0u32.to_le_bytes().to_vec();
+        fill.extend(1u32.to_le_bytes());
+        fill.extend([0, 0, 0, 0, 10, 0, 10, 0]);
+        let mut s = Vec::new();
+        s.extend(rec(0x4008, 0x8100, &part(&brush[..6])));
+        s.extend(rec(0x4008, 0x0100, &part(&brush[6..])));
+        s.extend(rec(0x400A, 0x4000, &fill));
+        let out = ctx.comment(&s).unwrap();
+        assert!(ctx.faithful, "나뉜 개체를 모아 옮김");
+        assert_eq!(ctx.kept, 2);
+        // 하나로 합친 개체 레코드 (C 플래그 없음)
+        assert_eq!(&out[..4], &[0x08, 0x40, 0x00, 0x01]);
+        // 조각 사이에 다른 레코드가 끼면 끊긴 것으로 본다
+        let mut s = Vec::new();
+        s.extend(rec(0x4008, 0x8101, &part(&brush[..6])));
+        s.extend(rec(0x4009, 0, &[0; 4]));
+        ctx.comment(&s);
         assert!(!ctx.faithful);
     }
 
