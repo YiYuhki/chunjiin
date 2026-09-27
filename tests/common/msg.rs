@@ -277,12 +277,14 @@ pub fn recurring_meeting_msg() -> Vec<u8> {
     w32(&mut rec, d0311 + 840);
     w32(&mut rec, d0311 + 900);
     w32(&mut rec, d0311 + 600);
-    w16(&mut rec, 0x0001 | 0x0004 | 0x0008); // 제목, 알림 시간, 알림 켬
+    w16(&mut rec, 0x0001 | 0x0004 | 0x0008 | 0x0020 | 0x0080); // 제목, 알림 시간·켬, 한가함, 종일
     w16(&mut rec, ansi.len() as u16 + 1);
     w16(&mut rec, ansi.len() as u16);
     rec.extend(ansi);
     w32(&mut rec, 30); // 30분 전
     w32(&mut rec, 1);
+    w32(&mut rec, 0); // 한가함
+    w32(&mut rec, 1); // 종일
     w32(&mut rec, 0); // ReservedBlock1
     w32(&mut rec, 4); // ChangeHighlight
     w32(&mut rec, 0);
@@ -370,8 +372,30 @@ pub fn recurring_meeting_msg() -> Vec<u8> {
 
 /// 사진이 있는 연락처
 pub fn contact_msg() -> Vec<u8> {
+    // 생일 1990-05-01 (한국 자정 = 1990-04-30 15:00 UTC)
+    let birthday = (641_487_600u64 + 11_644_473_600) * 10_000_000;
+    let address = [
+        0x04, 0x20, 0x06, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
+    ];
+    let mut entries = 0x804Fu32.to_le_bytes().to_vec(); // 사용자 정의 필드 1
+    entries.extend(6u16.to_le_bytes());
+    entries.extend(0u16.to_le_bytes());
     let e: Vec<(String, Vec<u8>)> = vec![
-        ("__properties_version1.0".into(), props_stream(32, &[])),
+        (
+            "__properties_version1.0".into(),
+            props_stream(32, &[(0x3A42, 0x0040, birthday)]),
+        ),
+        (
+            "__nameid_version1.0/__substg1.0_00020102".into(),
+            address.to_vec(),
+        ),
+        ("__nameid_version1.0/__substg1.0_00030102".into(), entries),
+        string_prop("", 0x8000, "사번 1234"),
+        string_prop("", 0x3A4F, "철수"),
+        string_prop("", 0x3A24, "02-000-0000"),
+        string_prop("", 0x3A59, "서울"),
+        string_prop("", 0x3A5D, "한강대로 1"),
+        string_prop("", 0x1000, "주간 회의 담당"),
         string_prop("", 0x001A, "IPM.Contact"),
         string_prop("", 0x0037, "김철수"),
         string_prop("", 0x3001, "김철수"),
@@ -449,6 +473,56 @@ pub fn recurring_task_msg() -> Vec<u8> {
         string_prop("", 0x001A, "IPM.Task"),
         string_prop("", 0x0037, "주간 보고서 작성"),
         binary_prop("", 0x8003, &rec),
+    ];
+    let refs: Vec<(&str, &[u8])> = e.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    cfb(&refs)
+}
+
+/// 음력 반복 일정. `yearly` 면 매년(음력 `day` 일), 아니면 매월 1일. `start` 는 1601 기준 분(자정), `count` 회
+pub fn lunar_event_msg(yearly: bool, start: u32, day: u32, count: u32) -> Vec<u8> {
+    let appt = [
+        0x02, 0x20, 0x06, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
+    ];
+    let mut entries = Vec::new();
+    for (i, lid) in [0x820Du32, 0x820E, 0x8216].into_iter().enumerate() {
+        entries.extend(lid.to_le_bytes());
+        entries.extend(6u16.to_le_bytes());
+        entries.extend((i as u16).to_le_bytes());
+    }
+    let mut rec = Vec::new();
+    let freq: u16 = if yearly { 0x200D } else { 0x200C };
+    for v in [0x3004u16, 0x3004, freq, 0xA, 0x14] {
+        rec.extend(v.to_le_bytes()); // 음력 날짜 패턴, 한국 음력
+    }
+    let period = if yearly { 12 } else { 1 };
+    for v in [0u32, period, 0, day, 0x2022, count, 0, 0, 0, start, start] {
+        rec.extend(v.to_le_bytes());
+    }
+    for v in [0x3006u32, 0x3009, 540, 600] {
+        rec.extend(v.to_le_bytes()); // 09:00~10:00
+    }
+    rec.extend(0u16.to_le_bytes());
+    rec.extend([0u8; 8]);
+    let ft = |m: u32| (u64::from(m) + 540) * 60 * 10_000_000;
+    let e: Vec<(String, Vec<u8>)> = vec![
+        (
+            "__properties_version1.0".into(),
+            props_stream(
+                32,
+                &[
+                    (0x8000, 0x0040, ft(start)),
+                    (0x8001, 0x0040, ft(start + 60)),
+                ],
+            ),
+        ),
+        (
+            "__nameid_version1.0/__substg1.0_00020102".into(),
+            appt.to_vec(),
+        ),
+        ("__nameid_version1.0/__substg1.0_00030102".into(), entries),
+        string_prop("", 0x001A, "IPM.Appointment"),
+        string_prop("", 0x0037, "어머니 생신"),
+        binary_prop("", 0x8002, &rec),
     ];
     let refs: Vec<(&str, &[u8])> = e.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
     cfb(&refs)

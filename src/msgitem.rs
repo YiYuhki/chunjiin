@@ -66,6 +66,22 @@ pub struct Contact {
     pub address: [Option<String>; 5],
     /// 재인코딩한 사진 (내용, vCard TYPE)
     pub photo: Option<(Vec<u8>, &'static str)>,
+    /// 집 주소 (거리, 시, 도, 우편번호, 국가)
+    pub home_address: [Option<String>; 5],
+    pub nickname: Option<String>,
+    /// 생일·기념일 (FILETIME)
+    pub birthday: Option<u64>,
+    pub anniversary: Option<u64>,
+    /// 메모(본문)
+    pub note: String,
+    /// 그 밖의 필드 (이름표, 값): 사용자 정의 필드, 메신저 주소, 배우자 등
+    pub extra: Vec<(String, String)>,
+}
+
+/// 생일처럼 날짜만 뜻이 있는 FILETIME → 날짜 (현지 자정을 UTC 로 저장하므로 가장 가까운 자정으로)
+fn nearest_date(ft: u64) -> Option<i64> {
+    let m = ft_minutes(ft);
+    Some((m + 720).div_euclid(1440) * 1440)
 }
 
 /// 참석자
@@ -130,6 +146,8 @@ pub struct Recur {
     /// 지운 회차 날짜 (현지 분, 자정)
     deleted: Vec<i64>,
     exceptions: Vec<Exception>,
+    /// 음력 반복이면 그 달력 (날짜·월은 음력 기준)
+    lunar: Option<crate::lunar::Calendar>,
 }
 
 impl Exception {
@@ -152,6 +170,10 @@ pub struct Exception {
     reminder_set: Option<bool>,
     /// 알림 시간(분 전) 변경
     reminder_delta: Option<u32>,
+    /// 약속 있음 표시 변경 (false 면 한가함)
+    busy: Option<bool>,
+    /// 종일 여부 변경
+    all_day: Option<bool>,
     subject: Option<String>,
     location: Option<String>,
 }
@@ -508,10 +530,19 @@ impl Recur {
         let _first = c.u32()?;
         let period = c.u32()?;
         let _sliding = c.u32()?;
-        // 그레고리력만
-        if calendar != 0 && calendar != 1 {
-            return None;
-        }
+        // 그레고리력과 음력(한국·중국)
+        let lunar = match calendar {
+            0 | 1 => None,
+            0x12 | 0x14 => Some(crate::lunar::KOREAN_CAL),
+            0x0F | 0x11 => Some(crate::lunar::CHINESE_CAL),
+            _ => return None,
+        };
+        // 음력 패턴(0xA~0xC)은 음력 달력에서만, 뜻은 날짜·n번째 요일·말일 패턴과 같다
+        let pattern = match pattern {
+            0xA..=0xC if lunar.is_some() => pattern - 8,
+            0xA..=0xC => return None,
+            p => p,
+        };
         let (mut days, mut nth, mut month_day) = (0u8, 0u32, 0i32);
         match pattern {
             0 => {}
@@ -534,7 +565,6 @@ impl Recur {
                     return None;
                 }
             }
-            // 음력(히즈라력) 패턴
             _ => return None,
         }
         let end_type = c.u32()?;
@@ -574,7 +604,13 @@ impl Recur {
             0x2022 => (Some(occurrences).filter(|&n| n > 0), None),
             _ => (None, None),
         };
-        let month = civil(start_date).map_or(1, |(_, m, ..)| m as u32);
+        // 음력은 매월·매년 반복에만 뜻이 있다
+        let lunar = lunar.filter(|_| matches!(freq, Freq::Monthly | Freq::Yearly));
+        let start_day = start_date.div_euclid(1440) - DAYS_1601_TO_1970;
+        let month = match lunar {
+            Some(cal) => cal.to_lunar(start_day)?.month,
+            None => civil(start_date).map_or(1, |(_, m, ..)| m as u32),
+        };
         if !appointment {
             return Some(Recur {
                 freq,
@@ -591,6 +627,7 @@ impl Recur {
                 end_offset: 0,
                 deleted,
                 exceptions: Vec::new(),
+                lunar,
             });
         }
         // AppointmentRecurrencePattern 나머지
@@ -613,6 +650,8 @@ impl Recur {
                 original: i64::from(original),
                 reminder_set: None,
                 reminder_delta: None,
+                busy: None,
+                all_day: None,
                 subject: None,
                 location: None,
             };
@@ -636,10 +675,17 @@ impl Recur {
             if f & 0x0010 != 0 {
                 e.location = Some(text(&mut c)?);
             }
-            for bit in [0x0020u16, 0x0040, 0x0080, 0x0100] {
-                if f & bit != 0 {
-                    c.u32()?;
-                }
+            if f & 0x0020 != 0 {
+                e.busy = Some(c.u32()? != 0);
+            }
+            if f & 0x0040 != 0 {
+                c.u32()?; // 첨부 여부 (예외 회차의 첨부는 옮기지 않음)
+            }
+            if f & 0x0080 != 0 {
+                e.all_day = Some(c.u32()? != 0);
+            }
+            if f & 0x0100 != 0 {
+                c.u32()?; // 색
             }
             flags.push(f);
             exceptions.push(e);
@@ -691,6 +737,7 @@ impl Recur {
             end_offset,
             deleted,
             exceptions,
+            lunar,
         })
     }
 
@@ -790,12 +837,80 @@ impl Recur {
             }
             Freq::Yearly => format!("{} {}월 {}", every("년", "매년"), self.month, day()),
         };
+        if self.lunar.is_some() {
+            s = format!("음력 {s}");
+        }
         if let Some(n) = self.count {
             s += &format!(", {n}회");
         } else if let Some(d) = self.until.and_then(human_date) {
             s += &format!(", {d}까지");
         }
         s
+    }
+
+    /// 음력 반복의 회차 시작 (현지 분). 음력 표 범위(한국 2049년, 중국 2098년) 안에서 최대
+    /// `MAX_LUNAR` 회까지 펼친다
+    fn lunar_dates(&self) -> Vec<i64> {
+        const MAX_LUNAR: usize = 500;
+        let Some(cal) = self.lunar else {
+            return Vec::new();
+        };
+        let start_day = self.start_date.div_euclid(1440) - DAYS_1601_TO_1970;
+        let Some(first) = cal.to_lunar(start_day) else {
+            return Vec::new();
+        };
+        let limit = self
+            .count
+            .map_or(MAX_LUNAR, |n| (n as usize).min(MAX_LUNAR));
+        let mut out = Vec::new();
+        for k in 0..(MAX_LUNAR * 2) as u32 {
+            if out.len() >= limit {
+                break;
+            }
+            let step = k.saturating_mul(self.interval);
+            let month = match self.freq {
+                Freq::Yearly => {
+                    let y = first.year + i64::from(step);
+                    // 윤달이 없는 해는 같은 달(평달)로
+                    cal.month_start(y, first.month, first.leap)
+                        .or_else(|| cal.month_start(y, first.month, false))
+                }
+                _ => cal
+                    .add_months(first.year, first.month, first.leap, step)
+                    .and_then(|(y, m, l)| cal.month_start(y, m, l)),
+            };
+            let Some((at, len)) = month else {
+                break;
+            };
+            let day = if self.nth > 0 {
+                // 그 달에서 n번째(5 는 마지막) 해당 요일
+                let hits: Vec<i64> = (0..i64::from(len))
+                    .filter(|d| self.days & (1 << (at + d + 4).rem_euclid(7)) != 0)
+                    .collect();
+                let pick = if self.nth == 5 {
+                    hits.last()
+                } else {
+                    hits.get(self.nth as usize - 1)
+                };
+                match pick {
+                    Some(&d) => at + d,
+                    None => continue,
+                }
+            } else if self.month_day < 0 {
+                at + i64::from(len) - 1
+            } else {
+                at + i64::from((self.month_day as u32).min(len)) - 1
+            };
+            let local = (day + DAYS_1601_TO_1970) * 1440;
+            if local < self.start_date {
+                continue;
+            }
+            if self.until.is_some_and(|u| local > u) {
+                break;
+            }
+            out.push(local + self.start_offset);
+        }
+        out
     }
 
     /// 지운 회차(바뀐 회차 제외)
@@ -925,7 +1040,12 @@ impl Event {
 
     /// 속성 하나 (매개변수 포함)
     fn when(&self, zone: &Zone, name: &str, t: i64) -> Option<String> {
-        if self.all_day(zone) {
+        self.when_as(zone, name, t, self.all_day(zone))
+    }
+
+    /// `date` 면 날짜로, 아니면 시각 표기 방식대로
+    fn when_as(&self, zone: &Zone, name: &str, t: i64, date: bool) -> Option<String> {
+        if date {
             return Some(format!("{name};VALUE=DATE:{}", ical_date(t)?));
         }
         Some(match zone {
@@ -1063,7 +1183,25 @@ impl Event {
                     }
                 }
             });
-            fold(&format!("RRULE:{}", r.rrule(until)), &mut o);
+            if r.lunar.is_some() {
+                // 음력 반복은 RRULE 로 나타낼 수 없어(RSCALE 은 지원이 드묾) 회차를 양력으로 펼친다
+                let dates: Vec<String> = r
+                    .lunar_dates()
+                    .into_iter()
+                    .filter(|&d| d != start)
+                    .filter_map(|d| {
+                        let line = self.when(&zone, "RDATE", d)?;
+                        Some(line.rsplit(':').next()?.to_string())
+                    })
+                    .collect();
+                if !dates.is_empty() {
+                    let head = self.when(&zone, "RDATE", start)?;
+                    let head = &head[..head.rfind(':')?];
+                    fold(&format!("{head}:{}", dates.join(",")), &mut o);
+                }
+            } else {
+                fold(&format!("RRULE:{}", r.rrule(until)), &mut o);
+            }
             let ex: Vec<String> = r
                 .exdates()
                 .into_iter()
@@ -1100,9 +1238,14 @@ impl Event {
         // 바뀐 회차
         if let Some(r) = &self.recur {
             for e in &r.exceptions {
+                // 이 회차만 종일로(또는 종일에서 시각으로) 바꾼 경우 (UTC 로 쓰는 일정은 날짜를 알 수 없음)
+                let all_day = match e.all_day {
+                    Some(v) if !matches!(zone, Zone::Utc) => v,
+                    _ => self.all_day(&zone),
+                };
                 let (Some(rid), Some(s)) = (
                     self.when(&zone, "RECURRENCE-ID", e.original),
-                    self.when(&zone, "DTSTART", e.start),
+                    self.when_as(&zone, "DTSTART", e.start, all_day),
                 ) else {
                     continue;
                 };
@@ -1112,16 +1255,26 @@ impl Event {
                 fold(&rid, &mut o);
                 fold(&s, &mut o);
                 if e.end >= e.start {
-                    let end = if self.all_day(&zone)
-                        && e.end.div_euclid(1440) == e.start.div_euclid(1440)
-                    {
-                        e.start.div_euclid(1440) * 1440 + 1440
-                    } else {
-                        e.end
-                    };
-                    if let Some(l) = self.when(&zone, "DTEND", end) {
+                    let day = |t: i64| t.div_euclid(1440);
+                    let end =
+                        if all_day && !(day(e.end) > day(e.start) && e.end.rem_euclid(1440) == 0) {
+                            (day(e.end) + 1) * 1440
+                        } else {
+                            e.end
+                        };
+                    if let Some(l) = self.when_as(&zone, "DTEND", end, all_day) {
                         fold(&l, &mut o);
                     }
+                }
+                if let Some(b) = e.busy.or(self.busy) {
+                    fold(
+                        if b {
+                            "TRANSP:OPAQUE"
+                        } else {
+                            "TRANSP:TRANSPARENT"
+                        },
+                        &mut o,
+                    );
                 }
                 prop(
                     &mut o,
@@ -1192,6 +1345,25 @@ impl Item {
                 }
                 let adr: Vec<&str> = c.address.iter().flatten().map(String::as_str).collect();
                 add("주소", (!adr.is_empty()).then(|| adr.join(" ")));
+                let home: Vec<&str> = c
+                    .home_address
+                    .iter()
+                    .flatten()
+                    .map(String::as_str)
+                    .collect();
+                add("집 주소", (!home.is_empty()).then(|| home.join(" ")));
+                add("별명", c.nickname.clone());
+                add(
+                    "생일",
+                    c.birthday.and_then(nearest_date).and_then(human_date),
+                );
+                add(
+                    "기념일",
+                    c.anniversary.and_then(nearest_date).and_then(human_date),
+                );
+                for (k, v) in &c.extra {
+                    add(k, Some(v.clone()));
+                }
             }
         }
         if lines.is_empty() {
@@ -1237,7 +1409,17 @@ impl Item {
                         {
                             fold(&format!("DUE;VALUE=DATE:{d}"), &mut o);
                         }
-                        if start.is_some() {
+                        if start.is_some() && r.lunar.is_some() {
+                            let dates: Vec<String> = r
+                                .lunar_dates()
+                                .into_iter()
+                                .filter_map(ical_date)
+                                .filter(|d| Some(d) != start.as_ref())
+                                .collect();
+                            if !dates.is_empty() {
+                                fold(&format!("RDATE;VALUE=DATE:{}", dates.join(",")), &mut o);
+                            }
+                        } else if start.is_some() {
                             fold(
                                 &format!("RRULE:{}", r.rrule(r.until.and_then(ical_date))),
                                 &mut o,
@@ -1310,6 +1492,44 @@ impl Item {
                     );
                 }
                 prop(&mut o, "TITLE", c.title.as_deref());
+                prop(&mut o, "NICKNAME", c.nickname.as_deref());
+                if let Some(d) = c.birthday.and_then(nearest_date).and_then(civil) {
+                    fold(&format!("BDAY:{:04}-{:02}-{:02}", d.0, d.1, d.2), &mut o);
+                }
+                // vCard 3.0 에 없는 필드와 메모는 NOTE 로
+                let mut note: Vec<String> = Vec::new();
+                if let Some(d) = c.anniversary.and_then(nearest_date).and_then(human_date) {
+                    note.push(format!("기념일: {d}"));
+                }
+                for (k, v) in &c.extra {
+                    note.push(format!("{k}: {v}"));
+                }
+                if let Some(n) = clean(&description(&c.note)) {
+                    note.push(n);
+                }
+                if !note.is_empty() {
+                    prop(&mut o, "NOTE", Some(&note.join("\n")));
+                }
+                if c.home_address.iter().any(Option::is_some) {
+                    let f = |i: usize| {
+                        esc(c.home_address[i]
+                            .as_deref()
+                            .and_then(clean)
+                            .as_deref()
+                            .unwrap_or(""))
+                    };
+                    fold(
+                        &format!(
+                            "ADR;TYPE=HOME:;;{};{};{};{};{}",
+                            f(0),
+                            f(1),
+                            f(2),
+                            f(3),
+                            f(4)
+                        ),
+                        &mut o,
+                    );
+                }
                 if let Some((img, t)) = &c.photo {
                     use base64::Engine as _;
                     let b64 = base64::engine::general_purpose::STANDARD.encode(img);
@@ -1321,7 +1541,12 @@ impl Item {
                 for (k, v) in &c.phones {
                     let t = match *k {
                         "휴대" => "CELL",
-                        "집" => "HOME",
+                        "집" | "집2" => "HOME",
+                        "팩스" => "WORK,FAX",
+                        "집 팩스" => "HOME,FAX",
+                        "호출기" => "PAGER",
+                        "자동차" => "CAR",
+                        "기타" => "VOICE",
                         _ => "WORK",
                     };
                     prop(&mut o, &format!("TEL;TYPE={t}"), Some(v));

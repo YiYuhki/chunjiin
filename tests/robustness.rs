@@ -169,7 +169,9 @@ fn mutate_recurrence(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     let targets: Vec<usize> = streams
         .iter()
         .enumerate()
-        .filter(|(_, (n, _))| n.ends_with("80030102") || n.ends_with("80040102"))
+        .filter(|(_, (n, _))| {
+            n.ends_with("80030102") || n.ends_with("80040102") || n.ends_with("80020102")
+        })
         .map(|(i, _)| i)
         .collect();
     let i = targets[rng.below(targets.len())];
@@ -274,6 +276,12 @@ fn fuzz_legacy() {
         "f.msg",
         35,
         common::msg::recurring_meeting_msg(),
+        mutate_recurrence,
+    );
+    run(
+        "h.msg",
+        40,
+        common::msg::lunar_event_msg(true, 222_850_080, 15, 5),
         mutate_recurrence,
     );
     run("b.msg", 29, common::msg::rtf_html_msg(), mutate_cfb);

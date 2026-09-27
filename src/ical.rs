@@ -28,7 +28,7 @@ fn allowed(component: &str, name: &str) -> Option<Kind> {
             "UID" => Text,
             "CATEGORIES" => List,
             "DTSTAMP" | "DTSTART" | "DTEND" | "DUE" | "COMPLETED" | "CREATED" | "LAST-MODIFIED"
-            | "RECURRENCE-ID" | "EXDATE" => Date,
+            | "RECURRENCE-ID" | "EXDATE" | "RDATE" => Date,
             "DURATION" | "RRULE" | "PRIORITY" | "SEQUENCE" | "PERCENT-COMPLETE" => Token,
             "ORGANIZER" | "ATTENDEE" => Mailto,
             _ => return None,

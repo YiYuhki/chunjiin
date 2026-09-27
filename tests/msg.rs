@@ -2,8 +2,8 @@ mod common;
 
 use cdr::{Engine, Status};
 use common::msg::{
-    appointment_msg, contact_msg, malicious_msg, recurring_meeting_msg, recurring_task_msg,
-    rtf_bomb_msg, rtf_html_msg,
+    appointment_msg, contact_msg, lunar_event_msg, malicious_msg, recurring_meeting_msg,
+    recurring_task_msg, rtf_bomb_msg, rtf_html_msg,
 };
 use mail_parser::MimeHeaders;
 
@@ -252,7 +252,8 @@ fn recurring_meeting_keeps_timezone_recurrence_and_attendees() {
         "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6;WKST=SU".into(),
         // 지운 회차만 제외하고, 옮긴 회차는 따로 쓴다
         format!("EXDATE;{tz}:20240306T100000\r\n"),
-        format!("RECURRENCE-ID;{tz}:20240311T100000\r\nDTSTART;{tz}:20240311T140000\r\nDTEND;{tz}:20240311T150000\r\nSUMMARY:주간 회의(변경)"),
+        // 이 회차만 종일·한가함으로 바꿈
+        format!("RECURRENCE-ID;{tz}:20240311T100000\r\nDTSTART;VALUE=DATE:20240311\r\nDTEND;VALUE=DATE:20240312\r\nTRANSP:TRANSPARENT\r\nSUMMARY:주간 회의(변경)"),
         // 바뀐 회차는 알림을 30분 전으로
         "TRIGGER:-PT30M\r\nDESCRIPTION:주간 회의(변경)\r\nEND:VALARM".into(),
         "ORGANIZER;CN=\"김철수\":mailto:kim@example.com".into(),
@@ -305,6 +306,15 @@ fn contact_photo_is_reencoded_into_vcard() {
     assert!(!png.windows(5).any(|w| w == b"<?php"));
     image::load_from_memory(&png).expect("재인코딩된 사진");
     assert!(vcf.contains("ORG:예시\\, 주식회사;"));
+    for want in [
+        "NICKNAME:철수",
+        "BDAY:1990-05-01",
+        "TEL;TYPE=WORK,FAX:02-000-0000",
+        "ADR;TYPE=HOME:;;한강대로 1;서울;;;",
+        "NOTE:사용자 1: 사번 1234\\n주간 회의 담당",
+    ] {
+        assert!(vcf.contains(want), "{want}\n{vcf}");
+    }
     let again = Engine::default().process(&out, "김철수.eml");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
@@ -333,4 +343,39 @@ fn recurring_task_keeps_rrule() {
     }
     let again = Engine::default().process(ics.as_bytes(), "task.ics");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
+
+#[test]
+fn lunar_recurrence_is_expanded() {
+    // 매년 음력 8월 15일, 2024-09-17 부터 5회
+    let r = Engine::default().process(&lunar_event_msg(true, 222_850_080, 15, 5), "생신.msg");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let m = parse(r.output.as_ref().unwrap());
+    let body = m.body_text(0).unwrap();
+    assert!(body.contains("반복: 음력 매년 8월 15일, 5회"), "{body}");
+    let ics = attachment_text(&m, "event.ics");
+    assert!(ics.contains("DTSTART:20240917T090000"), "{ics}");
+    assert!(
+        ics.contains("RDATE:20251006T090000,20260925T090000,20270915T090000,20281003T090000"),
+        "{ics}"
+    );
+    assert!(!ics.contains("RRULE"));
+    let again = Engine::default().process(ics.as_bytes(), "event.ics");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+
+    // 매월 음력 1일: 윤달도 한 달로 센다 (2023 음 2.1 → 윤2.1 → 3.1)
+    let r = Engine::default().process(&lunar_event_msg(false, 222_022_080, 1, 3), "초하루.msg");
+    let m = parse(r.output.as_ref().unwrap());
+    let ics = attachment_text(&m, "event.ics");
+    assert!(ics.contains("DTSTART:20230220T090000"), "{ics}");
+    assert!(
+        ics.contains("RDATE:20230322T090000,20230420T090000"),
+        "{ics}"
+    );
 }

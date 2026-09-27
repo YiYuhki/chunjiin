@@ -736,9 +736,59 @@ fn item(
             department: s(0x3A18),
             title: s(0x3A17),
             address: [s(0x3A29), s(0x3A27), s(0x3A28), s(0x3A2A), s(0x3A26)],
+            home_address: [s(0x3A5D), s(0x3A59), s(0x3A5C), s(0x3A5B), s(0x3A5A)],
+            nickname: s(0x3A4F),
+            note: description.clone(),
             ..Default::default()
         };
-        for (kind, id) in [("회사", 0x3A08), ("휴대", 0x3A1C), ("집", 0x3A09)] {
+        // 생일·기념일 (PidLidBirthdayLocal·PidLidWeddingAnniversaryLocal 이 있으면 그것을)
+        c.birthday = r
+            .named_u64(p, PSETID_ADDRESS, 0x80DE)
+            .or_else(|| p.u64(0x3A42).filter(|&t| t > 0));
+        c.anniversary = r
+            .named_u64(p, PSETID_ADDRESS, 0x80DF)
+            .or_else(|| p.u64(0x3A41).filter(|&t| t > 0));
+        let mut extra = Vec::new();
+        for (label, id) in [
+            ("배우자", 0x3A48u16),
+            ("관리자", 0x3A4E),
+            ("비서", 0x3A30),
+            ("자녀", 0x3A58),
+            ("직장 위치", 0x3A19),
+            ("직업", 0x3A46),
+        ] {
+            if let Some(v) = r.string(p, id).filter(|v| !v.trim().is_empty()) {
+                extra.push((label.to_string(), v));
+            }
+        }
+        // 메신저 주소, 사용자 정의 필드 1~4
+        for (label, lid) in [
+            ("메신저", 0x8062u32),
+            ("사용자 1", 0x804F),
+            ("사용자 2", 0x8050),
+            ("사용자 3", 0x8051),
+            ("사용자 4", 0x8052),
+        ] {
+            if let Some(v) = r
+                .named_string(p, PSETID_ADDRESS, lid)
+                .filter(|v| !v.trim().is_empty())
+            {
+                extra.push((label.to_string(), v));
+            }
+        }
+        c.extra = extra;
+        for (kind, id) in [
+            ("회사", 0x3A08),
+            ("회사2", 0x3A1B),
+            ("휴대", 0x3A1C),
+            ("집", 0x3A09),
+            ("집2", 0x3A2F),
+            ("팩스", 0x3A24),
+            ("집 팩스", 0x3A25),
+            ("호출기", 0x3A21),
+            ("자동차", 0x3A1E),
+            ("기타", 0x3A1F),
+        ] {
             if let Some(v) = r.string(p, id).filter(|v| !v.trim().is_empty()) {
                 c.phones.push((kind, v));
             }

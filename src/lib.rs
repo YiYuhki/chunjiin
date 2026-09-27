@@ -15,6 +15,7 @@ pub mod hwpx;
 pub mod ical;
 pub mod imaging;
 pub mod legacy;
+pub mod lunar;
 pub mod mail;
 pub mod metafile;
 pub mod msg;
