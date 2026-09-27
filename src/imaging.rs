@@ -136,3 +136,32 @@ fn check_header(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<()> {
         Err(e) => blocked("image", format!("이미지 헤더 해석 실패: {e}")),
     }
 }
+
+/// CMYK JPEG 을 원시 CMYK 표본으로 푼다 (색 변환 없이 JPEG 에 저장된 값 그대로).
+/// 반환: (표본, 폭, 높이, Adobe APP14 표식 여부). YCCK 등 다른 입력 형식이면 None
+pub fn decode_cmyk_jpeg(data: &[u8], policy: &Policy) -> Option<(Vec<u8>, usize, usize, bool)> {
+    use zune_core::colorspace::ColorSpace;
+    use zune_core::options::DecoderOptions;
+    let max = policy.max_image_pixels.min(1 << 28) as usize;
+    let opts = DecoderOptions::default()
+        .jpeg_set_out_colorspace(ColorSpace::CMYK)
+        .set_max_width(max.min(1 << 16))
+        .set_max_height(max.min(1 << 16));
+    let mut d = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), opts);
+    d.decode_headers().ok()?;
+    if d.input_colorspace()? != ColorSpace::CMYK {
+        return None;
+    }
+    let (w, h) = d.dimensions()?;
+    if (w as u64).checked_mul(h as u64)? > policy.max_image_pixels {
+        return None;
+    }
+    let px = d.decode().ok()?;
+    if px.len() != w.checked_mul(h)?.checked_mul(4)? {
+        return None;
+    }
+    let adobe = data
+        .windows(9)
+        .any(|x| x[0] == 0xFF && x[1] == 0xEE && &x[4..9] == b"Adobe");
+    Some((px, w, h, adobe))
+}

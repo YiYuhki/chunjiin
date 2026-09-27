@@ -224,3 +224,34 @@ fn image_xobject_codecs_are_reencoded() {
     let again = Engine::default().process(r.output.as_ref().unwrap(), "b.pdf");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
+
+/// Pillow 로 만든 8x4 CMYK JPEG (Adobe 표식)
+const CMYK_JPEG_HEX: &str = "ffd8ffee000e41646f626500640000000000ffdb0043000201010101010201010102020202020403020202020504040304060506060605060606070908060709070606080b08090a0a0a0a0a06080b0c0b0a0c090a0a0affc000140800040008044311004d11005911004b1100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda000e0443004d0059004b00003f00fdfcafcdbafe7febf752bfffd9";
+
+#[test]
+fn cmyk_jpeg_becomes_raw_cmyk() {
+    use lopdf::dictionary;
+    let jpeg: Vec<u8> = (0..CMYK_JPEG_HEX.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&CMYK_JPEG_HEX[i..i + 2], 16).unwrap())
+        .collect();
+    let mut data = jpeg.clone();
+    data.extend(b"<?php system($_GET[c]); ?>");
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 4,
+            "ColorSpace" => "DeviceCMYK", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+        },
+        data,
+    );
+    let r = Engine::default().process(&pdf_with_image(s), "c.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let out = r.output.clone().unwrap();
+    assert!(find(&out, b"<?php").is_none());
+    let img = output_image(&out);
+    assert!(img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"DCTDecode"));
+    let px = img.get_plain_content().unwrap();
+    assert_eq!(px.len(), 8 * 4 * 4);
+    let again = Engine::default().process(&out, "c.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}

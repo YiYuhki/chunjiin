@@ -331,6 +331,8 @@ dependencies = [
  "ttf-parser",
  "uuid",
  "zip",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]

@@ -719,9 +719,18 @@ impl<'a> Copier<'a> {
                 );
                 return Ok(None);
             };
-            // CMYK(Adobe) JPEG 은 뷰어마다 반전 규칙을 따로 적용해 RGB 로 바꾸면 색이 달라진다.
-            // 끝까지 디코딩해 형식을 검증한 뒤 원본을 옮긴다
+            // CMYK JPEG 은 RGB 로 바꾸면 색이 달라지므로 CMYK 표본으로 옮긴다. YCCK 등 풀 수 없는
+            // 형식은 끝까지 디코딩해 검증한 뒤 원본을 옮긴다
             if jpeg_components(raw) == Some(4) {
+                // CMYK(Adobe) JPEG 은 저장된 값 그대로가 DCTDecode 의 출력이다 (뷰어가 따로
+                // 반전하지 않음을 MuPDF 로 확인). 원시 CMYK 표본으로 옮긴다
+                if let Some((px, w, h, _)) = imaging::decode_cmyk_jpeg(raw, self.policy) {
+                    dict.set("Width", Object::Integer(w as i64));
+                    dict.set("Height", Object::Integer(h as i64));
+                    dict.set("BitsPerComponent", Object::Integer(8));
+                    *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
+                    return Ok(Some(Stream::new(dict, px)));
+                }
                 dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
                 *self
                     .font_stats
