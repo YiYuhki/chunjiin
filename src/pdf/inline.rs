@@ -7,8 +7,9 @@
 //! 해석 후 [`restore`] 가 자리표시를 `BI` 연산으로 되돌린다.
 //! - 풀 수 있는 필터: ASCIIHex, ASCII85, LZW, Flate, RunLength, DCT(JPEG 는 화소로 디코딩),
 //!   CCITT 팩스(G4·G3, 1비트 표본으로 디코딩)
-//! - JBIG2·JPX·Crypt 와 변환할 수 없는 색 공간(Separation·DeviceN·Lab·Pattern)은 뺀다
-//! - Indexed 색 공간은 기준 색 공간의 8비트 표본으로 펼친다
+//! - JBIG2·JPX·Crypt 와 패턴 색 공간은 뺀다
+//! - 리소스 이름의 색 공간(ICC·별색·Lab·Indexed)은 이름을 유지하고, 인라인 Indexed 는 기준 색 공간의
+//!   8비트 표본으로 펼친다
 
 use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Object, Stream};
@@ -40,6 +41,8 @@ pub enum Cs {
         hival: usize,
         lookup: Vec<u8>,
     },
+    /// 리소스 이름으로 가리키는 색 공간 (ICC·별색·Lab·리소스 Indexed): 이름을 그대로 둔다
+    Named { name: Vec<u8>, n: u8 },
 }
 
 #[derive(Default)]
@@ -370,7 +373,7 @@ fn image(
     };
     let ncomp = match &cs {
         None | Some(Cs::Indexed { .. }) => 1,
-        Some(Cs::Device(n)) => usize::from(*n),
+        Some(Cs::Device(n)) | Some(Cs::Named { n, .. }) => usize::from(*n),
     };
     if matches!(cs, Some(Cs::Indexed { .. })) && bpc > 8 {
         return (Err("비트 수 오류"), None);
@@ -581,6 +584,18 @@ fn image(
             dict.set("CS", device_name(base as u8));
             dict.set("BPC", Object::Integer(8));
             out
+        }
+        (Some(Cs::Named { name, n }), _) => {
+            // JPEG 은 디코딩 결과의 성분 수가 같아야 한다
+            if out_ncomp != usize::from(*n) {
+                return (Err("지원하지 않는 색 공간"), end);
+            }
+            dict.set("CS", Object::Name(name.clone()));
+            dict.set("BPC", Object::Integer(out_bpc as i64));
+            if let Some(a) = decode.filter(|a| a.len() == 2 * out_ncomp && !dct) {
+                dict.set("D", Object::Array(a));
+            }
+            samples
         }
         (Some(Cs::Device(_)), _) => {
             dict.set("CS", device_name(out_ncomp as u8));

@@ -36,6 +36,18 @@ pub fn pdf_with_content(content: &[u8]) -> Vec<u8> {
         "Resources" => dictionary! {
             "ColorSpace" => dictionary! {
                 "CS0" => vec!["Indexed".into(), "DeviceRGB".into(), 1.into(), lookup],
+                "Sep0" => vec![
+                    "Separation".into(),
+                    "PANTONE185".into(),
+                    "DeviceCMYK".into(),
+                    Object::Dictionary(dictionary! {
+                        "FunctionType" => 2,
+                        "Domain" => vec![0.into(), 1.into()],
+                        "C0" => vec![0.into(), 0.into(), 0.into(), 0.into()],
+                        "C1" => vec![0.into(), 1.into(), 1.into(), 0.into()],
+                        "N" => 1,
+                    }),
+                ],
             },
         },
     });
@@ -91,8 +103,8 @@ pub fn inline_image_content() -> Vec<u8> {
     c.extend(b"q BI /W 16 /H 4 /IM true /F /CCF /DP << /K -1 /Columns 16 >> ID ");
     c.extend(g4);
     c.extend(b"\nEI Q\n");
-    // 4) 리소스 이름의 Indexed 색 공간 (1비트 → RGB 로 펼침), 표본 앞의 공백 값
-    c.extend(b"q BI /W 8 /H 1 /BPC 1 /CS /CS0 ID ");
+    // 4) 인라인 Indexed 색 공간 (1비트 → RGB 로 펼침), 표본 앞의 공백 값
+    c.extend(b"q BI /W 8 /H 1 /BPC 1 /CS [/I /RGB 1 <FF0000 0000FF>] ID ");
     c.extend([0b1010_1010]);
     c.extend(b" EI\x00Q\x00");
     // 5) 공백 값으로 시작하는 필터 없는 표본
@@ -100,6 +112,9 @@ pub fn inline_image_content() -> Vec<u8> {
     // 6) JBIG2 는 빼고, 뒤의 그리기는 남는다
     c.extend(b"BI /W 8 /H 8 /IM true /F /JBIG2Decode ID \x97JB2\x00junk\nEI\n");
     c.extend(b"0 0 m 99 99 l S\n");
+    // 7) 리소스 이름의 Indexed·별색(Separation): 이름을 그대로 둔다
+    c.extend(b"q BI /W 8 /H 1 /BPC 1 /CS /CS0 ID \xA5\nEI Q\n");
+    c.extend(b"q BI /W 2 /H 1 /BPC 8 /CS /Sep0 /F /AHx ID 40C0>\nEI Q\n");
 
     c
 }

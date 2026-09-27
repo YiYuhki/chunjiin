@@ -418,7 +418,15 @@ impl<'a> Copier<'a> {
                 b"CMYK" | b"DeviceCMYK" => Some(Cs::Device(4)),
                 name => {
                     let v = res?.get(name).ok()?;
-                    self.resolve_cs(v, res, depth + 1)
+                    match self.deref(v)? {
+                        // 리소스 이름이 장치 색 공간을 가리키는 경우
+                        Object::Name(_) => self.resolve_cs(v, res, depth + 1),
+                        // 그 밖의 색 공간은 리소스 이름을 그대로 쓴다 (ICC 프로필·별색 유지)
+                        a => self.cs_components(a).map(|n| Cs::Named {
+                            name: name.to_vec(),
+                            n,
+                        }),
+                    }
                 }
             },
             Object::Array(a) => {
@@ -454,6 +462,34 @@ impl<'a> Copier<'a> {
                     }
                     _ => None,
                 }
+            }
+            _ => None,
+        }
+    }
+
+    /// 색 공간 배열의 성분 수 (패턴은 인라인 이미지에 쓸 수 없음)
+    fn cs_components(&self, o: &Object) -> Option<u8> {
+        let a = o.as_array().ok()?;
+        let family = self.deref(a.first()?)?.as_name().ok()?;
+        match family {
+            b"CalGray" | b"Separation" => Some(1),
+            b"CalRGB" | b"Lab" => Some(3),
+            b"ICCBased" => {
+                let s = self.deref(a.get(1)?)?.as_stream().ok()?;
+                match self.deref(s.dict.get(b"N").ok()?)?.as_i64().ok()? {
+                    n @ 1..=4 => Some(n as u8),
+                    _ => None,
+                }
+            }
+            b"DeviceN" => {
+                let names = self.deref(a.get(1)?)?.as_array().ok()?;
+                u8::try_from(names.len())
+                    .ok()
+                    .filter(|n| (1..=32).contains(n))
+            }
+            b"I" | b"Indexed" => {
+                let hival = self.deref(a.get(2)?)?.as_i64().ok()?;
+                (0..=255).contains(&hival).then_some(1)
             }
             _ => None,
         }

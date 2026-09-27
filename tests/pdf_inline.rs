@@ -26,7 +26,11 @@ fn inline_images(pdf: &[u8]) -> (Vec<(String, Vec<u8>)>, Vec<u8>) {
                 .parse()
                 .unwrap()
         };
-        let comps = if head.contains("/IM true") || head.contains("/DeviceGray") {
+        let comps = if head.contains("/IM true")
+            || head.contains("/DeviceGray")
+            || head.contains("/CS0")
+            || head.contains("/Sep0")
+        {
             1
         } else if head.contains("/DeviceCMYK") {
             4
@@ -62,10 +66,10 @@ fn filtered_inline_images_are_decoded() {
         r.reason,
         r.findings
     );
-    assert_eq!(r.stats.get("pdf_inline_images"), Some(&5), "{:?}", r.stats);
+    assert_eq!(r.stats.get("pdf_inline_images"), Some(&7), "{:?}", r.stats);
     let out = r.output.clone().unwrap();
     let (images, content) = inline_images(&out);
-    assert_eq!(images.len(), 5);
+    assert_eq!(images.len(), 7);
     assert!(images.iter().all(|(h, _)| !h.contains("/F")), "필터가 남음");
     // 1) 예측자까지 풀린 RGB
     assert!(images[0].0.contains("/DeviceRGB"));
@@ -87,6 +91,11 @@ fn filtered_inline_images_are_decoded() {
     assert_eq!(images[4].1, b" \n\r\x00");
     // 6) JBIG2 는 빠지고 뒤의 선은 남는다
     assert!(find(&content, b"99 99 l").is_some());
+    // 7) 리소스 색 공간은 이름을 유지하고 표본을 그대로
+    assert!(images[5].0.contains("/CS /CS0") && images[5].0.contains("/BPC 1"));
+    assert_eq!(images[5].1, [0xA5]);
+    assert!(images[6].0.contains("/CS /Sep0"));
+    assert_eq!(images[6].1, [0x40, 0xC0]);
     assert!(r
         .findings
         .iter()
@@ -94,7 +103,7 @@ fn filtered_inline_images_are_decoded() {
 
     let again = Engine::default().process(&out, "a.pdf");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
-    assert_eq!(again.stats.get("pdf_inline_images"), Some(&5));
+    assert_eq!(again.stats.get("pdf_inline_images"), Some(&7));
 }
 
 #[test]
