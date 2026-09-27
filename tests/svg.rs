@@ -179,3 +179,63 @@ fn docx_svg_blip_is_rebuilt() {
     let again = Engine::default().process(r.output.as_ref().unwrap(), "a.docx");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
+
+#[test]
+fn svg_reference_bombs_are_blocked() {
+    let blocked = |svg: &str| {
+        let r = Engine::default().process(svg.as_bytes(), "a.svg");
+        assert_eq!(r.status, Status::Blocked, "{:#?}", r.findings);
+        assert!(
+            r.findings.iter().any(|f| f.category == "resource"),
+            "{:#?}",
+            r.findings
+        );
+    };
+    // use 폭탄: 10단계 × 10배 = 100억 개 요소
+    let mut s = String::from(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><defs><rect id="a0" width="1" height="1"/>"#,
+    );
+    for i in 1..=10 {
+        s += &format!(r#"<g id="a{i}">"#);
+        for _ in 0..10 {
+            s += &format!(r##"<use href="#a{}"/>"##, i - 1);
+        }
+        s += "</g>";
+    }
+    s += r##"</defs><use href="#a10"/></svg>"##;
+    blocked(&s);
+    // 무늬 폭탄: <style> 규칙과 fill=url(#p) 로 무늬 안에 무늬를 겹침
+    let mut s = String::from(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><style>.k{fill:url(#p0)}</style><defs><pattern id="p10"><rect width="1" height="1"/></pattern>"#,
+    );
+    for i in (0..10).rev() {
+        s += &format!(r#"<pattern id="p{i}">"#);
+        for _ in 0..10 {
+            s += &format!(r##"<rect width="1" height="1" fill="url(#p{})"/>"##, i + 1);
+        }
+        s += "</pattern>";
+    }
+    s += r#"</defs><rect class="k" width="9" height="9"/></svg>"#;
+    blocked(&s);
+    // 너무 깊은 참조 사슬 (앞쪽 요소가 뒤쪽을 가리켜 재귀가 깊어짐)
+    let mut s = String::from(r#"<svg xmlns="http://www.w3.org/2000/svg"><defs>"#);
+    for i in 0..40 {
+        s += &format!(r##"<use id="c{i}" href="#c{}"/>"##, i + 1);
+    }
+    s += r##"<rect id="c40" width="1" height="1"/></defs><use href="#c0"/></svg>"##;
+    blocked(&s);
+    // 뒤쪽이 앞쪽을 가리키는 긴 사슬은 펼쳐도 선형이라 통과
+    let mut s = String::from(
+        r#"<svg xmlns="http://www.w3.org/2000/svg"><defs><rect id="d0" width="1" height="1"/>"#,
+    );
+    for i in 1..=40 {
+        s += &format!(r##"<use id="d{i}" href="#d{}"/>"##, i - 1);
+    }
+    s += r##"</defs><use href="#d40"/></svg>"##;
+    let r = Engine::default().process(s.as_bytes(), "a.svg");
+    assert_ne!(r.status, Status::Blocked, "{:#?}", r.findings);
+    // 순환 참조와 평범한 재사용은 그대로 통과
+    let ok = r##"<svg xmlns="http://www.w3.org/2000/svg"><defs><g id="x"><use href="#y"/></g><g id="y"><use href="#x"/><rect width="1" height="1"/></g></defs><use href="#y"/><use href="#y"/></svg>"##;
+    let r = Engine::default().process(ok.as_bytes(), "a.svg");
+    assert_ne!(r.status, Status::Blocked, "{:#?}", r.findings);
+}

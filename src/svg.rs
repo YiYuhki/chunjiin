@@ -11,6 +11,8 @@
 //! - 알 수 없는 네임스페이스(편집기 정보 등)의 요소·속성, 주석·처리 명령은 옮기지 않는다
 //! - DOCTYPE 은 내부 부분 집합(엔터티 선언)이 없을 때만 무시하고, 있으면 차단한다
 
+use std::collections::{HashMap, HashSet};
+
 use base64::Engine as _;
 
 use crate::error::{blocked, Result};
@@ -290,6 +292,7 @@ pub fn rebuild(
     if let Some(e) = ctx.error.take() {
         return Err(e);
     }
+    check_expansion(&out, policy)?;
     // 네임스페이스 선언은 새로 붙인다
     out.attrs.retain(|a| !a.is_xmlns());
     out.attrs.insert(0, attr_xmlns("xmlns", SVG_NS));
@@ -488,6 +491,144 @@ fn attribute(el: &Element, a: &Attr, ctx: &mut Ctx) -> Option<Attr> {
         return None;
     }
     Some(plain(a.value.clone()))
+}
+
+/// 참조 사슬(use → use → …)을 따라가는 최대 깊이
+const MAX_REF_DEPTH: usize = 16;
+
+/// 값 안의 문서 안 참조 `url(#id)` 들
+fn url_refs(v: &str, out: &mut Vec<String>) {
+    let lower = v.to_ascii_lowercase();
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("url(") {
+        let start = at + i + 4;
+        let arg = v[start..].trim_start().trim_start_matches(['"', '\'']);
+        if let Some(id) = arg.strip_prefix('#') {
+            let end = id.find(['"', '\'', ')', ' ']).unwrap_or(id.len());
+            out.push(id[..end].to_string());
+        }
+        at = start;
+    }
+}
+
+/// 요소 자신이 가리키는 id 들 (`href="#id"`, 속성·style 의 `url(#id)`)
+fn element_refs(el: &Element, out: &mut Vec<String>) {
+    for a in &el.attrs {
+        if a.local == "href" {
+            if let Some(id) = a.value.strip_prefix('#') {
+                out.push(id.to_string());
+            }
+        } else {
+            url_refs(&a.value, out);
+        }
+    }
+}
+
+struct Expansion<'a> {
+    ids: HashMap<&'a str, &'a Element>,
+    /// `<style>` 규칙이 가리키는 id: class 가 있는 요소마다 적용된다고 보고 넉넉히 센다
+    style_refs: Vec<String>,
+    memo: HashMap<&'a str, u64>,
+    active: HashSet<&'a str>,
+    depth: usize,
+    too_deep: bool,
+}
+
+impl<'a> Expansion<'a> {
+    fn collect(&mut self, el: &'a Element) {
+        if let Some(id) = el.attr("id") {
+            self.ids.entry(id).or_insert(el);
+        }
+        if el.local == "style" {
+            url_refs(&el.text(), &mut self.style_refs);
+        }
+        for c in el.child_elements() {
+            self.collect(c);
+        }
+    }
+
+    /// 렌더러가 펼쳐 그리는 요소 수 (참조한 대상은 가리킬 때마다 다시 센다)
+    fn weight(&mut self, el: &'a Element) -> u64 {
+        // id 가 붙은 요소는 한 번만 센다 (중첩된 id 를 여러 번 다시 걷지 않도록)
+        let key = el
+            .attr("id")
+            .and_then(|id| self.ids.get_key_value(id))
+            .filter(|(_, &t)| std::ptr::eq(t, el))
+            .map(|(&k, _)| k);
+        if let Some(w) = key.and_then(|k| self.memo.get(k)) {
+            return *w;
+        }
+        let mut total: u64 = 1;
+        let mut refs = Vec::new();
+        element_refs(el, &mut refs);
+        if el.attr("class").is_some() {
+            refs.extend(self.style_refs.iter().cloned());
+        }
+        for r in refs {
+            total = total.saturating_add(self.target(&r));
+        }
+        for c in el.child_elements() {
+            total = total.saturating_add(self.weight(c));
+        }
+        if let Some(k) = key {
+            self.memo.insert(k, total);
+        }
+        total
+    }
+
+    fn target(&mut self, id: &str) -> u64 {
+        let Some((&key, &el)) = self.ids.get_key_value(id) else {
+            return 0;
+        };
+        if let Some(&w) = self.memo.get(key) {
+            return w;
+        }
+        // 순환 참조는 렌더러가 그리지 않으므로 세지 않는다
+        if !self.active.insert(key) {
+            return 0;
+        }
+        if self.depth >= MAX_REF_DEPTH {
+            self.too_deep = true;
+            self.active.remove(key);
+            return 0;
+        }
+        self.depth += 1;
+        let w = self.weight(el);
+        self.depth -= 1;
+        self.active.remove(key);
+        w
+    }
+}
+
+/// `<use>`·무늬·마커 등 참조를 겹겹이 펼치면 요소 수가 기하급수로 늘어나는 구조를 막는다
+/// (XML 의 billion laughs 와 같은 원리로 작은 파일이 렌더러를 멈추게 함)
+fn check_expansion(root: &Element, policy: &Policy) -> Result<()> {
+    let mut x = Expansion {
+        ids: HashMap::new(),
+        style_refs: Vec::new(),
+        memo: HashMap::new(),
+        active: HashSet::new(),
+        depth: 0,
+        too_deep: false,
+    };
+    x.collect(root);
+    x.style_refs.sort();
+    x.style_refs.dedup();
+    let total = x.weight(root);
+    if x.too_deep {
+        return blocked(
+            "resource",
+            format!("SVG 참조 사슬이 너무 깊음(최대 {MAX_REF_DEPTH}단계)"),
+        );
+    }
+    let limit = policy.max_xml_nodes as u64;
+    if total > limit {
+        return blocked(
+            "resource",
+            format!("SVG 참조를 펼친 요소 수가 한도({limit})를 넘음 (use 폭탄 의심)"),
+        );
+    }
+    Ok(())
 }
 
 /// `url(...)` 참조가 모두 문서 안(`#id`)을 가리키는지
