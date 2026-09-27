@@ -142,11 +142,12 @@ fn pdf_jpx_image_is_excluded_even_with_indirect_keys() {
             b"/JPXDecode".to_vec(),
         ],
     );
+    // JPX 코덱 데이터는 옮기지 않는다: 화소로 풀지 못하면 이미지를 뺀다 (간접 참조로 쓴 키도 같음)
     let r = Engine::default().process(&pdf, "a.pdf");
     assert_eq!(
         r.findings
             .iter()
-            .filter(|f| f.category == "risky-codec")
+            .filter(|f| f.description.contains("JPX 이미지 제외"))
             .count(),
         2,
         "{:#?}",
@@ -154,6 +155,7 @@ fn pdf_jpx_image_is_excluded_even_with_indirect_keys() {
     );
     let out = r.output.as_ref().unwrap();
     assert!(!contains(out, b"JPXPAYLOAD") && !contains(&all_streams(out), b"JPXPAYLOAD"));
+    assert!(!contains(&all_streams(out), b"JPXDecode"));
 }
 
 #[test]

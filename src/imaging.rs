@@ -149,8 +149,37 @@ pub fn decode_cmyk_jpeg(data: &[u8], policy: &Policy) -> Option<(Vec<u8>, usize,
         .set_max_height(max.min(1 << 16));
     let mut d = zune_jpeg::JpegDecoder::new_with_options(Cursor::new(data), opts);
     d.decode_headers().ok()?;
-    if d.input_colorspace()? != ColorSpace::CMYK {
-        return None;
+    match d.input_colorspace()? {
+        ColorSpace::CMYK => {}
+        // YCCK(Adobe 변환 2): 성분을 그대로 받아 libjpeg 와 같이 CMYK 로 바꾼다
+        ColorSpace::YCCK => {
+            let mut d = zune_jpeg::JpegDecoder::new_with_options(
+                Cursor::new(data),
+                opts.jpeg_set_out_colorspace(ColorSpace::YCCK),
+            );
+            d.decode_headers().ok()?;
+            let (w, h) = d.dimensions()?;
+            if (w as u64).checked_mul(h as u64)? > policy.max_image_pixels {
+                return None;
+            }
+            let mut px = d.decode().ok()?;
+            if px.len() != w.checked_mul(h)?.checked_mul(4)? {
+                return None;
+            }
+            for p in px.as_chunks_mut::<4>().0 {
+                let (y, cb, cr) = (
+                    f32::from(p[0]),
+                    f32::from(p[1]) - 128.0,
+                    f32::from(p[2]) - 128.0,
+                );
+                let c = |v: f32| 255 - v.round().clamp(0.0, 255.0) as u8;
+                p[0] = c(y + 1.402 * cr);
+                p[1] = c(y - 0.344_136 * cb - 0.714_136 * cr);
+                p[2] = c(y + 1.772 * cb);
+            }
+            return Some((px, w, h, true));
+        }
+        _ => return None,
     }
     let (w, h) = d.dimensions()?;
     if (w as u64).checked_mul(h as u64)? > policy.max_image_pixels {

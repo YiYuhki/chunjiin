@@ -157,6 +157,12 @@ fn mutate_cfb(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     legacy::cfb(&refs)
 }
 
+/// JBIG2·JPX 인라인 이미지 콘텐츠를 변조해 PDF 로 감싼다
+fn mutate_codec_content(rng: &mut Rng, _: &[u8]) -> Vec<u8> {
+    let c = mutate_bytes(rng, &common::pdf_inline::codec_inline_content());
+    common::pdf_inline::pdf_with_content(&c)
+}
+
 /// 일정의 반복 패턴·시간대 스트림만 변조한다
 fn mutate_recurrence(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     let mut streams = legacy::read_cfb(data);
@@ -236,6 +242,8 @@ fn fuzz_pdf() {
     let inline = common::pdf_inline::pdf_with_content(&common::pdf_inline::inline_image_content());
     run("i.pdf", 30, inline.clone(), mutate_bytes);
     run("j.pdf", 31, inline, mutate_inline_content);
+    let codecs = common::pdf_inline::pdf_with_content(&common::pdf_inline::codec_inline_content());
+    run("k.pdf", 38, codecs, mutate_codec_content);
 }
 
 /// 인라인 이미지 콘텐츠를 변조해 PDF 로 감싼다 (xref 가 맞는 채로 해석기까지 도달하도록)

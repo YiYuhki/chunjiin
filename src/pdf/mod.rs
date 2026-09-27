@@ -15,6 +15,7 @@
 
 mod ccitt;
 mod cffw;
+mod codecs;
 mod content;
 mod font;
 mod inline;
@@ -154,7 +155,12 @@ const FONT_DESCRIPTOR_KEYS: &[&[u8]] = &[
 ];
 
 /// 원본 그대로 옮기되 디코딩 검증을 할 수 없는 이미지 필터
-const PASSTHROUGH_IMAGE_FILTERS: &[&[u8]] = &[b"DCTDecode", b"CCITTFaxDecode"];
+const PASSTHROUGH_IMAGE_FILTERS: &[&[u8]] = &[
+    b"DCTDecode",
+    b"CCITTFaxDecode",
+    b"JBIG2Decode",
+    b"JPXDecode",
+];
 /// 역사적으로 파서 취약점이 많아 재조합 대상에서 제외하는 이미지 필터
 const BLOCKED_IMAGE_FILTERS: &[&[u8]] = &[b"JBIG2Decode", b"JPXDecode"];
 
@@ -528,10 +534,13 @@ impl<'a> Copier<'a> {
         }
 
         if is_image {
-            if let Some(f) = filters
-                .iter()
-                .find(|f| BLOCKED_IMAGE_FILTERS.contains(&f.as_slice()))
-            {
+            // JBIG2·JPX 는 마지막 필터일 때 화소로 풀어 다시 쓴다. 코덱 데이터를 그대로 옮기는
+            // 재검증 단계(결과물에는 이 코덱이 없음)와 앞단에 놓인 경우는 제외한다
+            let last = filters.len().saturating_sub(1);
+            if let Some((_, f)) = filters.iter().enumerate().find(|(i, f)| {
+                BLOCKED_IMAGE_FILTERS.contains(&f.as_slice())
+                    && (self.policy.media_passthrough || *i != last)
+            }) {
                 self.findings.add(
                     "risky-codec",
                     Severity::Medium,
@@ -709,6 +718,12 @@ impl<'a> Copier<'a> {
                 .add("image", Severity::Low, "크기가 없는 이미지 제외", "");
             return Ok(None);
         };
+        if codec == b"JBIG2Decode" {
+            return Ok(self.jbig2_image(s, dict, raw));
+        }
+        if codec == b"JPXDecode" {
+            return Ok(self.jpx_image(s, dict, raw));
+        }
         if codec == b"DCTDecode" {
             let Ok(img) = imaging::decode(raw, ImageKind::Jpeg, self.policy) else {
                 self.findings.add(
@@ -786,6 +801,136 @@ impl<'a> Copier<'a> {
         dict.set("BitsPerComponent", Object::Integer(1));
         *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
         Ok(Some(Stream::new(dict, bits)))
+    }
+
+    /// 필터 매개변수 사전 (배열이면 마지막 필터 것)
+    fn last_decode_parms(&self, s: &Stream) -> Option<Dictionary> {
+        let p = self.deref(s.dict.get(b"DecodeParms").ok()?)?;
+        let p = match p {
+            Object::Array(a) => self.deref(a.last()?)?,
+            o => o,
+        };
+        p.as_dict().ok().cloned()
+    }
+
+    /// JBIG2 이미지 → 1비트 표본 (공유 기호 사전 JBIG2Globals 포함)
+    fn jbig2_image(&mut self, s: &Stream, mut dict: Dictionary, raw: &[u8]) -> Option<Stream> {
+        let globals = self
+            .last_decode_parms(s)
+            .and_then(|p| p.get(b"JBIG2Globals").ok().cloned())
+            .and_then(|g| self.deref(&g).and_then(|o| o.as_stream().ok()).cloned())
+            .and_then(|g| inline::plain_content(&g, self.policy.max_stream_size).ok());
+        let Some((bits, w, h)) =
+            codecs::jbig2(raw, globals.as_deref(), self.policy.max_image_pixels)
+        else {
+            self.findings.add(
+                "image",
+                Severity::Medium,
+                "디코딩할 수 없는 JBIG2 이미지 제외",
+                "",
+            );
+            return None;
+        };
+        dict.set("Width", Object::Integer(w as i64));
+        dict.set("Height", Object::Integer(h as i64));
+        dict.set("BitsPerComponent", Object::Integer(1));
+        *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
+        Some(Stream::new(dict, bits))
+    }
+
+    /// 사전 색 공간의 성분 수와 Indexed 여부
+    fn image_cs(&self, s: &Stream) -> Option<(u8, bool)> {
+        let cs = self.deref(s.dict.get(b"ColorSpace").ok()?)?;
+        match cs {
+            Object::Name(n) => match n.as_slice() {
+                b"DeviceGray" | b"G" | b"CalGray" => Some((1, false)),
+                b"DeviceRGB" | b"RGB" => Some((3, false)),
+                b"DeviceCMYK" | b"CMYK" => Some((4, false)),
+                _ => None,
+            },
+            Object::Array(a) => {
+                let indexed = self
+                    .deref(a.first()?)
+                    .and_then(|o| o.as_name().ok())
+                    .is_some_and(|n| n == b"Indexed" || n == b"I");
+                Some((self.cs_components(cs)?, indexed))
+            }
+            _ => None,
+        }
+    }
+
+    /// JPEG 2000 이미지 → 8비트 표본. 사전에 색 공간이 없으면 코드스트림의 성분 수로 정하고,
+    /// 알파는 SMaskInData 가 있을 때 소프트 마스크로 옮긴다
+    fn jpx_image(&mut self, s: &Stream, mut dict: Dictionary, raw: &[u8]) -> Option<Stream> {
+        let has_cs = s.dict.get(b"ColorSpace").is_ok();
+        let cs = self.image_cs(s);
+        let drop = |c: &mut Self, why: &str| {
+            c.findings.add(
+                "image",
+                Severity::Medium,
+                format!("{why} JPX 이미지 제외"),
+                "",
+            );
+            None
+        };
+        if has_cs && cs.is_none() {
+            return drop(self, "색 공간을 알 수 없는");
+        }
+        let indexed = cs.is_some_and(|(_, i)| i);
+        let Some(mut img) = codecs::jpx(raw, !indexed, self.policy.max_image_pixels) else {
+            return drop(self, "디코딩할 수 없는");
+        };
+        // 색상표 번호는 디코더가 8비트로 늘린 값을 원래 번호로 되돌린다
+        if indexed && (1..8).contains(&img.bit_depth) {
+            let max = (1u32 << img.bit_depth) - 1;
+            for v in &mut img.samples {
+                *v = ((u32::from(*v) * max + 127) / 255) as u8;
+            }
+        }
+        match cs {
+            Some((n, _)) if usize::from(n) != img.components => {
+                return drop(self, "색 공간과 성분 수가 맞지 않는");
+            }
+            Some(_) => {}
+            None => {
+                let name: &[u8] = match img.components {
+                    1 => b"DeviceGray",
+                    3 => b"DeviceRGB",
+                    4 => b"DeviceCMYK",
+                    _ => return drop(self, "성분 수를 알 수 없는"),
+                };
+                dict.set("ColorSpace", Object::Name(name.to_vec()));
+            }
+        }
+        let smask_in_data = s
+            .dict
+            .get(b"SMaskInData")
+            .ok()
+            .and_then(|o| self.deref(o))
+            .and_then(|o| o.as_i64().ok())
+            .unwrap_or(0);
+        dict.remove(b"SMaskInData");
+        // JPX 에서는 무시되던 Decode 가 원시 표본에는 적용되므로 뺀다
+        dict.remove(b"Decode");
+        dict.set("Width", Object::Integer(img.width as i64));
+        dict.set("Height", Object::Integer(img.height as i64));
+        dict.set("BitsPerComponent", Object::Integer(8));
+        if let Some(alpha) = img
+            .alpha
+            .filter(|_| smask_in_data > 0 && !dict.has(b"SMask"))
+        {
+            let mut m = Dictionary::new();
+            m.set("Type", Object::Name(b"XObject".to_vec()));
+            m.set("Subtype", Object::Name(b"Image".to_vec()));
+            m.set("Width", Object::Integer(img.width as i64));
+            m.set("Height", Object::Integer(img.height as i64));
+            m.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
+            m.set("BitsPerComponent", Object::Integer(8));
+            let id = self.dst.add_object(Object::Stream(Stream::new(m, alpha)));
+            dict.set("SMask", Object::Reference(id));
+        }
+        *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
+        Some(Stream::new(dict, img.samples))
     }
 
     /// 글꼴 프로그램 스트림. TrueType 과 CFF 기반 OpenType 은 새로 조립하고, CFF(Type1C 등)와

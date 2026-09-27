@@ -315,6 +315,8 @@ dependencies = [
  "fax",
  "flate2",
  "hayro",
+ "hayro-jbig2",
+ "hayro-jpeg2000",
  "http-body-util",
  "image",
  "lopdf",

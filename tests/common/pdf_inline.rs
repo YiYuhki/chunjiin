@@ -118,3 +118,78 @@ pub fn inline_image_content() -> Vec<u8> {
 
     c
 }
+
+/// 8×6 RGB 무손실 JPEG 2000 코드스트림 (Pillow/OpenJPEG). 화소 (x, y) = (30x, 40y, x+y 홀수면 200 아니면 20)
+pub const JPX_RGB: &str = "ff4fff51002f000000000008000000060000000000000000000000080000000600000000000000000003070101070101070101ff52000c00000001000204040001ff5c000a4040484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000510001ff93df8020095c3d87df802006915b39c3e708088f9d3fc7da08000d02ff7fa03e10c008ff7f80c1f384001beda77fa1f502000cbf281e93f30b08e7380aac0063c645241fffd9";
+/// 4×4 RGBA JP2: 첫 줄은 파랑(알파 0·64·128·192), 나머지는 불투명 빨강
+pub const JPX_RGBA: &str = "0000000c6a5020200d0a870a00000014667479706a703220000000006a7032200000004f6a703268000000166968647200000004000000040004070700000000000f636f6c720100000000001000000022636465660004000000000001000100000002000200000003000300010000000000d96a703263ff4fff510032000000000004000000040000000000000000000000040000000400000000000000000004070101070101070101070101ff52000c00000001000204040001ff5c000a4040484850484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000580001ff93c7d40201df800807c7d40208cfb4080471a7e004017f80a7e004097bc3ea029f80143ed020031f02d709dfa7e00603ff7f80a3ed02000674c3ea039f801c1f50180da237052d770e737fffd9";
+
+pub fn unhex(s: &str) -> Vec<u8> {
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+/// JBIG2 세그먼트 (번호, 종류, 데이터). 페이지 연결 1바이트, 참조 없음
+pub fn jbig2_segment(n: u32, t: u8, data: &[u8]) -> Vec<u8> {
+    let mut v = n.to_be_bytes().to_vec();
+    v.push(t);
+    v.push(0);
+    v.push(1);
+    v.extend((data.len() as u32).to_be_bytes());
+    v.extend(data);
+    v
+}
+
+/// 무늬 (x+2y)%5==0 이 검정인 w×h 그림을 JBIG2(MMR 일반 영역)로: (페이지 정보, 영역+끝, 기대 1비트 표본)
+pub fn jbig2_parts(w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let black = |x: u32, y: u32| (x + 2 * y).is_multiple_of(5);
+    let mut info = Vec::new();
+    for v in [w, h, 0, 0] {
+        info.extend(v.to_be_bytes());
+    }
+    info.push(0);
+    info.extend(0u16.to_be_bytes());
+    let mut enc = fax::encoder::Encoder::new(fax::VecWriter::new());
+    for y in 0..h {
+        let row = (0..w).map(|x| {
+            if black(x, y) {
+                fax::Color::Black
+            } else {
+                fax::Color::White
+            }
+        });
+        enc.encode_line(row, w).unwrap();
+    }
+    let mmr = enc.finish().unwrap().finish();
+    let mut region = Vec::new();
+    for v in [w, h, 0, 0] {
+        region.extend(v.to_be_bytes());
+    }
+    region.push(0); // 합성: OR
+    region.push(1); // MMR
+    region.extend(mmr);
+    let body = [jbig2_segment(1, 38, &region), jbig2_segment(2, 49, &[])].concat();
+    let stride = (w as usize).div_ceil(8);
+    let mut bits = vec![0xFFu8; stride * h as usize];
+    for y in 0..h {
+        for x in 0..w {
+            if black(x, y) {
+                bits[y as usize * stride + x as usize / 8] &= !(0x80 >> (x % 8));
+            }
+        }
+    }
+    (jbig2_segment(0, 48, &info), body, bits)
+}
+
+/// JBIG2·JPX 인라인 이미지를 담은 콘텐츠
+pub fn codec_inline_content() -> Vec<u8> {
+    let (info, body, _) = jbig2_parts(20, 6);
+    let mut c = b"q BI /W 20 /H 6 /IM true /F /JBIG2Decode ID ".to_vec();
+    c.extend([info, body].concat());
+    c.extend(b"\nEI Q q BI /W 8 /H 6 /F /JPXDecode ID ");
+    c.extend(unhex(JPX_RGB));
+    c.extend(b"\nEI Q 0 0 m 9 9 l S");
+    c
+}

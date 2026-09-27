@@ -3,7 +3,9 @@
 mod common;
 
 use cdr::{Engine, Status};
-use common::pdf_inline::{inline_image_content, pdf_with_content};
+use common::pdf_inline::{
+    inline_image_content, jbig2_parts, pdf_with_content, unhex, JPX_RGB, JPX_RGBA,
+};
 use lopdf::{Document, Stream};
 
 /// 결과물 첫 쪽 콘텐츠의 인라인 이미지들: (머리 사전 문자열, 표본)
@@ -254,4 +256,222 @@ fn cmyk_jpeg_becomes_raw_cmyk() {
     assert_eq!(px.len(), 8 * 4 * 4);
     let again = Engine::default().process(&out, "c.pdf");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
+
+#[test]
+fn jbig2_and_jpx_images_are_decoded() {
+    use lopdf::dictionary;
+    // JBIG2 XObject: 1비트 표본(검정 = 0)으로
+    let (info, body, bits) = jbig2_parts(20, 6);
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 20, "Height" => 6,
+            "ColorSpace" => "DeviceGray", "BitsPerComponent" => 1, "Filter" => "JBIG2Decode",
+        },
+        [info.clone(), body.clone()].concat(),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "a.pdf");
+    assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
+    let img = output_image(r.output.as_ref().unwrap());
+    assert!(img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"JBIG2Decode"));
+    assert_eq!(img.get_plain_content().unwrap(), bits);
+    assert_eq!(r.stats.get("pdf_images_reencoded"), Some(&1));
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "a.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+
+    // 공유 기호 사전(JBIG2Globals)에 든 세그먼트도 함께 푼다
+    let mut doc = Document::with_version("1.7");
+    let globals = doc.add_object(Stream::new(dictionary! {}, info));
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 20, "Height" => 6,
+            "ImageMask" => true, "Filter" => vec!["FlateDecode".into(), "JBIG2Decode".into()],
+            "DecodeParms" => vec![lopdf::Object::Null, dictionary! { "JBIG2Globals" => globals }.into()],
+        },
+        {
+            use std::io::Write;
+            let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+            z.write_all(&body).unwrap();
+            z.finish().unwrap()
+        },
+    )
+    .with_compression(false);
+    let pdf = pdf_with_image_in(doc, s);
+    let r = Engine::default().process(&pdf, "b.pdf");
+    assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
+    let img = output_image(r.output.as_ref().unwrap());
+    assert_eq!(
+        img.get_plain_content().unwrap(),
+        bits,
+        "{:?} {:#?}",
+        img.dict,
+        r.findings
+    );
+    assert!(img.dict.get(b"DecodeParms").is_err());
+
+    // JPX XObject (색 공간 없음, Decode 는 JPX 에서 무시되므로 뺌) → 8비트 DeviceRGB
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 6,
+            "Filter" => "JPXDecode", "Decode" => vec![1.into(), 0.into(), 1.into(), 0.into(), 1.into(), 0.into()],
+        },
+        unhex(JPX_RGB),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "c.pdf");
+    assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
+    let img = output_image(r.output.as_ref().unwrap());
+    assert_eq!(
+        img.dict.get(b"ColorSpace").unwrap().as_name().unwrap(),
+        b"DeviceRGB"
+    );
+    assert!(img.dict.get(b"Decode").is_err());
+    let expect: Vec<u8> = (0..6)
+        .flat_map(|y| {
+            (0..8).flat_map(move |x| [30 * x, 40 * y, if (x + y) % 2 == 1 { 200 } else { 20 }])
+        })
+        .collect();
+    assert_eq!(img.get_plain_content().unwrap(), expect);
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "c.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+
+    // 알파가 있는 JPX + SMaskInData → 소프트 마스크
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 4, "Height" => 4,
+            "ColorSpace" => "DeviceRGB", "Filter" => "JPXDecode", "SMaskInData" => 1,
+        },
+        unhex(JPX_RGBA),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "d.pdf");
+    assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
+    let doc = Document::load_mem(r.output.as_ref().unwrap()).unwrap();
+    let img = doc
+        .objects
+        .values()
+        .find_map(|o| o.as_stream().ok().filter(|s| s.dict.get(b"SMask").is_ok()))
+        .expect("SMask 가 붙은 이미지");
+    let mut rgb = [0, 0, 255].repeat(4);
+    rgb.extend([255, 0, 0].repeat(12));
+    assert_eq!(img.get_plain_content().unwrap(), rgb);
+    let mask = doc
+        .get_object(img.dict.get(b"SMask").unwrap().as_reference().unwrap())
+        .unwrap()
+        .as_stream()
+        .unwrap();
+    let mut alpha = vec![0u8, 64, 128, 192];
+    alpha.extend([255].repeat(12));
+    assert_eq!(mask.get_plain_content().unwrap(), alpha);
+    assert!(img.dict.get(b"SMaskInData").is_err());
+
+    // 인라인 JBIG2·JPX
+    let (info, body, bits) = jbig2_parts(20, 6);
+    let mut c = b"q BI /W 20 /H 6 /IM true /F /JBIG2Decode ID ".to_vec();
+    c.extend([info, body].concat());
+    c.extend(b"\nEI Q q BI /W 8 /H 6 /F /JPXDecode ID ");
+    c.extend(unhex(JPX_RGB));
+    c.extend(b"\nEI Q 0 0 m 9 9 l S");
+    let r = Engine::default().process(&pdf_with_content(&c), "e.pdf");
+    assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
+    let (images, content) = inline_images(r.output.as_ref().unwrap());
+    assert_eq!(images.len(), 2, "{:?}", String::from_utf8_lossy(&content));
+    assert!(images[0].0.contains("/IM true"));
+    assert_eq!(images[0].1, bits);
+    assert!(images[1].0.contains("/DeviceRGB") && images[1].0.contains("/BPC 8"));
+    assert_eq!(images[1].1, expect);
+    assert!(!images.iter().any(|(h, _)| h.contains("/F")));
+
+    // 풀 수 없는 JBIG2 는 뺀다
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 8,
+            "ImageMask" => true, "Filter" => "JBIG2Decode",
+        },
+        b"\x97JB2 exploit".to_vec(),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "f.pdf");
+    assert!(find(r.output.as_ref().unwrap(), b"exploit").is_none());
+    assert!(
+        r.findings.iter().any(|f| f.description.contains("JBIG2")),
+        "{:#?}",
+        r.findings
+    );
+}
+
+fn pdf_with_image_in(mut doc: Document, image: Stream) -> Vec<u8> {
+    use lopdf::dictionary;
+    let pages_id = doc.new_object_id();
+    let img_id = doc.add_object(image);
+    let content_id = doc.add_object(Stream::new(
+        dictionary! {},
+        b"q 100 0 0 100 10 10 cm /Im0 Do Q".to_vec(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+    });
+    doc.objects.insert(
+        pages_id,
+        lopdf::Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+/// 16×16 YCCK(Adobe 변환 2) JPEG, 양자화 1. 복원 CMYK (x, y) = (15x, 15y, 8(x+y), xy) (256 으로 나눈 나머지)
+const YCCK_JPEG: &str = "ffd8ffee000e41646f626500640000000002ffdb00430001010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101010101ffc00014080010001004011100021100031100041100ffc4001f0000010501010101010100000000000000000102030405060708090a0bffc400b5100002010303020403050504040000017d01020300041105122131410613516107227114328191a1082342b1c11552d1f02433627282090a161718191a25262728292a3435363738393a434445464748494a535455565758595a636465666768696a737475767778797a838485868788898a92939495969798999aa2a3a4a5a6a7a8a9aab2b3b4b5b6b7b8b9bac2c3c4c5c6c7c8c9cad2d3d4d5d6d7d8d9dae1e2e3e4e5e6e7e8e9eaf1f2f3f4f5f6f7f8f9faffda000e040100020003000400003f00fe947e317ed63ff1f5ff00133fefff00cb6fafbd51d6f4dfbff2faf6a77c7df803ff001fbfe85ff3d3fe59fd7dabf861f87ff0ff00fe12af23f71e6799b7f873d71ed5f94bf18bf6b1ff008faff899ff007ffe5b7d7debc875bd37effcbebdabf127e3efc01ff8fdff0042ff009e9ff2cfebed5f707c3ffd8b7fe12af23fe253e6799b7fe5867ae3fd9afcebf8c5fb58ff00c7d7fc4cff00bfff002dbebef5f4e6b7a6fdff0097d7b57f6e5f1f7e00ff00c7effa17fcf4ff00967f5f6a3f62df87ff00f0957f64fee3ccf33c8fe1cf5dbed5f94df18bf6b1ff008faff899ff007ffe5b7d7debc875bd37effcbebdabf123e3efc01ff8fdff0042ff009e9ff2cfebed5fd707ec5bfb16ff00c255fd93ff00129f33ccf23fe5867aedff0066bfffd9";
+
+#[test]
+fn ycck_jpeg_becomes_raw_cmyk() {
+    use lopdf::dictionary;
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 16, "Height" => 16,
+            "ColorSpace" => "DeviceCMYK", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+        },
+        unhex(YCCK_JPEG),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "y.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    assert_eq!(
+        r.stats.get("pdf_images_reencoded"),
+        Some(&1),
+        "{:?}",
+        r.stats
+    );
+    let img = output_image(r.output.as_ref().unwrap());
+    assert!(img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"DCTDecode"));
+    let px = img.get_plain_content().unwrap();
+    assert_eq!(px.len(), 16 * 16 * 4);
+    for y in 0..16u32 {
+        for x in 0..16u32 {
+            let want = [
+                (x * 15) % 256,
+                (y * 15) % 256,
+                ((x + y) * 8) % 256,
+                (x * y) % 256,
+            ];
+            let at = ((y * 16 + x) * 4) as usize;
+            for k in 0..4 {
+                let got = i32::from(px[at + k]);
+                assert!(
+                    (got - want[k] as i32).abs() <= 3,
+                    "({x},{y}) {k}: {got} != {}",
+                    want[k]
+                );
+            }
+        }
+    }
 }

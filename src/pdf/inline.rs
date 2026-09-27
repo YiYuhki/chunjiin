@@ -7,7 +7,8 @@
 //! 해석 후 [`restore`] 가 자리표시를 `BI` 연산으로 되돌린다.
 //! - 풀 수 있는 필터: ASCIIHex, ASCII85, LZW, Flate, RunLength, DCT(JPEG 는 화소로 디코딩),
 //!   CCITT 팩스(G4·G3, 1비트 표본으로 디코딩)
-//! - JBIG2·JPX·Crypt 와 패턴 색 공간은 뺀다
+//! - JBIG2·JPX 는 화소로 풀어 다시 쓰고(공유 기호 사전은 인라인에서 쓸 수 없음), Crypt 와 패턴
+//!   색 공간은 뺀다
 //! - 리소스 이름의 색 공간(ICC·별색·Lab·Indexed)은 이름을 유지하고, 인라인 Indexed 는 기준 색 공간의
 //!   8비트 표본으로 펼친다
 
@@ -329,6 +330,8 @@ fn filter_name(n: &[u8]) -> Option<&'static [u8]> {
         b"RL" | b"RunLengthDecode" => b"RunLengthDecode",
         b"DCT" | b"DCTDecode" => b"DCTDecode",
         b"CCF" | b"CCITTFaxDecode" => b"CCITTFaxDecode",
+        b"JBIG2Decode" => b"JBIG2Decode",
+        b"JPXDecode" => b"JPXDecode",
         _ => return None,
     })
 }
@@ -363,12 +366,20 @@ fn image(
         return (Err("비트 수 오류"), None);
     }
     let bpc = bpc as usize;
+    let last_filter = match get(d, b"F", b"Filter") {
+        Some(Object::Name(n)) => Some(n.as_slice()),
+        Some(Object::Array(a)) => a.last().and_then(|o| o.as_name().ok()),
+        _ => None,
+    };
+    let jpx_codec = last_filter == Some(b"JPXDecode".as_slice());
     let cs = if mask {
         None
     } else {
-        match get(d, b"CS", b"ColorSpace").and_then(&mut *resolve) {
-            Some(cs) => Some(cs),
-            None => return (Err("지원하지 않는 색 공간"), None),
+        match get(d, b"CS", b"ColorSpace").map(&mut *resolve) {
+            Some(Some(cs)) => Some(cs),
+            // JPX 는 색 공간을 코드스트림에서 정할 수 있다 (성분 수는 풀어 본 뒤 정함)
+            None if jpx_codec => Some(Cs::Device(4)),
+            _ => return (Err("지원하지 않는 색 공간"), None),
         }
     };
     let ncomp = match &cs {
@@ -398,18 +409,28 @@ fn image(
         .map(|f| filter_name(f))
         .collect::<Option<Vec<_>>>()
     else {
-        return (Err("지원하지 않는 필터(JBIG2·JPX 등)"), None);
+        return (Err("지원하지 않는 필터"), None);
     };
-    let codec = |f: &&[u8]| *f == b"DCTDecode" || *f == b"CCITTFaxDecode";
-    let dct = filters.last() == Some(&b"DCTDecode".as_slice());
-    let fax = filters.last() == Some(&b"CCITTFaxDecode".as_slice());
+    let codec = |f: &&[u8]| {
+        matches!(
+            *f,
+            b"DCTDecode" | b"CCITTFaxDecode" | b"JBIG2Decode" | b"JPXDecode"
+        )
+    };
+    let last = filters.last().copied();
+    let dct = last == Some(b"DCTDecode".as_slice());
+    let fax = last == Some(b"CCITTFaxDecode".as_slice());
+    let jbig2 = last == Some(b"JBIG2Decode".as_slice());
+    let jpx = last == Some(b"JPXDecode".as_slice());
+    // 표본을 다시 만드는 코덱 (Decode 배열은 코덱 출력에 적용되지 않음)
+    let recoded = dct || jpx;
     if filters.iter().rev().skip(1).any(codec) {
         return (Err("필터 오류"), None);
     }
-    if fax && (bpc != 1 || ncomp != 1) {
+    if (fax || jbig2) && (bpc != 1 || ncomp != 1) {
         return (Err("필터 오류"), None);
     }
-    let pre: Vec<&[u8]> = if dct || fax {
+    let pre: Vec<&[u8]> = if dct || fax || jbig2 || jpx {
         filters[..filters.len() - 1].to_vec()
     } else {
         filters.clone()
@@ -508,6 +529,26 @@ fn image(
                 found = Some((bytes, n, 8, p));
                 break;
             }
+            if jbig2 {
+                // 인라인 이미지는 공유 기호 사전(JBIG2Globals)을 가리킬 수 없다
+                match super::codecs::jbig2(&plain, None, policy.max_image_pixels) {
+                    Some((bits, bw, bh)) if bw == w && bh == h => {
+                        found = Some((bits, 1, 1, p));
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
+            if jpx {
+                let palette = !matches!(cs, Some(Cs::Indexed { .. }));
+                match super::codecs::jpx(&plain, palette, policy.max_image_pixels) {
+                    Some(img) if img.width == w && img.height == h => {
+                        found = Some((img.samples, img.components, 8, p));
+                        break;
+                    }
+                    _ => continue,
+                }
+            }
             if let Some(fp) = &fax_parms {
                 let Some((bits, lines)) = ccitt_decode(&plain, fp, w, h) else {
                     continue;
@@ -543,7 +584,7 @@ fn image(
         Some(Object::Array(a)) if a.iter().all(|o| o.as_float().is_ok()) => Some(a.clone()),
         _ => None,
     };
-    let samples = match (&cs, dct) {
+    let samples = match (&cs, recoded) {
         (None, _) => {
             dict.set("IM", Object::Boolean(true));
             dict.set("BPC", Object::Integer(1));
@@ -592,7 +633,7 @@ fn image(
             }
             dict.set("CS", Object::Name(name.clone()));
             dict.set("BPC", Object::Integer(out_bpc as i64));
-            if let Some(a) = decode.filter(|a| a.len() == 2 * out_ncomp && !dct) {
+            if let Some(a) = decode.filter(|a| a.len() == 2 * out_ncomp && !recoded) {
                 dict.set("D", Object::Array(a));
             }
             samples
@@ -600,7 +641,7 @@ fn image(
         (Some(Cs::Device(_)), _) => {
             dict.set("CS", device_name(out_ncomp as u8));
             dict.set("BPC", Object::Integer(out_bpc as i64));
-            if let Some(a) = decode.filter(|a| a.len() == 2 * out_ncomp && !dct) {
+            if let Some(a) = decode.filter(|a| a.len() == 2 * out_ncomp && !recoded) {
                 dict.set("D", Object::Array(a));
             }
             samples
@@ -776,9 +817,13 @@ mod tests {
 
     #[test]
     fn unsupported_filters_are_dropped() {
-        let (out, res) = run(b"BI /W 1 /H 1 /IM true /F /JBIG2Decode ID \x00\x01 EI 0 0 m");
+        let (out, res) = run(b"BI /W 1 /H 1 /IM true /F /Crypt ID \x00\x01 EI 0 0 m");
         assert_eq!(res.normalized, 0);
-        assert_eq!(res.dropped, vec!["지원하지 않는 필터(JBIG2·JPX 등)"]);
+        assert_eq!(res.dropped, vec!["지원하지 않는 필터"]);
+        assert_eq!(out, b" 0 0 m");
+        // 풀 수 없는 JBIG2 는 뺀다
+        let (out, res) = run(b"BI /W 1 /H 1 /IM true /F /JBIG2Decode ID \x00\x01 EI 0 0 m");
+        assert_eq!(res.dropped, vec!["데이터 해석 실패"]);
         assert_eq!(out, b" 0 0 m");
     }
 }
