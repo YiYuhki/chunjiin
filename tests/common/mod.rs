@@ -4,6 +4,7 @@
 pub mod legacy;
 pub mod metafile;
 pub mod msg;
+pub mod pdf_inline;
 
 use std::io::{Cursor, Read, Write};
 

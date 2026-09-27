@@ -215,6 +215,15 @@ fn fuzz_hwpx() {
 fn fuzz_pdf() {
     run("a.pdf", 5, common::malicious_pdf(), mutate_bytes);
     run("b.pdf", 6, common::clean_pdf(), mutate_bytes);
+    let inline = common::pdf_inline::pdf_with_content(&common::pdf_inline::inline_image_content());
+    run("i.pdf", 30, inline.clone(), mutate_bytes);
+    run("j.pdf", 31, inline, mutate_inline_content);
+}
+
+/// 인라인 이미지 콘텐츠를 변조해 PDF 로 감싼다 (xref 가 맞는 채로 해석기까지 도달하도록)
+fn mutate_inline_content(rng: &mut Rng, _: &[u8]) -> Vec<u8> {
+    let c = mutate_bytes(rng, &common::pdf_inline::inline_image_content());
+    common::pdf_inline::pdf_with_content(&c)
 }
 
 #[test]

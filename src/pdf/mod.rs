@@ -15,6 +15,7 @@
 
 mod content;
 mod font;
+mod inline;
 mod raster;
 mod scan;
 
@@ -168,6 +169,9 @@ struct Copier<'a> {
     copied: usize,
     dropped_ops: HashMap<String, u64>,
     font_stats: BTreeMap<&'static str, u64>,
+    /// 문서 전체 인라인 이미지 표본 예산 (바이트)
+    inline_budget: usize,
+    inline_images: u64,
 }
 
 impl<'a> Copier<'a> {
@@ -343,7 +347,12 @@ impl<'a> Copier<'a> {
 
     /// 콘텐츠 스트림을 연산자로 해석한다. 해석 전에 토큰 수를 세어 스트림/문서 단위 예산을 넘으면 차단한다
     /// (작은 압축 스트림이 수천만 개의 연산자로 풀려 메모리를 고갈시키는 공격 방어).
-    fn decode_ops(&mut self, plain: &[u8]) -> Result<Option<Vec<Operation>>> {
+    /// 인라인 이미지는 먼저 직접 해석해 정규화한다. `colorspaces` 는 원본 리소스의 ColorSpace 사전.
+    fn decode_ops(
+        &mut self,
+        plain: &[u8],
+        colorspaces: Option<&Dictionary>,
+    ) -> Result<Option<Vec<Operation>>> {
         let tokens = content::count_tokens(plain);
         if tokens > MAX_STREAM_TOKENS {
             return blocked("resource", format!("콘텐츠 스트림 토큰 수 초과 ({tokens})"));
@@ -352,7 +361,97 @@ impl<'a> Copier<'a> {
         if self.content_tokens > MAX_DOCUMENT_TOKENS {
             return blocked("resource", "문서 전체 콘텐츠 토큰 수 초과");
         }
-        Ok(Content::decode(plain).ok().map(|c| c.operations))
+        let mut budget = self.inline_budget;
+        let normalized = {
+            let this = &*self;
+            inline::normalize(
+                plain,
+                &mut |o| this.resolve_cs(o, colorspaces, 0),
+                this.policy,
+                &mut budget,
+            )
+        };
+        self.inline_budget = budget;
+        let Some((bytes, outcome)) = normalized else {
+            return Ok(Content::decode(plain).ok().map(|c| c.operations));
+        };
+        for reason in &outcome.dropped {
+            *self
+                .dropped_ops
+                .entry(format!("BI(인라인 이미지: {reason})"))
+                .or_default() += 1;
+        }
+        self.inline_images += outcome.normalized;
+        let Ok(content) = Content::decode(&bytes) else {
+            return Ok(None);
+        };
+        let mut ops = content.operations;
+        let mut images: Vec<Option<Stream>> = outcome.images.into_iter().map(Some).collect();
+        inline::restore(&mut ops, &mut images);
+        Ok(Some(ops))
+    }
+
+    /// 인라인 이미지의 색 공간을 장치 색 공간(또는 그 위의 Indexed)으로 해석한다
+    fn resolve_cs(&self, o: &Object, res: Option<&Dictionary>, depth: usize) -> Option<inline::Cs> {
+        use inline::Cs;
+        if depth > 4 {
+            return None;
+        }
+        match self.deref(o)? {
+            Object::Name(n) => match n.as_slice() {
+                b"G" | b"DeviceGray" | b"CalGray" => Some(Cs::Device(1)),
+                b"RGB" | b"DeviceRGB" | b"CalRGB" => Some(Cs::Device(3)),
+                b"CMYK" | b"DeviceCMYK" => Some(Cs::Device(4)),
+                name => {
+                    let v = res?.get(name).ok()?;
+                    self.resolve_cs(v, res, depth + 1)
+                }
+            },
+            Object::Array(a) => {
+                let family = self.deref(a.first()?)?.as_name().ok()?;
+                match family {
+                    b"CalGray" => Some(Cs::Device(1)),
+                    b"CalRGB" => Some(Cs::Device(3)),
+                    b"ICCBased" => {
+                        let s = self.deref(a.get(1)?)?.as_stream().ok()?;
+                        match self.deref(s.dict.get(b"N").ok()?)?.as_i64().ok()? {
+                            n @ (1 | 3 | 4) => Some(Cs::Device(n as u8)),
+                            _ => None,
+                        }
+                    }
+                    b"I" | b"Indexed" => {
+                        let Cs::Device(base) = self.resolve_cs(a.get(1)?, res, depth + 1)? else {
+                            return None;
+                        };
+                        let hival = self.deref(a.get(2)?)?.as_i64().ok()?;
+                        if !(0..=255).contains(&hival) {
+                            return None;
+                        }
+                        let lookup = match self.deref(a.get(3)?)? {
+                            Object::String(b, _) => b.clone(),
+                            Object::Stream(s) => s.get_plain_content_with_limit(1 << 20).ok()?,
+                            _ => return None,
+                        };
+                        Some(Cs::Indexed {
+                            base,
+                            hival: hival as usize,
+                            lookup,
+                        })
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// 리소스 사전(원본)의 ColorSpace 범주
+    fn colorspace_resources(&self, resources: Option<&Object>) -> Option<Dictionary> {
+        let res = self.deref(resources?)?.as_dict().ok()?;
+        self.deref(res.get(b"ColorSpace").ok()?)?
+            .as_dict()
+            .ok()
+            .cloned()
     }
 
     fn copy_stream(&mut self, s: &Stream, role: Role, depth: usize) -> Result<Option<Stream>> {
@@ -412,7 +511,7 @@ impl<'a> Copier<'a> {
 
         // 1) 그리기 연산자 스트림: 해석 → 필터링 → 재인코딩
         if is_form || is_tiling || role == Role::Content {
-            let Ok(plain) = s.get_plain_content_with_limit(self.policy.max_stream_size) else {
+            let Ok(plain) = inline::plain_content(s, self.policy.max_stream_size) else {
                 self.findings.add(
                     "structure",
                     Severity::Medium,
@@ -421,7 +520,12 @@ impl<'a> Copier<'a> {
                 );
                 return Ok(None);
             };
-            let ops = match self.decode_ops(&plain)? {
+            let colorspaces = if is_form || is_tiling {
+                self.colorspace_resources(s.dict.get(b"Resources").ok())
+            } else {
+                None
+            };
+            let ops = match self.decode_ops(&plain, colorspaces.as_ref())? {
                 Some(ops) => ops,
                 None => {
                     self.findings.add(
@@ -449,7 +553,7 @@ impl<'a> Copier<'a> {
             .filter(|f| PASSTHROUGH_IMAGE_FILTERS.contains(&f.as_slice()))
             .collect();
         if passthrough.is_empty() {
-            return match s.get_plain_content_with_limit(self.policy.max_stream_size) {
+            return match inline::plain_content(s, self.policy.max_stream_size) {
                 Ok(plain) => Ok(Some(Stream::new(dict, plain))),
                 Err(_) => {
                     self.findings.add(
@@ -487,9 +591,19 @@ impl<'a> Copier<'a> {
         let raw = if pre_filters.is_empty() {
             s.content.clone()
         } else {
+            let n = pre_filters.len();
             pre.dict.set("Filter", Object::Array(pre_filters));
-            pre.dict.remove(b"DecodeParms");
-            match pre.get_plain_content_with_limit(self.policy.max_stream_size) {
+            // 필터마다 매개변수가 있으면 앞 필터 것만 남긴다
+            match s.dict.get(b"DecodeParms") {
+                Ok(Object::Array(a)) => pre.dict.set(
+                    "DecodeParms",
+                    Object::Array(a.iter().take(n).cloned().collect()),
+                ),
+                _ => {
+                    pre.dict.remove(b"DecodeParms");
+                }
+            }
+            match inline::plain_content(&pre, self.policy.max_stream_size) {
                 Ok(r) => r,
                 Err(_) => return Ok(None),
             }
@@ -527,7 +641,7 @@ impl<'a> Copier<'a> {
         role: Role,
         depth: usize,
     ) -> Result<Option<Option<Stream>>> {
-        let Ok(plain) = s.get_plain_content_with_limit(self.policy.max_stream_size) else {
+        let Ok(plain) = inline::plain_content(s, self.policy.max_stream_size) else {
             self.findings.add(
                 "font",
                 Severity::Low,
@@ -704,6 +818,8 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
         dropped_ops: HashMap::new(),
         font_stats: BTreeMap::new(),
         content_tokens: 0,
+        inline_budget: 256 << 20,
+        inline_images: 0,
     };
     let pages_id = copier.dst.new_object_id();
 
@@ -775,6 +891,7 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
     let mut dropped_list: Vec<_> = copier.dropped_ops.iter().collect();
     dropped_list.sort();
     let copied_objects = copier.copied as u64;
+    let inline_images = copier.inline_images;
     let Copier {
         mut dst,
         findings,
@@ -796,6 +913,9 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
             format!("허용 목록 외 콘텐츠 연산자 제외: {}", names.join(", ")),
             "",
         );
+    }
+    if inline_images > 0 {
+        findings.count("pdf_inline_images", inline_images);
     }
     findings.count("pages", order.len() as u64);
     findings.count("objects_copied", copied_objects);
@@ -926,7 +1046,8 @@ fn build_page(
             )
         }
     };
-    let ops = match c.decode_ops(&raw)? {
+    let colorspaces = c.colorspace_resources(inherited(src, src_id, b"Resources"));
+    let ops = match c.decode_ops(&raw, colorspaces.as_ref())? {
         Some(ops) => ops,
         None => {
             return blocked(
