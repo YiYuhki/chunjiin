@@ -228,6 +228,23 @@ fn xls_vba_and_ole_are_not_reassembled() {
     assert_cats(&r, &["macro", "metadata", "embedded-object"]);
     let out = r.output.as_ref().unwrap();
     assert_eq!(names(&read_cfb(out)), vec!["Workbook"]);
+    // VBA 표시 레코드(OBPROJ)는 같은 자리에서 '매크로 없음'(ObNoMacros)으로
+    let wb = read_cfb(out)
+        .into_iter()
+        .find(|(n, _)| n == "Workbook")
+        .unwrap()
+        .1;
+    let src_wb = read_cfb(&xls(0, &[obproj()]))
+        .into_iter()
+        .find(|(n, _)| n == "Workbook")
+        .unwrap()
+        .1;
+    assert_eq!(wb.len(), src_wb.len(), "길이·오프셋 불변");
+    let at = src_wb
+        .windows(4)
+        .position(|w| w == [0xD3, 0, 0, 0])
+        .unwrap();
+    assert_eq!(&wb[at..at + 4], &[0xBD, 0x01, 0, 0]);
     // 빈 MBD 저장소는 남아 있음 (시트의 개체 참조 유지)
     let c = cfb::CompoundFile::open(std::io::Cursor::new(out.as_slice())).unwrap();
     assert!(c.is_storage("/MBD0001A2B3"));

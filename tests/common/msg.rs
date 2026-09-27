@@ -480,6 +480,17 @@ pub fn recurring_task_msg() -> Vec<u8> {
 
 /// 음력 반복 일정. `yearly` 면 매년(음력 `day` 일), 아니면 매월 1일. `start` 는 1601 기준 분(자정), `count` 회
 pub fn lunar_event_msg(yearly: bool, start: u32, day: u32, count: u32) -> Vec<u8> {
+    calendar_event_msg(0x14, yearly, start, day, count)
+}
+
+/// 달력 종류(`calendar`: MS-OXOCAL CalendarType)를 지정한 반복 일정
+pub fn calendar_event_msg(
+    calendar: u16,
+    yearly: bool,
+    start: u32,
+    day: u32,
+    count: u32,
+) -> Vec<u8> {
     let appt = [
         0x02, 0x20, 0x06, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
     ];
@@ -491,8 +502,8 @@ pub fn lunar_event_msg(yearly: bool, start: u32, day: u32, count: u32) -> Vec<u8
     }
     let mut rec = Vec::new();
     let freq: u16 = if yearly { 0x200D } else { 0x200C };
-    for v in [0x3004u16, 0x3004, freq, 0xA, 0x14] {
-        rec.extend(v.to_le_bytes()); // 음력 날짜 패턴, 한국 음력
+    for v in [0x3004u16, 0x3004, freq, 0xA, calendar] {
+        rec.extend(v.to_le_bytes()); // 음력·히즈라력 날짜 패턴
     }
     let period = if yearly { 12 } else { 1 };
     for v in [0u32, period, 0, day, 0x2022, count, 0, 0, 0, start, start] {

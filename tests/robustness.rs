@@ -279,6 +279,12 @@ fn fuzz_legacy() {
         mutate_recurrence,
     );
     run(
+        "i.msg",
+        42,
+        common::msg::calendar_event_msg(0x17, true, 222_066_720, 1, 3),
+        mutate_recurrence,
+    );
+    run(
         "h.msg",
         40,
         common::msg::lunar_event_msg(true, 222_850_080, 15, 5),
@@ -326,6 +332,20 @@ fn fuzz_archive_and_images() {
     run("a.zip", 19, archive.clone(), mutate_zip);
     run("r.zip", 20, archive, mutate_bytes);
     run("a.png", 21, common::png_with_payload(), mutate_bytes);
+    let gif = {
+        use image::codecs::gif::{GifEncoder, Repeat};
+        let mut out = Vec::new();
+        {
+            let mut enc = GifEncoder::new(&mut out);
+            enc.set_repeat(Repeat::Infinite).unwrap();
+            for i in 0..4u8 {
+                let img = image::RgbaImage::from_pixel(9, 7, image::Rgba([i * 60, 90, 200, 255]));
+                enc.encode_frame(image::Frame::new(img)).unwrap();
+            }
+        }
+        out
+    };
+    run("a.gif", 41, gif, mutate_bytes);
     let csv = "이름,값,비고\n홍길동,=1+2,\"a,\"\"b\"\"\"\n-,+82-10,@x\r\n"
         .as_bytes()
         .to_vec();

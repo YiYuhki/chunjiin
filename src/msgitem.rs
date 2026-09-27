@@ -530,11 +530,15 @@ impl Recur {
         let _first = c.u32()?;
         let period = c.u32()?;
         let _sliding = c.u32()?;
-        // 그레고리력과 음력(한국·중국)
+        // 그레고리력(연호만 다른 일본·대만·한국 단기·태국 달력 포함), 음력(한국·중국·일본), 히즈라력
+        use crate::lunar::*;
         let lunar = match calendar {
-            0 | 1 => None,
-            0x12 | 0x14 => Some(crate::lunar::KOREAN_CAL),
-            0x0F | 0x11 => Some(crate::lunar::CHINESE_CAL),
+            0..=5 | 7 | 9..=12 => None,
+            0x12 | 0x14 => Some(KOREAN_CAL),
+            0x0F | 0x11 => Some(CHINESE_CAL),
+            0x0E | 0x13 => Some(JAPANESE_CAL),
+            6 => Some(HIJRI_CAL),
+            0x17 => Some(UMM_AL_QURA_CAL),
             _ => return None,
         };
         // 음력 패턴(0xA~0xC)은 음력 달력에서만, 뜻은 날짜·n번째 요일·말일 패턴과 같다
@@ -837,8 +841,8 @@ impl Recur {
             }
             Freq::Yearly => format!("{} {}월 {}", every("년", "매년"), self.month, day()),
         };
-        if self.lunar.is_some() {
-            s = format!("음력 {s}");
+        if let Some(cal) = self.lunar {
+            s = format!("{} {s}", cal.label());
         }
         if let Some(n) = self.count {
             s += &format!(", {n}회");

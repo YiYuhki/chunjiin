@@ -2,8 +2,8 @@ mod common;
 
 use cdr::{Engine, Status};
 use common::msg::{
-    appointment_msg, contact_msg, lunar_event_msg, malicious_msg, recurring_meeting_msg,
-    recurring_task_msg, rtf_bomb_msg, rtf_html_msg,
+    appointment_msg, calendar_event_msg, contact_msg, lunar_event_msg, malicious_msg,
+    recurring_meeting_msg, recurring_task_msg, rtf_bomb_msg, rtf_html_msg,
 };
 use mail_parser::MimeHeaders;
 
@@ -378,4 +378,39 @@ fn lunar_recurrence_is_expanded() {
         ics.contains("RDATE:20230322T090000,20230420T090000"),
         "{ics}"
     );
+}
+
+#[test]
+fn hijri_and_japanese_recurrence_is_expanded() {
+    let ics = |msg: Vec<u8>| {
+        let r = Engine::default().process(&msg, "a.msg");
+        assert_eq!(
+            r.status,
+            Status::Sanitized,
+            "{} {:#?}",
+            r.reason,
+            r.findings
+        );
+        let m = parse(r.output.as_ref().unwrap());
+        (
+            m.body_text(0).unwrap().to_string(),
+            attachment_text(&m, "event.ics"),
+        )
+    };
+    // 움 알쿠라: 매년 9월 1일(라마단 첫날), 2023-03-23 부터 3회
+    let (body, ics1) = ics(calendar_event_msg(0x17, true, 222_066_720, 1, 3));
+    assert!(body.contains("반복: 히즈라력 매년 9월 1일, 3회"), "{body}");
+    assert!(ics1.contains("DTSTART:20230323T090000"), "{ics1}");
+    assert!(
+        ics1.contains("RDATE:20240311T090000,20250301T090000"),
+        "{ics1}"
+    );
+    // 일본 음력(구력): 한국과 같은 UTC+9 기준이라 2024년 음 8.15 = 2024-09-17
+    let (body, ics2) = ics(calendar_event_msg(0x0E, true, 222_850_080, 15, 2));
+    assert!(body.contains("반복: 음력 매년 8월 15일, 2회"), "{body}");
+    assert!(ics2.contains("RDATE:20251006T090000"), "{ics2}");
+    for i in [ics1, ics2] {
+        let again = Engine::default().process(i.as_bytes(), "event.ics");
+        assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+    }
 }

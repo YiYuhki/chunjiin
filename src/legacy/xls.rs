@@ -18,6 +18,8 @@ const BOUNDSHEET: u16 = 0x0085;
 const NAME: u16 = 0x0018;
 const SUPBOOK: u16 = 0x01AE;
 const OBPROJ: u16 = 0x00D3;
+/// ObNoMacros: 매크로가 없음을 나타내는 본문 없는 레코드
+const OB_NO_MACROS: u16 = 0x01BD;
 const HLINK: u16 = 0x01B8;
 /// 외부로 요청을 보내는 함수 (BIFF8 에는 "_xlfn." 이름으로 저장됨)
 const REQUEST_FUNCTIONS: &[&str] = &["_xlfn.webservice", "_xlfn.filterxml", "_xlfn.image"];
@@ -79,6 +81,7 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
     let mut auto_names = 0u32;
     let mut external_books = 0u32;
     let mut hlink_bodies: Vec<(usize, usize)> = Vec::new();
+    let mut obproj: Vec<usize> = Vec::new();
     // 모든 BIFF 레코드 본문 구간 (그림 제자리 재인코딩이 레코드 경계를 넘지 않게)
     let mut bodies: Vec<(usize, usize, u16)> = Vec::new();
     while pos + 4 <= wb.len() {
@@ -146,12 +149,8 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
                 }
             }
             HLINK => hlink_bodies.push((body_at, len)),
-            OBPROJ => findings.add(
-                "macro",
-                Severity::Info,
-                "VBA 프로젝트 표시 레코드(OBPROJ) - 프로젝트 본체는 조립하지 않음",
-                stream_name,
-            ),
+            // VBA 프로젝트 표시: 프로젝트 본체는 조립하지 않으므로 "매크로 없음" 레코드로 바꾼다
+            OBPROJ if len == 0 => obproj.push(body_at - 4),
             _ => {}
         }
     }
@@ -185,6 +184,17 @@ pub fn reassemble(data: &[u8], policy: &Policy, findings: &mut Findings) -> Resu
 
     // 하이퍼링크(HLINK): 허용 URI 가 아닌 문자열(파일 모니커, 상대/UNC 경로 등)을 제자리에서 공백으로
     let mut wb_out = wb.to_vec();
+    for &at in &obproj {
+        wb_out[at..at + 2].copy_from_slice(&OB_NO_MACROS.to_le_bytes());
+    }
+    if !obproj.is_empty() {
+        findings.add(
+            "macro",
+            Severity::Low,
+            "VBA 프로젝트 표시 레코드(OBPROJ)를 '매크로 없음'(ObNoMacros)으로 바꿈 - 프로젝트 본체는 조립하지 않음",
+            stream_name,
+        );
+    }
     let mut neutralized = Vec::new();
     for (at, len) in hlink_bodies {
         let body = &wb_out[at..at + len];

@@ -87,6 +87,11 @@ pub fn reencode(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<(Vec<u8
         check_header(data, kind, policy)?;
         return Ok((data.to_vec(), kind));
     }
+    if kind == ImageKind::Gif {
+        if let Some(out) = reencode_animated_gif(data, policy)? {
+            return Ok((out, ImageKind::Gif));
+        }
+    }
     let img = decode(data, kind, policy)?;
     let (img, target) = match kind {
         ImageKind::Jpeg => (DynamicImage::ImageRgb8(img.to_rgb8()), ImageKind::Jpeg),
@@ -105,6 +110,71 @@ pub fn reencode(data: &[u8], kind: ImageKind, policy: &Policy) -> Result<(Vec<u8
         return blocked("reconstruct", format!("이미지 재인코딩 실패: {e}"));
     }
     Ok((out.into_inner(), target))
+}
+
+/// 애니메이션 GIF 의 최대 프레임 수
+const MAX_GIF_FRAMES: usize = 1000;
+
+/// 애니메이션 GIF 를 프레임마다 화소로 풀어(합성된 전체 화면) 새 GIF 로 쓴다. 프레임 지연은
+/// 유지하고 반복은 무한으로 쓴다. 프레임이 하나뿐이면 None (정지 그림으로 처리).
+/// 프레임을 하나씩 풀고 바로 쓰므로 메모리는 한 프레임 크기만 쓴다. 프레임 수와 전체 화소
+/// (그림 하나 한도의 1/4)를 넘는 뒷부분은 옮기지 않는다
+fn reencode_animated_gif(data: &[u8], policy: &Policy) -> Result<Option<Vec<u8>>> {
+    use image::codecs::gif::{GifDecoder, GifEncoder, Repeat};
+    use image::{AnimationDecoder, ImageDecoder};
+    let Ok(mut dec) = GifDecoder::new(Cursor::new(data)) else {
+        return blocked("image", "GIF 헤더 해석 실패");
+    };
+    let (w, h) = dec.dimensions();
+    let px = u64::from(w) * u64::from(h);
+    if px == 0 || px > policy.max_image_pixels {
+        return blocked("image-bomb", format!("이미지 크기 초과 ({w}x{h})"));
+    }
+    let mut limits = Limits::default();
+    limits.max_alloc = Some(policy.max_image_pixels.saturating_mul(8));
+    if dec.set_limits(limits).is_err() {
+        return blocked("image-bomb", "GIF 메모리 한도 초과");
+    }
+    let budget = (policy.max_image_pixels / 4).max(px);
+    let mut frames = dec.into_frames();
+    let Some(first) = frames.next() else {
+        return blocked("image", "GIF 프레임 없음");
+    };
+    let Ok(first) = first else {
+        return blocked("image", "GIF 디코딩 실패");
+    };
+    let Some(second) = frames.next() else {
+        return Ok(None);
+    };
+    let mut out = Vec::new();
+    {
+        let mut enc = GifEncoder::new_with_speed(&mut out, 10);
+        if enc.set_repeat(Repeat::Infinite).is_err() {
+            return blocked("reconstruct", "GIF 재인코딩 실패");
+        }
+        let mut used = 0u64;
+        for (i, f) in std::iter::once(Ok(first))
+            .chain(std::iter::once(second))
+            .chain(frames)
+            .enumerate()
+        {
+            used = used.saturating_add(px);
+            if i >= MAX_GIF_FRAMES || used > budget {
+                break;
+            }
+            // 깨진 뒤쪽 프레임은 거기까지만 옮긴다
+            let Ok(f) = f else {
+                if i == 0 {
+                    return blocked("image", "GIF 디코딩 실패");
+                }
+                break;
+            };
+            if enc.encode_frame(f).is_err() {
+                return blocked("reconstruct", "GIF 재인코딩 실패");
+            }
+        }
+    }
+    Ok(Some(out))
 }
 
 /// 이미지를 원래 형식 그대로(BMP 포함) 재인코딩한다. 형식 정보가 문서 안에 따로

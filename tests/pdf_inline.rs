@@ -608,3 +608,47 @@ fn lossy_jpx_becomes_jpeg() {
     let again = Engine::default().process(r.output.as_ref().unwrap(), "l.pdf");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
+
+#[test]
+fn raw_images_use_png_predictor() {
+    use lopdf::dictionary;
+    // 부드러운 그라데이션: 예측자가 Flate 만보다 훨씬 작다
+    let (w, h) = (64u32, 64u32);
+    let px: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).flat_map(move |x| [(x * 4) as u8, (y * 4) as u8, ((x + y) * 2) as u8]))
+        .collect();
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8,
+        },
+        px.clone(),
+    );
+    let r = Engine::default().process(&pdf_with_image(s), "p.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let img = output_image(r.output.as_ref().unwrap());
+    let parms = img.dict.get(b"DecodeParms").unwrap().as_dict().unwrap();
+    assert_eq!(parms.get(b"Predictor").unwrap().as_i64().unwrap(), 15);
+    assert_eq!(parms.get(b"Colors").unwrap().as_i64().unwrap(), 3);
+    assert_eq!(img.get_plain_content().unwrap(), px);
+    let flate = {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&px).unwrap();
+        z.finish().unwrap().len()
+    };
+    assert!(
+        img.content.len() * 2 < flate,
+        "{} vs {flate}",
+        img.content.len()
+    );
+    // 다시 넣어도 같은 바이트
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "p.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+    let third = Engine::default().process(again.output.as_ref().unwrap(), "p.pdf");
+    assert_eq!(third.output, again.output);
+    assert_eq!(
+        output_image(again.output.as_ref().unwrap()).content,
+        img.content
+    );
+}

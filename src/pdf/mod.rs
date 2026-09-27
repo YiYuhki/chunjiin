@@ -613,7 +613,14 @@ impl<'a> Copier<'a> {
             .collect();
         if passthrough.is_empty() {
             return match inline::plain_content(s, self.policy.max_stream_size) {
-                Ok(plain) => Ok(Some(Stream::new(dict, plain))),
+                Ok(plain) => {
+                    // 8비트 이미지는 PNG 예측자로 다시 압축한다 (이 모듈이 만든 결과물과 같은 바이트)
+                    let n = is_image.then(|| self.plain_image_components(s)).flatten();
+                    Ok(Some(match n {
+                        Some(n) => predicted(dict, plain, n),
+                        None => Stream::new(dict, plain),
+                    }))
+                }
                 Err(_) => {
                     self.findings.add(
                         "structure",
@@ -744,7 +751,7 @@ impl<'a> Copier<'a> {
                     dict.set("Height", Object::Integer(h as i64));
                     dict.set("BitsPerComponent", Object::Integer(8));
                     *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
-                    return Ok(Some(Stream::new(dict, px)));
+                    return Ok(Some(predicted(dict, px, 4)));
                 }
                 dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
                 *self
@@ -834,6 +841,23 @@ impl<'a> Copier<'a> {
         dict.set("Height", Object::Integer(h as i64));
         *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
         Some(bilevel(dict, bits, w, h))
+    }
+
+    /// 8비트 원시 표본 이미지의 성분 수 (마스크·다른 비트 수는 None)
+    fn plain_image_components(&self, s: &Stream) -> Option<usize> {
+        let int = |k: &[u8]| {
+            s.dict
+                .get(k)
+                .ok()
+                .and_then(|o| self.deref(o))
+                .and_then(|o| o.as_i64().ok())
+        };
+        if int(b"BitsPerComponent") != Some(8)
+            || s.dict.get(b"ImageMask").ok().and_then(|o| o.as_bool().ok()) == Some(true)
+        {
+            return None;
+        }
+        self.image_cs(s).map(|(n, _)| usize::from(n))
     }
 
     /// 사전 색 공간의 성분 수와 Indexed 여부
@@ -940,7 +964,7 @@ impl<'a> Copier<'a> {
             m.set("Height", Object::Integer(img.height as i64));
             m.set("ColorSpace", Object::Name(b"DeviceGray".to_vec()));
             m.set("BitsPerComponent", Object::Integer(8));
-            let id = self.dst.add_object(Object::Stream(Stream::new(m, alpha)));
+            let id = self.dst.add_object(Object::Stream(predicted(m, alpha, 1)));
             dict.set("SMask", Object::Reference(id));
         }
         *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
@@ -961,7 +985,7 @@ impl<'a> Copier<'a> {
                 return Some(Stream::new(dict, out.into_inner()).with_compression(false));
             }
         }
-        Some(Stream::new(dict, img.samples))
+        Some(predicted(dict, img.samples, img.components))
     }
 
     /// 글꼴 프로그램 스트림. TrueType 과 CFF 기반 OpenType 은 새로 조립하고, CFF(Type1C 등)와
@@ -1881,4 +1905,91 @@ fn wrapped_once(ops: &[Operation]) -> bool {
         }
     }
     depth == 0
+}
+
+/// 8비트 이미지 표본을 PNG 예측자(행마다 None·Sub·Up·Average·Paeth 중 절댓값 합이 가장 작은 것)와
+/// Flate 로 압축한다. 예측이 도움이 안 되면(더 크면) 예측자 없는 Flate 로 둔다
+fn predicted(mut dict: Dictionary, samples: Vec<u8>, n: usize) -> Stream {
+    use std::io::Write;
+    let width = dict
+        .get(b"Width")
+        .ok()
+        .and_then(|o| o.as_i64().ok())
+        .filter(|&w| w > 0)
+        .map(|w| w as usize);
+    let (Some(w), true) = (width, (1..=32).contains(&n)) else {
+        return Stream::new(dict, samples);
+    };
+    let row = w * n;
+    if row == 0 || !samples.len().is_multiple_of(row) {
+        return Stream::new(dict, samples);
+    }
+    let paeth = |a: u8, b: u8, c: u8| {
+        let p = i16::from(a) + i16::from(b) - i16::from(c);
+        let (pa, pb, pc) = (
+            (p - i16::from(a)).abs(),
+            (p - i16::from(b)).abs(),
+            (p - i16::from(c)).abs(),
+        );
+        if pa <= pb && pa <= pc {
+            a
+        } else if pb <= pc {
+            b
+        } else {
+            c
+        }
+    };
+    let mut out = Vec::with_capacity(samples.len() + samples.len() / row);
+    let zero = vec![0u8; row];
+    let mut cand = vec![0u8; row];
+    for (y, cur) in samples.chunks(row).enumerate() {
+        let prev = if y == 0 {
+            &zero[..]
+        } else {
+            &samples[(y - 1) * row..y * row]
+        };
+        let mut best: Option<(u64, u8, Vec<u8>)> = None;
+        for f in 0u8..5 {
+            for i in 0..row {
+                let a = if i >= n { cur[i - n] } else { 0 };
+                let b = prev[i];
+                let c = if i >= n { prev[i - n] } else { 0 };
+                let pred = match f {
+                    0 => 0,
+                    1 => a,
+                    2 => b,
+                    3 => ((u16::from(a) + u16::from(b)) / 2) as u8,
+                    _ => paeth(a, b, c),
+                };
+                cand[i] = cur[i].wrapping_sub(pred);
+            }
+            let cost: u64 = cand
+                .iter()
+                .map(|&v| u64::from((v as i8).unsigned_abs()))
+                .sum();
+            if best.as_ref().is_none_or(|(bc, _, _)| cost < *bc) {
+                best = Some((cost, f, cand.clone()));
+            }
+        }
+        let (_, f, data) = best.expect("필터 후보");
+        out.push(f);
+        out.extend(data);
+    }
+    let z = |d: &[u8]| {
+        let mut e = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        e.write_all(d).ok();
+        e.finish().unwrap_or_default()
+    };
+    let (pz, plain) = (z(&out), z(&samples));
+    if pz.len() >= plain.len() {
+        return Stream::new(dict, samples);
+    }
+    dict.set("Filter", Object::Name(b"FlateDecode".to_vec()));
+    let mut p = Dictionary::new();
+    p.set("Predictor", Object::Integer(15));
+    p.set("Colors", Object::Integer(n as i64));
+    p.set("BitsPerComponent", Object::Integer(8));
+    p.set("Columns", Object::Integer(w as i64));
+    dict.set("DecodeParms", Object::Dictionary(p));
+    Stream::new(dict, pz).with_compression(false)
 }
