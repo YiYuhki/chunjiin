@@ -265,6 +265,12 @@ fn fuzz_legacy() {
     );
     run("e.msg", 34, common::msg::contact_msg(), mutate_cfb);
     run(
+        "g.msg",
+        39,
+        common::msg::recurring_task_msg(),
+        mutate_recurrence,
+    );
+    run(
         "f.msg",
         35,
         common::msg::recurring_meeting_msg(),

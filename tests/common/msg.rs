@@ -277,10 +277,12 @@ pub fn recurring_meeting_msg() -> Vec<u8> {
     w32(&mut rec, d0311 + 840);
     w32(&mut rec, d0311 + 900);
     w32(&mut rec, d0311 + 600);
-    w16(&mut rec, 0x0001);
+    w16(&mut rec, 0x0001 | 0x0004 | 0x0008); // 제목, 알림 시간, 알림 켬
     w16(&mut rec, ansi.len() as u16 + 1);
     w16(&mut rec, ansi.len() as u16);
     rec.extend(ansi);
+    w32(&mut rec, 30); // 30분 전
+    w32(&mut rec, 1);
     w32(&mut rec, 0); // ReservedBlock1
     w32(&mut rec, 4); // ChangeHighlight
     w32(&mut rec, 0);
@@ -389,6 +391,64 @@ pub fn contact_msg() -> Vec<u8> {
             0x3701,
             &png_with_payload(),
         ),
+    ];
+    let refs: Vec<(&str, &[u8])> = e.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    cfb(&refs)
+}
+
+/// 반복 작업 (매주 화요일, 5회)
+pub fn recurring_task_msg() -> Vec<u8> {
+    let task = [
+        0x03, 0x20, 0x06, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
+    ];
+    let mut entries = Vec::new();
+    for (i, lid) in [0x8104u32, 0x8105, 0x8126, 0x8116].into_iter().enumerate() {
+        entries.extend(lid.to_le_bytes());
+        entries.extend(6u16.to_le_bytes());
+        entries.extend((i as u16).to_le_bytes());
+    }
+    // 2024-03-05 (화)
+    let d0305 = 222_567_840u32;
+    let mut rec = Vec::new();
+    for v in [0x3004u16, 0x3004, 0x200B, 1, 0] {
+        rec.extend(v.to_le_bytes());
+    }
+    for v in [
+        0u32,
+        1,
+        0,
+        0b0000_0100,
+        0x2022,
+        5,
+        1,
+        0,
+        0,
+        d0305,
+        d0305 + 4 * 7 * 1440,
+    ] {
+        rec.extend(v.to_le_bytes());
+    }
+    let day = |d: u32| u64::from(d) * 60 * 10_000_000; // 1601 기준 분 → FILETIME
+    let e: Vec<(String, Vec<u8>)> = vec![
+        (
+            "__properties_version1.0".into(),
+            props_stream(
+                32,
+                &[
+                    (0x8000, 0x0040, day(d0305)),
+                    (0x8001, 0x0040, day(d0305 + 1440)),
+                    (0x8002, 0x000B, 1),
+                ],
+            ),
+        ),
+        (
+            "__nameid_version1.0/__substg1.0_00020102".into(),
+            task.to_vec(),
+        ),
+        ("__nameid_version1.0/__substg1.0_00030102".into(), entries),
+        string_prop("", 0x001A, "IPM.Task"),
+        string_prop("", 0x0037, "주간 보고서 작성"),
+        binary_prop("", 0x8003, &rec),
     ];
     let refs: Vec<(&str, &[u8])> = e.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
     cfb(&refs)

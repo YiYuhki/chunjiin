@@ -47,6 +47,8 @@ pub struct Task {
     pub description: String,
     /// 알림 시각 (FILETIME)
     pub reminder: Option<u64>,
+    /// 반복 (날짜 단위)
+    pub recur: Option<Recur>,
 }
 
 #[derive(Default)]
@@ -130,11 +132,26 @@ pub struct Recur {
     exceptions: Vec<Exception>,
 }
 
+impl Exception {
+    /// 이 회차의 알림 (분 전). `master` 는 전체 일정의 알림
+    fn reminder(&self, master: Option<u32>) -> Option<u32> {
+        match self.reminder_set {
+            Some(false) => None,
+            Some(true) => Some(self.reminder_delta.or(master).unwrap_or(15)),
+            None => master.map(|m| self.reminder_delta.unwrap_or(m)),
+        }
+    }
+}
+
 /// 바뀐 회차
 pub struct Exception {
     start: i64,
     end: i64,
     original: i64,
+    /// 알림을 켜거나 끈 변경 (None 이면 전체 일정을 따름)
+    reminder_set: Option<bool>,
+    /// 알림 시간(분 전) 변경
+    reminder_delta: Option<u32>,
     subject: Option<String>,
     location: Option<String>,
 }
@@ -473,7 +490,16 @@ const MAX_INSTANCES: usize = 4096;
 
 impl Recur {
     /// PidLidAppointmentRecur. `ansi` 는 8비트 문자열 디코더
+    /// 작업의 반복 (PidLidTaskRecurrence: 일정 전용 부분이 없는 RecurrencePattern)
+    pub fn parse_task(b: &[u8]) -> Option<Recur> {
+        Recur::parse_inner(b, &|_| String::new(), false)
+    }
+
     pub fn parse(b: &[u8], ansi: &dyn Fn(&[u8]) -> String) -> Option<Recur> {
+        Recur::parse_inner(b, ansi, true)
+    }
+
+    fn parse_inner(b: &[u8], ansi: &dyn Fn(&[u8]) -> String, appointment: bool) -> Option<Recur> {
         let mut c = Cur { b, at: 0 };
         let (_reader, _writer) = (c.u16()?, c.u16()?);
         let recur_freq = c.u16()?;
@@ -548,6 +574,25 @@ impl Recur {
             0x2022 => (Some(occurrences).filter(|&n| n > 0), None),
             _ => (None, None),
         };
+        let month = civil(start_date).map_or(1, |(_, m, ..)| m as u32);
+        if !appointment {
+            return Some(Recur {
+                freq,
+                interval,
+                days,
+                nth,
+                month_day,
+                month,
+                count,
+                until,
+                first_dow,
+                start_date,
+                start_offset: 0,
+                end_offset: 0,
+                deleted,
+                exceptions: Vec::new(),
+            });
+        }
         // AppointmentRecurrencePattern 나머지
         let _reader2 = c.u32()?;
         let writer2 = c.u32()?;
@@ -566,6 +611,8 @@ impl Recur {
                 start: i64::from(start),
                 end: i64::from(end),
                 original: i64::from(original),
+                reminder_set: None,
+                reminder_delta: None,
                 subject: None,
                 location: None,
             };
@@ -577,10 +624,14 @@ impl Recur {
             if f & 0x0001 != 0 {
                 e.subject = Some(text(&mut c)?);
             }
-            for bit in [0x0002u16, 0x0004, 0x0008] {
-                if f & bit != 0 {
-                    c.u32()?;
-                }
+            if f & 0x0002 != 0 {
+                c.u32()?; // MeetingType
+            }
+            if f & 0x0004 != 0 {
+                e.reminder_delta = Some(c.u32()?.min(60 * 24 * 365));
+            }
+            if f & 0x0008 != 0 {
+                e.reminder_set = Some(c.u32()? != 0);
             }
             if f & 0x0010 != 0 {
                 e.location = Some(text(&mut c)?);
@@ -625,7 +676,6 @@ impl Recur {
             }
             Some(())
         })();
-        let month = civil(start_date).map_or(1, |(_, m, ..)| m as u32);
         Some(Recur {
             freq,
             interval,
@@ -826,10 +876,14 @@ fn uid(parts: &[&str]) -> String {
     format!("{hex}@cdr")
 }
 
-/// 알림 문구 (화면 표시 알림에는 설명이 있어야 한다)
-fn alarm_text(o: &mut String, summary: &str) {
+/// 화면 표시 알림 (설명이 있어야 한다)
+fn display_alarm(o: &mut String, trigger: &str, summary: &str) {
+    fold("BEGIN:VALARM", o);
+    fold("ACTION:DISPLAY", o);
+    fold(trigger, o);
     let text = clean(summary).unwrap_or_else(|| "Reminder".into());
     prop(o, "DESCRIPTION", Some(&text));
+    fold("END:VALARM", o);
 }
 
 /// 본문 설명은 너무 길면 자른다
@@ -927,6 +981,40 @@ impl Event {
         (!v.is_empty()).then(|| v.join(", "))
     }
 
+    /// 주최자·참석자
+    fn participants(&self, o: &mut String) {
+        if let Some(addr) = self.organizer_email.as_deref().and_then(mail_addr) {
+            let cn = self
+                .organizer
+                .as_deref()
+                .and_then(param_text)
+                .map(|n| format!(";CN=\"{n}\""))
+                .unwrap_or_default();
+            fold(&format!("ORGANIZER{cn}:mailto:{addr}"), o);
+        }
+        for a in &self.attendee_list {
+            let Some(addr) = a.email.as_deref().and_then(mail_addr) else {
+                continue;
+            };
+            let mut p = String::new();
+            if let Some(n) = a.name.as_deref().and_then(param_text) {
+                p += &format!(";CN=\"{n}\"");
+            }
+            p += match a.kind {
+                2 => ";ROLE=OPT-PARTICIPANT",
+                3 => ";CUTYPE=RESOURCE;ROLE=NON-PARTICIPANT",
+                _ => ";ROLE=REQ-PARTICIPANT",
+            };
+            p += match a.status {
+                2 => ";PARTSTAT=TENTATIVE",
+                3 => ";PARTSTAT=ACCEPTED",
+                4 => ";PARTSTAT=DECLINED",
+                _ => ";PARTSTAT=NEEDS-ACTION",
+            };
+            fold(&format!("ATTENDEE{p}:mailto:{addr}"), o);
+        }
+    }
+
     fn ics(&self, stamp: Option<u64>) -> Option<String> {
         let (zone, start, end) = self.times()?;
         let mut o = String::new();
@@ -1003,42 +1091,9 @@ impl Event {
                 &mut o,
             );
         }
-        if let Some(addr) = self.organizer_email.as_deref().and_then(mail_addr) {
-            let cn = self
-                .organizer
-                .as_deref()
-                .and_then(param_text)
-                .map(|n| format!(";CN=\"{n}\""))
-                .unwrap_or_default();
-            fold(&format!("ORGANIZER{cn}:mailto:{addr}"), &mut o);
-        }
-        for a in &self.attendee_list {
-            let Some(addr) = a.email.as_deref().and_then(mail_addr) else {
-                continue;
-            };
-            let mut p = String::new();
-            if let Some(n) = a.name.as_deref().and_then(param_text) {
-                p += &format!(";CN=\"{n}\"");
-            }
-            p += match a.kind {
-                2 => ";ROLE=OPT-PARTICIPANT",
-                3 => ";CUTYPE=RESOURCE;ROLE=NON-PARTICIPANT",
-                _ => ";ROLE=REQ-PARTICIPANT",
-            };
-            p += match a.status {
-                2 => ";PARTSTAT=TENTATIVE",
-                3 => ";PARTSTAT=ACCEPTED",
-                4 => ";PARTSTAT=DECLINED",
-                _ => ";PARTSTAT=NEEDS-ACTION",
-            };
-            fold(&format!("ATTENDEE{p}:mailto:{addr}"), &mut o);
-        }
+        self.participants(&mut o);
         if let Some(m) = self.reminder {
-            fold("BEGIN:VALARM", &mut o);
-            fold("ACTION:DISPLAY", &mut o);
-            fold(&format!("TRIGGER:-PT{m}M"), &mut o);
-            alarm_text(&mut o, &self.summary);
-            fold("END:VALARM", &mut o);
+            display_alarm(&mut o, &format!("TRIGGER:-PT{m}M"), &self.summary);
         }
         fold("END:VEVENT", &mut o);
 
@@ -1078,6 +1133,12 @@ impl Event {
                     "LOCATION",
                     e.location.as_deref().or(self.location.as_deref()),
                 );
+                prop(&mut o, "DESCRIPTION", Some(&description(&self.description)));
+                self.participants(&mut o);
+                if let Some(m) = e.reminder(self.reminder) {
+                    let subject = e.subject.as_deref().unwrap_or(&self.summary);
+                    display_alarm(&mut o, &format!("TRIGGER:-PT{m}M"), subject);
+                }
                 fold("END:VEVENT", &mut o);
             }
         }
@@ -1115,6 +1176,7 @@ impl Item {
                 add("시작", t.start.and_then(utc));
                 add("기한", t.due.and_then(utc));
                 add("진행률", t.percent.map(|p| format!("{:.0}%", p * 100.0)));
+                add("반복", t.recur.as_ref().map(Recur::describe));
                 add("알림", t.reminder.and_then(utc));
             }
             Item::Contact(c) => {
@@ -1160,8 +1222,33 @@ impl Item {
                 if stamp.or(t.start).or(t.due).is_none() {
                     fold("DTSTAMP:19700101T000000Z", &mut o);
                 }
-                utc_prop(&mut o, "DTSTART", t.start);
-                utc_prop(&mut o, "DUE", t.due);
+                match &t.recur {
+                    // 반복 작업은 날짜로 (RRULE 에는 DTSTART 가 있어야 하고, DUE 도 같은 형식)
+                    Some(r) => {
+                        let date = |ft: u64| ical_date(ft_minutes(ft));
+                        let start = t.start.and_then(date).or_else(|| ical_date(r.start_date));
+                        if let Some(d) = &start {
+                            fold(&format!("DTSTART;VALUE=DATE:{d}"), &mut o);
+                        }
+                        if let Some(d) = t
+                            .due
+                            .and_then(date)
+                            .filter(|d| start.as_ref().is_none_or(|s| d >= s))
+                        {
+                            fold(&format!("DUE;VALUE=DATE:{d}"), &mut o);
+                        }
+                        if start.is_some() {
+                            fold(
+                                &format!("RRULE:{}", r.rrule(r.until.and_then(ical_date))),
+                                &mut o,
+                            );
+                        }
+                    }
+                    None => {
+                        utc_prop(&mut o, "DTSTART", t.start);
+                        utc_prop(&mut o, "DUE", t.due);
+                    }
+                }
                 prop(&mut o, "SUMMARY", Some(&t.summary));
                 if let Some(p) = t.percent.filter(|p| p.is_finite()) {
                     fold(
@@ -1171,11 +1258,7 @@ impl Item {
                 }
                 prop(&mut o, "DESCRIPTION", Some(&description(&t.description)));
                 if let Some(at) = t.reminder.and_then(|r| ical_dt(ft_minutes(r), true)) {
-                    fold("BEGIN:VALARM", &mut o);
-                    fold("ACTION:DISPLAY", &mut o);
-                    fold(&format!("TRIGGER;VALUE=DATE-TIME:{at}"), &mut o);
-                    alarm_text(&mut o, &t.summary);
-                    fold("END:VALARM", &mut o);
+                    display_alarm(&mut o, &format!("TRIGGER;VALUE=DATE-TIME:{at}"), &t.summary);
                 }
                 fold("END:VTODO", &mut o);
                 fold("END:VCALENDAR", &mut o);

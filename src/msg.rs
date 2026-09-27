@@ -718,6 +718,12 @@ fn item(
             reminder: reminder_set
                 .then(|| r.named_u64(p, PSETID_COMMON, 0x8502))
                 .flatten(),
+            // PidLidTaskFRecurring + PidLidTaskRecurrence
+            recur: r
+                .named_u32(p, PSETID_TASK, 0x8126)
+                .filter(|v| v & 0xFF != 0)
+                .and_then(|_| r.named_binary(p, PSETID_TASK, 0x8116))
+                .and_then(|b| Recur::parse_task(&b)),
         }));
     }
     if class.starts_with("IPM.CONTACT") {

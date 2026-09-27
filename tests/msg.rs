@@ -2,7 +2,8 @@ mod common;
 
 use cdr::{Engine, Status};
 use common::msg::{
-    appointment_msg, contact_msg, malicious_msg, recurring_meeting_msg, rtf_bomb_msg, rtf_html_msg,
+    appointment_msg, contact_msg, malicious_msg, recurring_meeting_msg, recurring_task_msg,
+    rtf_bomb_msg, rtf_html_msg,
 };
 use mail_parser::MimeHeaders;
 
@@ -252,6 +253,8 @@ fn recurring_meeting_keeps_timezone_recurrence_and_attendees() {
         // 지운 회차만 제외하고, 옮긴 회차는 따로 쓴다
         format!("EXDATE;{tz}:20240306T100000\r\n"),
         format!("RECURRENCE-ID;{tz}:20240311T100000\r\nDTSTART;{tz}:20240311T140000\r\nDTEND;{tz}:20240311T150000\r\nSUMMARY:주간 회의(변경)"),
+        // 바뀐 회차는 알림을 30분 전으로
+        "TRIGGER:-PT30M\r\nDESCRIPTION:주간 회의(변경)\r\nEND:VALARM".into(),
         "ORGANIZER;CN=\"김철수\":mailto:kim@example.com".into(),
         "ATTENDEE;CN=\"이영희\";ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:lee@example.com".into(),
         "ATTENDEE;CN=\"Park, Minsu\";ROLE=OPT-PARTICIPANT;PARTSTAT=DECLINED:mailto:park@example.com".into(),
@@ -261,8 +264,8 @@ fn recurring_meeting_keeps_timezone_recurrence_and_attendees() {
     ] {
         assert!(ics.contains(&want), "{want}\n{ics}");
     }
-    // 주최자 자신은 참석자로 넣지 않는다
-    assert_eq!(ics.matches("ATTENDEE").count(), 3, "{ics}");
+    // 주최자 자신은 참석자로 넣지 않는다 (전체 일정·바뀐 회차에 각각 3명)
+    assert_eq!(ics.matches("ATTENDEE").count(), 6, "{ics}");
     // 헤더의 숨은 참조(자원)는 메일 헤더에 나오지 않는다
     assert!(!String::from_utf8_lossy(&out).contains("Bcc"));
 
@@ -303,5 +306,31 @@ fn contact_photo_is_reencoded_into_vcard() {
     image::load_from_memory(&png).expect("재인코딩된 사진");
     assert!(vcf.contains("ORG:예시\\, 주식회사;"));
     let again = Engine::default().process(&out, "김철수.eml");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
+
+#[test]
+fn recurring_task_keeps_rrule() {
+    let r = Engine::default().process(&recurring_task_msg(), "작업.msg");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let out = r.output.clone().unwrap();
+    let m = parse(&out);
+    let body = m.body_text(0).unwrap();
+    assert!(body.contains("반복: 매주 화요일, 5회"), "{body}");
+    let ics = attachment_text(&m, "task.ics");
+    for want in [
+        "DTSTART;VALUE=DATE:20240305",
+        "DUE;VALUE=DATE:20240306",
+        "RRULE:FREQ=WEEKLY;BYDAY=TU;COUNT=5;WKST=MO",
+    ] {
+        assert!(ics.contains(want), "{want}\n{ics}");
+    }
+    let again = Engine::default().process(ics.as_bytes(), "task.ics");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
