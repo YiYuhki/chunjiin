@@ -143,6 +143,7 @@ impl Engine {
             FileType::Zip => archive::reassemble(self, self.depth, data, findings),
             FileType::Rtf => rtf::reassemble(data, &self.policy, findings),
             FileType::Eml => mail::reassemble(self, self.depth, data, findings),
+            FileType::Msg => crate::msg::reassemble(self, self.depth, data, findings),
             FileType::Png | FileType::Jpeg | FileType::Gif | FileType::Bmp => {
                 if !self.policy.allow_images {
                     return Err(CdrError::Blocked {
@@ -199,6 +200,8 @@ impl Engine {
         // 텍스트는 내용만으로 판별되지 않으므로 같은 형식으로 다시 해석한다
         let out_type = match ftype {
             FileType::Text | FileType::Csv | FileType::Tsv | FileType::Eml | FileType::Svg => ftype,
+            // 결과는 EML (내용만으로는 메일로 판별하지 않는다)
+            FileType::Msg => FileType::Eml,
             _ => detect::detect(output),
         };
         if out_type != ftype.output_type() {
@@ -242,7 +245,7 @@ fn ole_reason(data: &[u8]) -> String {
     if detect::find(data, &utf16("EncryptedPackage")).is_some() {
         "암호화된 Office 문서는 검사할 수 없어 차단합니다".into()
     } else {
-        "지원하지 않는 OLE 복합 문서(Outlook 메시지 등)라 차단합니다".into()
+        "지원하지 않는 OLE 복합 문서라 차단합니다".into()
     }
 }
 

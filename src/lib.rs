@@ -16,6 +16,7 @@ pub mod imaging;
 pub mod legacy;
 pub mod mail;
 pub mod metafile;
+pub mod msg;
 pub mod ooxml;
 pub mod pdf;
 pub mod policy;

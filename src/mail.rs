@@ -84,13 +84,40 @@ struct Attachment {
     data: Vec<u8>,
 }
 
+/// 형식(EML·MSG)에서 꺼낸 정제 전 메일 내용
+#[derive(Default)]
+pub(crate) struct RawMail<'a> {
+    /// 옮길 헤더 (KEEP_HEADERS 이름, 전송용으로 인코딩된 값. 제목은 디코딩한 값)
+    pub headers: Vec<(String, String)>,
+    pub texts: Vec<String>,
+    pub htmls: Vec<String>,
+    pub attachments: Vec<RawAttachment<'a>>,
+    /// 형식 단계에서 이미 뺀 첨부 (이름, 사유)
+    pub removed: Vec<(String, String)>,
+}
+
+pub(crate) struct RawAttachment<'a> {
+    pub name: String,
+    pub content_id: Option<String>,
+    /// 본문 안에 표시하는 첨부로 표시되었는지 (cid 이미지 판단에 씀)
+    pub inline_hint: bool,
+    /// S/MIME 분리 서명 (재조합하면 맞지 않으므로 뺀다)
+    pub signature: bool,
+    pub data: Cow<'a, [u8]>,
+}
+
 pub fn reassemble(
     engine: &Engine,
     depth: usize,
     data: &[u8],
     findings: &mut Findings,
 ) -> Result<Vec<u8>> {
-    let policy = &engine.policy;
+    let raw = parse(data, findings)?;
+    rebuild(engine, depth, raw, findings)
+}
+
+/// MIME 메일을 해석해 정제 전 내용을 꺼낸다
+pub(crate) fn parse(data: &[u8], findings: &mut Findings) -> Result<RawMail<'static>> {
     let Some(msg) = MessageParser::default().parse(data) else {
         return blocked("structure", "메일 형식을 해석할 수 없음");
     };
@@ -101,8 +128,9 @@ pub fn reassemble(
         );
     }
 
+    let mut raw = RawMail::default();
     // 헤더
-    let mut headers = Vec::new();
+    let headers = &mut raw.headers;
     let mut dropped_headers = 0u64;
     for (name, value) in msg.headers_raw() {
         match KEEP_HEADERS.iter().find(|k| k.eq_ignore_ascii_case(name)) {
@@ -124,16 +152,14 @@ pub fn reassemble(
     }
 
     // 본문
-    let mut texts = Vec::new();
     for id in &msg.text_body {
         if let Some(PartType::Text(t)) = msg.parts.get(*id as usize).map(|p| &p.body) {
-            texts.push(crate::text::strip_controls(t, findings));
+            raw.texts.push(t.to_string());
         }
     }
-    let mut htmls = Vec::new();
     for id in &msg.html_body {
         if let Some(PartType::Html(h)) = msg.parts.get(*id as usize).map(|p| &p.body) {
-            htmls.push(sanitize_html(h, policy, findings));
+            raw.htmls.push(h.to_string());
         }
     }
 
@@ -144,9 +170,6 @@ pub fn reassemble(
         .chain(&msg.html_body)
         .copied()
         .collect();
-    let mut attachments = Vec::new();
-    let mut removed = Vec::new();
-    let mut expanded: u64 = 0;
     for (i, id) in msg.attachments.iter().enumerate() {
         if body_ids.contains(id) {
             continue;
@@ -170,11 +193,11 @@ pub fn reassemble(
         if part.attachment_name().is_none() {
             match &part.body {
                 PartType::Text(t) => {
-                    texts.push(crate::text::strip_controls(t, findings));
+                    raw.texts.push(t.to_string());
                     continue;
                 }
                 PartType::Html(h) => {
-                    htmls.push(sanitize_html(h, policy, findings));
+                    raw.htmls.push(h.to_string());
                     continue;
                 }
                 _ => {}
@@ -185,9 +208,58 @@ pub fn reassemble(
             .map(crate::text::strip_spoofing)
             .filter(|n| !n.trim().is_empty())
             .unwrap_or(default_name);
+        let signature = part.content_type().is_some_and(|ct| {
+            ct.c_type.eq_ignore_ascii_case("application")
+                && ct.subtype().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("pkcs7-signature")
+                        || s.eq_ignore_ascii_case("x-pkcs7-signature")
+                })
+        });
+        raw.attachments.push(RawAttachment {
+            name,
+            content_id: part.content_id().map(str::to_string),
+            inline_hint: part.content_disposition().is_none_or(|d| d.is_inline()),
+            signature,
+            data: Cow::Owned(bytes.into_owned()),
+        });
+    }
+    Ok(raw)
+}
+
+/// 꺼낸 메일 내용을 정제하고 첨부를 하나씩 재조합해 새 MIME 메일로 쓴다
+pub(crate) fn rebuild(
+    engine: &Engine,
+    depth: usize,
+    raw: RawMail,
+    findings: &mut Findings,
+) -> Result<Vec<u8>> {
+    let policy = &engine.policy;
+    let headers = raw.headers;
+    let mut texts: Vec<String> = raw
+        .texts
+        .iter()
+        .map(|t| crate::text::strip_controls(t, findings))
+        .collect();
+    let mut htmls: Vec<String> = raw
+        .htmls
+        .iter()
+        .map(|h| sanitize_html(h, policy, findings))
+        .collect();
+    let mut attachments = Vec::new();
+    let mut removed = raw.removed;
+    let mut expanded: u64 = 0;
+    let mut signatures = 0u64;
+    for a in raw.attachments {
+        if a.signature {
+            signatures += 1;
+            continue;
+        }
+        let bytes = a.data;
+        let name = crate::text::strip_spoofing(&a.name);
         let name = name
             .rsplit(['/', '\\'])
             .next()
+            .filter(|n| !n.is_empty())
             .unwrap_or("attachment")
             .to_string();
 
@@ -242,18 +314,25 @@ pub fn reassemble(
             continue;
         };
         let content_type = mime_for(&out_name).to_string();
-        let content_id = part
-            .content_id()
-            .map(|c| clean_header(c).trim_matches(['<', '>']).to_string());
+        let content_id = a
+            .content_id
+            .map(|c| clean_header(&c).trim_matches(['<', '>']).to_string())
+            .filter(|c| !c.is_empty());
         attachments.push(Attachment {
-            inline: content_id.is_some()
-                && content_type.starts_with("image/")
-                && part.content_disposition().is_none_or(|d| d.is_inline()),
+            inline: content_id.is_some() && content_type.starts_with("image/") && a.inline_hint,
             name: out_name,
             content_type,
             content_id,
             data: output,
         });
+    }
+    if signatures > 0 {
+        findings.add(
+            "signature",
+            Severity::Low,
+            "전자서명(S/MIME) 제거 - 재조합한 메일에는 원래 서명이 맞지 않음",
+            "",
+        );
     }
     findings.count("mail_attachments", attachments.len() as u64);
     findings.count("unpacked_bytes", expanded);
@@ -285,12 +364,49 @@ pub fn reassemble(
     Ok(build(&headers, &texts, &htmls, &attachments))
 }
 
-fn is_container(data: &[u8]) -> bool {
+/// 정제하지 않은 메일 내용을 그대로 MIME 으로 쓴다 (.msg 의 내장 메시지를 첨부로 실을 때.
+/// 첨부가 된 메일은 다시 [`rebuild`] 로 정제된다)
+pub(crate) fn serialize_raw(raw: RawMail) -> Vec<u8> {
+    let mut texts = raw.texts;
+    if !raw.removed.is_empty() {
+        let list: Vec<String> = raw
+            .removed
+            .iter()
+            .map(|(n, r)| format!("- {n}: {r}"))
+            .collect();
+        texts.push(format!(
+            "[문서 보안] 보안 정책에 따라 다음 첨부 파일을 제거했습니다.\n{}\n",
+            list.join("\n")
+        ));
+    }
+    let attachments: Vec<Attachment> = raw
+        .attachments
+        .into_iter()
+        .filter(|a| !a.signature)
+        .map(|a| {
+            let content_type = mime_for(&a.name).to_string();
+            let content_id = a
+                .content_id
+                .map(|c| clean_header(&c).trim_matches(['<', '>']).to_string())
+                .filter(|c| !c.is_empty());
+            Attachment {
+                inline: content_id.is_some() && a.inline_hint,
+                name: crate::text::strip_spoofing(&a.name),
+                content_type,
+                content_id,
+                data: a.data.into_owned(),
+            }
+        })
+        .collect();
+    build(&raw.headers, &texts, &raw.htmls, &attachments)
+}
+
+pub(crate) fn is_container(data: &[u8]) -> bool {
     matches!(crate::detect::detect(data), crate::detect::FileType::Zip) || looks_like_mail(data)
 }
 
 /// 헤더 값: 줄 접기를 풀고 제어 문자를 뺀다 (헤더 주입 방지)
-fn clean_header(v: &str) -> String {
+pub(crate) fn clean_header(v: &str) -> String {
     let unfolded: String = v
         .chars()
         .map(|c| {
@@ -316,13 +432,13 @@ fn sanitize_html(html: &str, policy: &Policy, findings: &mut Findings) -> String
         "<embed",
         "<form",
         "<applet",
-        "<meta http-equiv",
         "<base",
     ]
     .iter()
     .filter(|p| lower.contains(*p))
     .count()
-        + event_handlers(&lower);
+        + event_handlers(&lower)
+        + meta_refresh(&lower);
     let remote = lower.matches("src=\"http").count()
         + lower.matches("src='http").count()
         + lower.matches("src=http").count();
@@ -398,6 +514,17 @@ fn sanitize_html(html: &str, policy: &Policy, findings: &mut Findings) -> String
     clean
 }
 
+/// 문자 집합 선언(`http-equiv="Content-Type"`) 이 아닌 `<meta http-equiv>` (refresh 등)
+fn meta_refresh(lower: &str) -> usize {
+    lower
+        .match_indices("<meta http-equiv")
+        .any(|(i, m)| {
+            let rest = lower[i + m.len()..].trim_start_matches([' ', '=', '"', '\'']);
+            !rest.starts_with("content-type")
+        })
+        .into()
+}
+
 fn event_handlers(lower: &str) -> usize {
     let b = lower.as_bytes();
     (0..b.len().saturating_sub(3))
@@ -459,7 +586,7 @@ fn mime_for(name: &str) -> &'static str {
 }
 
 /// RFC 2047/2231: 비ASCII 이름은 UTF-8 로 인코딩한다
-fn encoded_word(s: &str) -> String {
+pub(crate) fn encoded_word(s: &str) -> String {
     if s.is_ascii() && !s.contains(['"', '\\']) {
         s.to_string()
     } else {

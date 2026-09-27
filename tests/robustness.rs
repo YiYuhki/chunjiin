@@ -220,6 +220,8 @@ fn fuzz_pdf() {
 #[test]
 fn fuzz_legacy() {
     run("a.hwp", 7, legacy::malicious_hwp(1 | 8), mutate_cfb);
+    run("a.msg", 28, common::msg::malicious_msg(), mutate_cfb);
+    run("b.msg", 29, common::msg::rtf_html_msg(), mutate_cfb);
     run("b.hwp", 8, legacy::malicious_hwp(0), mutate_cfb);
     run("a.doc", 9, legacy::malicious_doc(1 << 9), mutate_cfb);
     // 기본 정책은 임베디드 OLE 가 있으면 차단하므로, 대체 모드로 BIFF 해석까지 도달시킨다

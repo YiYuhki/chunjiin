@@ -3,6 +3,7 @@
 
 pub mod legacy;
 pub mod metafile;
+pub mod msg;
 
 use std::io::{Cursor, Read, Write};
 

@@ -20,6 +20,8 @@ pub enum Kind {
     Doc,
     Xls,
     Ppt,
+    /// Outlook 메시지
+    Msg,
     /// 암호화된 OOXML (EncryptedPackage)
     EncryptedOoxml,
     Other,
@@ -40,6 +42,8 @@ pub fn classify(data: &[u8]) -> Kind {
         Kind::Xls
     } else if has("/PowerPoint Document") {
         Kind::Ppt
+    } else if crate::msg::is_msg(&cf) {
+        Kind::Msg
     } else {
         Kind::Other
     }

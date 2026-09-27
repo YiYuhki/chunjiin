@@ -25,6 +25,8 @@ pub enum FileType {
     Rtf,
     /// 전자우편 (RFC 5322/MIME, .eml)
     Eml,
+    /// Outlook 메시지 (EML 로 재조합)
+    Msg,
     /// 단독 이미지 파일
     Png,
     Jpeg,
@@ -58,6 +60,7 @@ impl FileType {
             FileType::Zip => "zip",
             FileType::Rtf => "rtf",
             FileType::Eml => "eml",
+            FileType::Msg => "msg",
             FileType::Png => "png",
             FileType::Jpeg => "jpeg",
             FileType::Gif => "gif",
@@ -77,6 +80,7 @@ impl FileType {
     pub fn output_type(self) -> FileType {
         match self {
             FileType::Bmp => FileType::Png,
+            FileType::Msg => FileType::Eml,
             t => t,
         }
     }
@@ -94,7 +98,7 @@ impl FileType {
             FileType::Ppt => Some("ppt"),
             FileType::Zip => Some("zip"),
             FileType::Rtf => Some("rtf"),
-            FileType::Eml => Some("eml"),
+            FileType::Eml | FileType::Msg => Some("eml"),
             FileType::Png | FileType::Bmp => Some("png"),
             FileType::Jpeg => Some("jpg"),
             FileType::Gif => Some("gif"),
@@ -117,12 +121,11 @@ impl FileType {
             FileType::Doc => &["doc", "dot"],
             FileType::Xls => &["xls", "xlt", "xla"],
             FileType::Ppt => &["ppt", "pot", "pps"],
-            FileType::Ole => &[
-                "doc", "dot", "xls", "xlt", "ppt", "pot", "pps", "hwp", "msg",
-            ],
+            FileType::Ole => &["doc", "dot", "xls", "xlt", "ppt", "pot", "pps", "hwp"],
             FileType::Zip => &["zip"],
             FileType::Rtf => &["rtf"],
             FileType::Eml => &["eml"],
+            FileType::Msg => &["msg"],
             FileType::Png => &["png"],
             FileType::Jpeg => &["jpg", "jpeg", "jpe", "jfif"],
             FileType::Gif => &["gif"],
@@ -189,6 +192,7 @@ pub fn detect(data: &[u8]) -> FileType {
             Kind::Doc => FileType::Doc,
             Kind::Xls => FileType::Xls,
             Kind::Ppt => FileType::Ppt,
+            Kind::Msg => FileType::Msg,
             Kind::EncryptedOoxml | Kind::Other => FileType::Ole,
         };
     }
