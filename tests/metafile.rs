@@ -272,3 +272,25 @@ fn wmf_object_flood_is_linear() {
     assert!(started.elapsed().as_secs() < 20, "{:?}", started.elapsed());
     assert_eq!(wmf_functions(r.output.as_ref().unwrap()).len(), 65535 + 1);
 }
+
+#[test]
+fn emf_plus_records_are_validated_and_kept() {
+    let r = Engine::default().process(&dual_emf(0), "a.emf");
+    assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
+    let out = r.output.clone().unwrap();
+    assert!(contains(&out, b"EMF+"), "EMF+ 유지");
+    assert!(!contains(&out, PAYLOAD), "EMF+ 주석은 옮기지 않음");
+    // 머리글·브러시·FillRects
+    assert_eq!(r.stats.get("emf_plus_records"), Some(&3), "{:?}", r.stats);
+    let again = Engine::default().process(&out, "a.emf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+    assert_eq!(again.output.as_deref(), Some(out.as_slice()), "고정점");
+
+    // 없는 브러시를 가리키면 EMF+ 를 모두 빼고 GDI 로만 그린다
+    let r = Engine::default().process(&dual_emf(9), "b.emf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let out = r.output.clone().unwrap();
+    assert!(!contains(&out, b"EMF+"));
+    assert!(!emf_record(&out, 43).is_empty(), "GDI 사각형은 유지");
+    assert!(!severities(&r, "metafile").is_empty(), "{:#?}", r.findings);
+}

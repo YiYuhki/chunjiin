@@ -8,10 +8,12 @@
 //! - 좌표 배열 레코드는 개수와 레코드 크기가 맞는지 확인하고 선언된 만큼만 옮긴다
 //! - 개체 번호(핸들)는 머리글의 개체 표 범위 안이어야 한다
 //! - 비트맵은 헤더·색상표·화소 크기를 검증해 정규형 DIB 로 다시 쓰고, 압축(RLE/JPEG/PNG)은 풀어서 쓴다
-//! - 주석(EMF+ 포함)·이스케이프·색 프로필·OpenGL·미지원 레코드는 옮기지 않는다
+//! - EMF+ 레코드는 개체·좌표·경로·영역·비트맵을 검증해 옮기고, 하나라도 옮길 수 없으면 EMF+ 전체를 뺀다
+//! - 일반 주석·이스케이프·색 프로필·OpenGL·미지원 레코드는 옮기지 않는다
 
 mod dib;
 mod emf;
+mod emfplus;
 mod wmf;
 
 use crate::error::Result;
@@ -63,6 +65,8 @@ pub struct Stats {
     pub bitmaps: u64,
     /// GDI 레코드 없이 EMF+ 로만 그려진 그림 (EMF+ 를 버리면 비어 보일 수 있음)
     pub emf_plus_only: u64,
+    /// 검증해 옮긴 EMF+ 레코드
+    pub emf_plus_records: u64,
 }
 
 impl Stats {
@@ -73,6 +77,7 @@ impl Stats {
         self.invalid += o.invalid;
         self.bitmaps += o.bitmaps;
         self.emf_plus_only += o.emf_plus_only;
+        self.emf_plus_records += o.emf_plus_records;
     }
 
     pub fn report(&self, findings: &mut Findings, location: &str) {
@@ -80,6 +85,9 @@ impl Stats {
             return;
         }
         findings.count("metafiles_rebuilt", self.metafiles);
+        if self.emf_plus_records > 0 {
+            findings.count("emf_plus_records", self.emf_plus_records);
+        }
         if self.invalid > 0 {
             findings.add(
                 "metafile",
@@ -107,7 +115,7 @@ impl Stats {
                 "metafile",
                 Severity::Low,
                 format!(
-                    "EMF+ 전용 그림 {}개: EMF+ 레코드를 옮기지 않아 비어 보일 수 있음",
+                    "EMF+ 전용 그림 {}개: 검증할 수 없는 EMF+ 레코드가 있어 EMF+ 를 옮기지 않았고 비어 보일 수 있음",
                     self.emf_plus_only
                 ),
                 location,

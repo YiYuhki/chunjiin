@@ -231,3 +231,67 @@ pub fn officeart_metafile_data(body: &[u8]) -> Vec<u8> {
     .unwrap();
     out
 }
+
+/// 머리글만 새로 붙인 EMF (설명 없음)
+pub fn emf_from(recs: &[Vec<u8>]) -> Vec<u8> {
+    let body: Vec<u8> = recs.concat();
+    let eof = emf_rec(14, &le32(&[0, 16, 20]));
+    let total = 108 + body.len() + eof.len();
+    let mut h = le32(&[1, 108, 0, 0, 100, 100, 0, 0, 2646, 2646]);
+    h.extend(0x464D_4520u32.to_le_bytes());
+    h.extend(0x0001_0000u32.to_le_bytes());
+    h.extend((total as u32).to_le_bytes());
+    h.extend(((recs.len() + 2) as u32).to_le_bytes());
+    h.extend(2u16.to_le_bytes());
+    h.extend(0u16.to_le_bytes());
+    h.extend(le32(&[0, 0, 0, 1024, 768, 320, 240, 0, 0, 0]));
+    h.extend(le32(&[320_000, 240_000]));
+    [h, body, eof].concat()
+}
+
+/// EMF+ 레코드 하나
+pub fn plus_rec(t: u16, flags: u16, data: &[u8]) -> Vec<u8> {
+    let padded = data.len().div_ceil(4) * 4;
+    let mut v = t.to_le_bytes().to_vec();
+    v.extend(flags.to_le_bytes());
+    v.extend(((12 + padded) as u32).to_le_bytes());
+    v.extend((data.len() as u32).to_le_bytes());
+    v.extend(data);
+    v.resize(12 + padded, 0);
+    v
+}
+
+/// EMF+ 레코드들을 담은 EMR_COMMENT
+pub fn plus_comment(recs: &[Vec<u8>]) -> Vec<u8> {
+    let data: Vec<u8> = recs.concat();
+    let mut c = ((data.len() + 4) as u32).to_le_bytes().to_vec();
+    c.extend(b"EMF+");
+    c.extend(data);
+    emf_rec(70, &c)
+}
+
+/// 이중(EMF+ + GDI) EMF. `brush` 는 FillRects 가 가리키는 브러시 번호 (0 이면 정상)
+pub fn dual_emf(brush: u32) -> Vec<u8> {
+    let ver = 0xDBC0_1002u32.to_le_bytes();
+    let mut header = ver.to_vec();
+    header.extend(le32(&[1, 96, 96]));
+    let mut solid = ver.to_vec();
+    solid.extend(le32(&[0, 0xFF00_00FFu32 as i32]));
+    let mut fill = brush.to_le_bytes().to_vec();
+    fill.extend(le32(&[1]));
+    fill.extend([0, 0, 0, 0, 50, 0, 50, 0]); // 압축 좌표 사각형
+    let mut comment = PAYLOAD.to_vec();
+    comment.extend(b"-in-EMF+-comment");
+    let plus = plus_comment(&[
+        plus_rec(0x4001, 1, &header),
+        plus_rec(0x4008, 0x0100, &solid),
+        plus_rec(0x400A, 0x4000, &fill),
+        plus_rec(0x4003, 0, &comment),
+    ]);
+    emf_from(&[
+        plus,
+        emf_rec(39, &le32(&[1, 0, 0x0000FF, 0])),
+        emf_rec(37, &le32(&[1])),
+        emf_rec(43, &le32(&[0, 0, 50, 50])),
+    ])
+}

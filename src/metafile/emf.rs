@@ -83,6 +83,29 @@ pub fn rebuild(
     out.extend(&micrometers);
     debug_assert_eq!(out.len(), HEADER_SIZE);
 
+    // 1차: EMF+ 를 모두 검증한다. 하나라도 옮길 수 없으면 EMF+ 전체를 뺀다
+    let mut plus_out: std::collections::VecDeque<Option<Vec<u8>>> = Default::default();
+    let plus_faithful = {
+        let mut plus = super::emfplus::PlusCtx::new(policy, budget);
+        let mut p = hsize;
+        while let (Some(t), Some(size)) = (rd::u32(data, p), rd::u32(data, p + 4)) {
+            let size = size as usize;
+            if size < 8 || !size.is_multiple_of(4) || size > data.len() - p || t == EMR_EOF {
+                break;
+            }
+            let rec = &data[p..p + size];
+            p += size;
+            if t == EMR_COMMENT && rd::u32(rec, 12) == Some(EMF_PLUS) {
+                let dsize = rd::u32(rec, 8).unwrap_or(0) as usize;
+                let body = rec.get(16..(12 + dsize).min(rec.len())).unwrap_or_default();
+                plus_out.push_back(plus.comment(body));
+            }
+        }
+        stats.emf_plus_records += plus.kept;
+        stats.bitmaps += plus.images;
+        plus.faithful && !plus_out.is_empty()
+    };
+
     let mut ctx = Ctx {
         policy,
         budget,
@@ -114,6 +137,17 @@ pub fn rebuild(
                     emf_plus_only = rd::u16(rec, 18).is_some_and(|f| f & 1 == 0);
                 }
                 emf_plus = true;
+                if let Some(Some(body)) = plus_out.pop_front().filter(|_| plus_faithful) {
+                    // EMR_COMMENT: 형식·크기·데이터 크기, "EMF+", 레코드들
+                    let dsize = body.len() + 4;
+                    out.extend(EMR_COMMENT.to_le_bytes());
+                    out.extend(((12 + dsize) as u32).to_le_bytes());
+                    out.extend((dsize as u32).to_le_bytes());
+                    out.extend(EMF_PLUS.to_le_bytes());
+                    out.extend(body);
+                    records += 1;
+                    continue;
+                }
             }
             stats.removed += 1;
             continue;
@@ -149,7 +183,7 @@ pub fn rebuild(
     out[48..52].copy_from_slice(&total.to_le_bytes());
     out[52..56].copy_from_slice(&records.to_le_bytes());
     stats.bitmaps += ctx.bitmaps;
-    if emf_plus && (emf_plus_only || !gdi_drawing) {
+    if emf_plus && !plus_faithful && (emf_plus_only || !gdi_drawing) {
         stats.emf_plus_only += 1;
     }
     Ok(out)
@@ -461,6 +495,14 @@ fn text(b: &[u8], unit: usize) -> Option<Vec<u8>> {
     let string = rd::slice(b, rec_at(off_string)?, chars.checked_mul(unit)?)?;
     let dx_len = chars * 4 * if options & PDY != 0 { 2 } else { 1 };
     let dx = rec_at(off_dx).and_then(|at| rd::slice(b, at, dx_len));
+    // 그래픽 모드는 GM_COMPATIBLE(1)·GM_ADVANCED(2)만, 배율은 유한한 실수만
+    if !matches!(rd::u32(b, 16)?, 1 | 2) {
+        return None;
+    }
+    let scale_ok = |at| rd::u32(b, at).is_some_and(|v| f32::from_bits(v).is_finite());
+    if !scale_ok(20) || !scale_ok(24) {
+        return None;
+    }
 
     let mut v = b[..36].to_vec(); // Bounds, 그래픽 모드, 배율, 기준점
     v.extend((chars as u32).to_le_bytes());
