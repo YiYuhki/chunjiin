@@ -48,6 +48,17 @@ pub fn rebuild(
     budget: &mut PixelBudget,
     stats: &mut Stats,
 ) -> Result<Vec<u8>> {
+    rebuild_nested(data, policy, budget, stats, 0)
+}
+
+/// `depth` 는 EMF+ 메타파일 이미지 안에 들어 있는 깊이
+pub(super) fn rebuild_nested(
+    data: &[u8],
+    policy: &Policy,
+    budget: &mut PixelBudget,
+    stats: &mut Stats,
+    depth: usize,
+) -> Result<Vec<u8>> {
     if !is_emf(data) {
         return fail("머리글");
     }
@@ -87,6 +98,7 @@ pub fn rebuild(
     let mut plus_out: std::collections::VecDeque<Option<Vec<u8>>> = Default::default();
     let plus_faithful = {
         let mut plus = super::emfplus::PlusCtx::new(policy, budget);
+        plus.depth = depth;
         let mut p = hsize;
         while let (Some(t), Some(size)) = (rd::u32(data, p), rd::u32(data, p + 4)) {
             let size = size as usize;
@@ -103,7 +115,13 @@ pub fn rebuild(
         }
         stats.emf_plus_records += plus.kept;
         stats.bitmaps += plus.images;
-        plus.faithful && !plus_out.is_empty()
+        // 깊이가 한도를 넘으면(작은 재조합) EMF+ 를 옮기지 않는다
+        let faithful = plus.faithful && !plus_out.is_empty() && depth <= super::MAX_NESTED;
+        // 옮기는 EMF+ 의 메타파일 이미지만 통계에 넣는다
+        if faithful {
+            stats.add(&plus.nested);
+        }
+        faithful
     };
 
     let mut ctx = Ctx {

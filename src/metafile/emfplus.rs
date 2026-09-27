@@ -81,7 +81,13 @@ pub struct PlusCtx<'a> {
     pub images: u64,
     /// 여러 레코드로 나뉜 개체를 모으는 중: (C 를 뺀 플래그, 전체 크기, 모은 데이터)
     cont: Option<(u16, usize, Vec<u8>)>,
+    /// 메타파일 이미지 안의 메타파일 중첩 깊이
+    pub depth: usize,
+    /// 메타파일 이미지를 재조합한 통계
+    pub nested: super::Stats,
 }
+
+use super::MAX_NESTED;
 
 impl<'a> PlusCtx<'a> {
     pub fn new(policy: &'a Policy, budget: &'a mut PixelBudget) -> Self {
@@ -96,6 +102,8 @@ impl<'a> PlusCtx<'a> {
             invalid: 0,
             images: 0,
             cont: None,
+            depth: 0,
+            nested: super::Stats::default(),
         }
     }
 
@@ -212,7 +220,8 @@ impl<'a> PlusCtx<'a> {
             self.cont = None;
             return Cont::Broken;
         }
-        if flags & 0x8000 != 0 {
+        // GDI+ 는 마지막 조각에도 C 플래그를 붙이므로 전체 크기를 다 모으면 끝으로 본다
+        if flags & 0x8000 != 0 && entry.len() < total {
             return Cont::Pending;
         }
         let (_, _, buf) = self.cont.take().unwrap();
@@ -554,10 +563,104 @@ impl<'a> PlusCtx<'a> {
         Some(out)
     }
 
-    /// 이미지 개체: 압축 비트맵은 재인코딩, 원시 화소는 크기 검증. 메타파일은 옮기지 않는다
+    /// 메타파일 이미지: 안의 EMF/WMF 를 같은 재조합기로 다시 만든다
+    fn metafile_image(&mut self, ver: u32, c: &mut Cur) -> Option<Vec<u8>> {
+        if self.depth >= MAX_NESTED {
+            return None;
+        }
+        let mtype = c.u32()?;
+        let size = c.u32()? as usize;
+        let rest = &c.d[c.p..];
+        let key = 0x9AC6_CDD7u32.to_le_bytes();
+        // GDI+ 는 배치 머리글을 22바이트가 아니라 구조체 정렬대로 24바이트(0 두 개 덧붙임)로
+        // 쓰고, 데이터 크기에는 머리글을 넣지 않는다. 두 방식을 모두 받고 출력도 같은 방식으로 쓴다
+        let padded = rest.starts_with(&key)
+            && rest.get(22..24) == Some(&[0, 0])
+            && !super::wmf::is_wmf(rest.get(22..)?)
+            && super::wmf::is_wmf(rest.get(24..)?);
+        let head = if padded { 24 } else { 22 };
+        let excluded = mtype == 2 && rest.starts_with(&key) && rest.len() > size;
+        let data = if excluded {
+            &rest[..rest.len().min(size + head)]
+        } else {
+            c.take(size)?
+        };
+        let mut s = super::Stats::default();
+        let out = match mtype {
+            // WMF (2 는 배치 머리글 포함)
+            1 | 2 => {
+                let placeable = data.starts_with(&key);
+                if !super::wmf::is_wmf(data) || placeable != (mtype == 2) {
+                    return None;
+                }
+                if padded {
+                    let plain = [&data[..22], &data[24..]].concat();
+                    let mut out = super::wmf::rebuild_nested(
+                        &plain,
+                        self.policy,
+                        self.budget,
+                        &mut s,
+                        self.depth + 1,
+                    )
+                    .ok()?;
+                    out.splice(22..22, [0, 0]);
+                    out
+                } else {
+                    super::wmf::rebuild_nested(
+                        data,
+                        self.policy,
+                        self.budget,
+                        &mut s,
+                        self.depth + 1,
+                    )
+                    .ok()?
+                }
+            }
+            // EMF, EMF+ 전용, EMF+ 이중
+            3..=5 => {
+                if !super::emf::is_emf(data) {
+                    return None;
+                }
+                let out = super::emf::rebuild_nested(
+                    data,
+                    self.policy,
+                    self.budget,
+                    &mut s,
+                    self.depth + 1,
+                )
+                .ok()?;
+                // 안의 EMF+ 를 옮기지 못해 비어 보이게 될 그림이면 바깥 EMF+ 도 믿지 않는다
+                if s.emf_plus_only > 0 {
+                    return None;
+                }
+                out
+            }
+            _ => return None,
+        };
+        let declared = if excluded {
+            out.len() - head
+        } else {
+            out.len()
+        };
+        s.nested += 1;
+        self.nested.add(&s);
+        self.images += 1;
+        let mut v = Vec::with_capacity(out.len() + 16);
+        for x in [ver, 2, mtype, u32::try_from(declared).ok()?] {
+            v.extend(x.to_le_bytes());
+        }
+        v.extend(out);
+        Some(v)
+    }
+
+    /// 이미지 개체: 압축 비트맵은 재인코딩, 원시 화소는 크기 검증, 메타파일은 재조합
     fn image(&mut self, c: &mut Cur) -> Option<Vec<u8>> {
         let ver = version(c)?;
-        (c.u32()? == 1).then_some(())?; // 비트맵만
+        match c.u32()? {
+            1 => {}
+            2 => return self.metafile_image(ver, c),
+            _ => return None,
+        }
         let w = c.u32()?;
         let h = c.u32()?;
         let stride = c.u32()?;
@@ -895,6 +998,14 @@ mod tests {
         assert_eq!(ctx.kept, 2);
         // 하나로 합친 개체 레코드 (C 플래그 없음)
         assert_eq!(&out[..4], &[0x08, 0x40, 0x00, 0x01]);
+        // GDI+ 처럼 마지막 조각에도 C 플래그가 붙어 있어도 전체 크기를 채우면 끝
+        let mut s = Vec::new();
+        s.extend(rec(0x4008, 0x8100, &part(&brush[..6])));
+        s.extend(rec(0x4008, 0x8100, &part(&brush[6..])));
+        s.extend(rec(0x400A, 0x4000, &fill));
+        let again = ctx.comment(&s).unwrap();
+        assert!(ctx.faithful);
+        assert_eq!(again, out);
         // 조각 사이에 다른 레코드가 끼면 끊긴 것으로 본다
         let mut s = Vec::new();
         s.extend(rec(0x4008, 0x8101, &part(&brush[..6])));

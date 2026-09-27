@@ -38,6 +38,7 @@ const BT_PNG: u8 = 6;
 const PIXEL_BUDGET_FACTOR: u64 = 4;
 
 /// 문서 단위 누적 화소 예산
+#[derive(Clone)]
 pub struct PixelBudget {
     left: u64,
 }
@@ -362,28 +363,56 @@ fn rebuild_metafile(
     } else {
         metafile::Kind::Wmf
     };
-    let mf = match metafile::rebuild(&plain, policy, budget, stats) {
-        Ok((mf, kind)) if kind == expected => mf,
-        Ok(_) => return Ok(None),
-        Err(e) if e.category() == "resource" => return Err(e),
-        Err(_) => return Ok(None),
-    };
     let room = slot.map(|r| r.saturating_sub(uids + 34));
-    let mut packed = if compression == 0 {
-        let mut p = deflate_zlib(&mf, 9);
-        // 자리가 모자라면 다른 압축 단계도 시도해 가장 작은 것을 쓴다
-        if room.is_some_and(|r| p.len() > r) {
-            for level in [8, 7, 6, 5, 4] {
-                let q = deflate_zlib(&mf, level);
-                if q.len() < p.len() {
-                    p = q;
+    let pack = |mf: &[u8]| {
+        if compression == 0 {
+            let mut p = deflate_zlib(mf, 9);
+            // 자리가 모자라면 다른 압축 단계도 시도해 가장 작은 것을 쓴다
+            if room.is_some_and(|r| p.len() > r) {
+                for level in [8, 7, 6, 5, 4] {
+                    let q = deflate_zlib(mf, level);
+                    if q.len() < p.len() {
+                        p = q;
+                    }
                 }
             }
+            p
+        } else {
+            mf.to_vec()
         }
-        p
-    } else {
-        mf.clone()
     };
+    // EMF+ 와 안에 든 메타파일(EMF+ 메타파일 이미지, WMF 내장 EMF)까지 옮기면 자리에 맞지 않을 수
+    // 있다. 그때는 GDI 레코드만 옮기는 작은 재조합으로 다시 시도한다
+    let saved = budget.clone();
+    let attempt =
+        |shallow: bool, budget: &mut PixelBudget| -> Result<Option<(Vec<u8>, metafile::Stats)>> {
+            let mut s = metafile::Stats::default();
+            let r = if shallow {
+                metafile::rebuild_shallow(&plain, policy, budget, &mut s)
+            } else {
+                metafile::rebuild(&plain, policy, budget, &mut s)
+            };
+            match r {
+                Ok((mf, kind)) if kind == expected => Ok(Some((mf, s))),
+                Ok(_) => Ok(None),
+                Err(e) if e.category() == "resource" => Err(e),
+                Err(_) => Ok(None),
+            }
+        };
+    let Some((mut mf, mut s)) = attempt(false, budget)? else {
+        return Ok(None);
+    };
+    let mut packed = pack(&mf);
+    if room.is_some_and(|r| packed.len() > r) && (s.nested > 0 || s.emf_plus_records > 0) {
+        *budget = saved;
+        if let Some((m2, s2)) = attempt(true, budget)? {
+            let p2 = pack(&m2);
+            if p2.len() < packed.len() {
+                (mf, s, packed) = (m2, s2, p2);
+            }
+        }
+    }
+    stats.add(&s);
     // 제자리 처리에서 새 압축이 원래 자리보다 크면(압축기 차이), 재조합 결과가 원본을 푼 내용과
     // 바이트 단위로 같고 압축 스트림이 선언된 길이를 남김없이 쓴 경우에만 원래 압축 스트림을 둔다.
     // 이때 읽는 쪽이 푸는 내용은 재조합 결과와 정확히 같다.

@@ -295,3 +295,111 @@ pub fn dual_emf(brush: u32) -> Vec<u8> {
         emf_rec(43, &le32(&[0, 0, 50, 50])),
     ])
 }
+
+/// EMF+ 메타파일 이미지(안에 `inner`, 형식 `mtype`)를 그리는 이중 EMF
+pub fn plus_metafile_image_emf(mtype: u32, inner: &[u8]) -> Vec<u8> {
+    let ver = 0xDBC0_1002u32.to_le_bytes();
+    let mut header = ver.to_vec();
+    header.extend(le32(&[1, 96, 96]));
+    let mut image = ver.to_vec();
+    image.extend(le32(&[2, mtype as i32, inner.len() as i32]));
+    image.extend(inner);
+    // DrawImage: 속성 없음, 단위 픽셀, 원본 사각형, 대상 사각형(압축 아님)
+    let mut draw = le32(&[-1, 2]);
+    for v in [0f32, 0.0, 100.0, 100.0, 0.0, 0.0, 50.0, 50.0] {
+        draw.extend(v.to_le_bytes());
+    }
+    emf_from(&[
+        plus_comment(&[
+            plus_rec(0x4001, 1, &header),
+            plus_rec(0x4008, 0x0500, &image),
+            plus_rec(0x401A, 0x0000, &draw),
+        ]),
+        emf_rec(39, &le32(&[1, 0, 0x0000FF, 0])),
+        emf_rec(37, &le32(&[1])),
+        emf_rec(43, &le32(&[0, 0, 50, 50])),
+    ])
+}
+
+/// 레코드들로 WMF 를 만든다 (배치 머리글 없음, 끝 레코드 포함)
+pub fn wmf_from(recs: &[Vec<u8>], objects: u16) -> Vec<u8> {
+    let mut recs = recs.to_vec();
+    recs.push(wmf_rec(0x0000, &[]));
+    let body = recs.concat();
+    let words = 9 + body.len() / 2;
+    let max = recs.iter().map(|r| r.len() / 2).max().unwrap();
+    let mut h = le16(&[1, 9, 0x0300]);
+    h.extend((words as u32).to_le_bytes());
+    h.extend(objects.to_le_bytes());
+    h.extend((max as u32).to_le_bytes());
+    h.extend(0u16.to_le_bytes());
+    [h, body].concat()
+}
+
+/// META_ESCAPE_ENHANCED_METAFILE 레코드들 (EMF 를 `parts` 조각으로)
+pub fn embedded_emf_escapes(emf: &[u8], parts: usize) -> Vec<Vec<u8>> {
+    let size = emf.len().div_ceil(parts);
+    let mut remaining = emf.len();
+    emf.chunks(size)
+        .map(|c| {
+            remaining -= c.len();
+            let mut p = le16(&[0x000F, (34 + c.len()) as i16]);
+            p.extend(0x4346_4D57u32.to_le_bytes());
+            p.extend(1u32.to_le_bytes());
+            p.extend(0x0001_0000u32.to_le_bytes());
+            p.extend(0x1234u16.to_le_bytes());
+            p.extend(0u32.to_le_bytes());
+            p.extend((parts as u32).to_le_bytes());
+            p.extend((c.len() as u32).to_le_bytes());
+            p.extend((remaining as u32).to_le_bytes());
+            p.extend((emf.len() as u32).to_le_bytes());
+            p.extend(c);
+            wmf_rec(0x0626, &p)
+        })
+        .collect()
+}
+
+/// CreateRegion 매개변수. `swap` 이면 스캔의 왼쪽·오른쪽을 뒤집어 깨뜨린다
+pub fn wmf_region(swap: bool) -> Vec<u8> {
+    let mut scans = Vec::new();
+    for (top, bottom, l, r) in [(0i16, 10i16, 0i16, 20i16), (10, 20, 5, 15)] {
+        let (l, r) = if swap { (r, l) } else { (l, r) };
+        scans.extend(le16(&[2, top, bottom, l, r, 2]));
+    }
+    // nextInChain·ObjectCount 에 쓰레기 값
+    let mut p = le16(&[0x7777, 6]);
+    p.extend(0x5555_5555u32.to_le_bytes());
+    p.extend(le16(&[(22 + scans.len()) as i16, 2, 1, 0, 0, 20, 20]));
+    p.extend(scans);
+    p
+}
+
+/// CreatePatternBrush 매개변수 (8×8 1비트, 예약 영역에 페이로드)
+pub fn wmf_pattern_brush() -> Vec<u8> {
+    let mut p = le16(&[0, 8, 8, 2]);
+    p.extend([1, 1]);
+    p.extend(0xDEAD_BEEFu32.to_le_bytes());
+    p.extend(&PAYLOAD[..18]);
+    p.extend([0xAA, 0, 0x55, 0].repeat(4));
+    p
+}
+
+/// 내장 EMF·영역·무늬 브러시를 담은 WMF
+pub fn wmf_with_extras() -> Vec<u8> {
+    let mut recs = embedded_emf_escapes(&malicious_emf(), 2);
+    recs.push(wmf_rec(0x02FC, &le16(&[0, 0xFF, 0, 0]))); // 브러시 → 0
+    recs.push(wmf_rec(0x06FF, &wmf_region(false))); // 영역 → 1
+    recs.push(wmf_rec(0x0228, &le16(&[1, 0]))); // FillRegion
+    recs.push(wmf_rec(0x01F9, &wmf_pattern_brush())); // 무늬 브러시 → 2
+    recs.push(wmf_rec(0x012D, &le16(&[2])));
+    recs.push(wmf_rec(0x041B, &le16(&[90, 90, 10, 10])));
+    recs.push(wmf_rec(0x06FF, &wmf_region(true))); // 깨진 영역 → 3 (빈 브러시로)
+    let mut esc = le16(&[9, PAYLOAD.len() as i16]); // SETABORTPROC
+    esc.extend(PAYLOAD);
+    recs.push(wmf_rec(0x0626, &esc));
+    wmf_from(&recs, 4)
+}
+
+pub fn wmf_rec_pub(f: u16, params: &[u8]) -> Vec<u8> {
+    wmf_rec(f, params)
+}

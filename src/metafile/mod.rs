@@ -17,6 +17,10 @@ mod emfplus;
 mod wmf;
 
 use crate::error::Result;
+
+/// 메타파일 안의 메타파일(EMF+ 메타파일 이미지, WMF 이스케이프의 EMF)을 푸는 깊이. 안쪽 데이터는
+/// 바깥 데이터의 일부이므로 처리량은 깊이에 비례한다 (Office 는 로고 등을 3단계까지 겹쳐 쓰기도 한다)
+pub(super) const MAX_NESTED: usize = 4;
 use crate::legacy::blip::PixelBudget;
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
@@ -67,6 +71,8 @@ pub struct Stats {
     pub emf_plus_only: u64,
     /// 검증해 옮긴 EMF+ 레코드
     pub emf_plus_records: u64,
+    /// 다시 만든 안쪽 메타파일 (EMF+ 메타파일 이미지, WMF 내장 EMF)
+    pub nested: u64,
 }
 
 impl Stats {
@@ -78,6 +84,7 @@ impl Stats {
         self.bitmaps += o.bitmaps;
         self.emf_plus_only += o.emf_plus_only;
         self.emf_plus_records += o.emf_plus_records;
+        self.nested += o.nested;
     }
 
     pub fn report(&self, findings: &mut Findings, location: &str) {
@@ -136,6 +143,30 @@ pub fn rebuild(
     let out = match sniff(data) {
         Some(Kind::Emf) => (emf::rebuild(data, policy, budget, &mut s)?, Kind::Emf),
         Some(Kind::Wmf) => (wmf::rebuild(data, policy, budget, &mut s)?, Kind::Wmf),
+        None => return crate::error::blocked("metafile", "메타파일 형식이 아님"),
+    };
+    s.metafiles = 1;
+    stats.add(&s);
+    Ok(out)
+}
+
+/// 작은 재조합 (제자리 처리에서 자리가 모자랄 때): EMF+ 를 빼고 GDI 로만 그리고, WMF 내장 EMF 는 뺀다
+pub fn rebuild_shallow(
+    data: &[u8],
+    policy: &Policy,
+    budget: &mut PixelBudget,
+    stats: &mut Stats,
+) -> Result<(Vec<u8>, Kind)> {
+    let mut s = Stats::default();
+    let out = match sniff(data) {
+        Some(Kind::Emf) => (
+            emf::rebuild_nested(data, policy, budget, &mut s, MAX_NESTED + 1)?,
+            Kind::Emf,
+        ),
+        Some(Kind::Wmf) => (
+            wmf::rebuild_nested(data, policy, budget, &mut s, MAX_NESTED + 1)?,
+            Kind::Wmf,
+        ),
         None => return crate::error::blocked("metafile", "메타파일 형식이 아님"),
     };
     s.metafiles = 1;

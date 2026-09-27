@@ -4,6 +4,10 @@
 //! 그 자리 번호를 가리킨다. 개체 생성 레코드를 버리면 뒤의 번호가 모두 어긋나므로, 옮길 수 없는
 //! 생성 레코드는 빈 브러시 생성 레코드로 바꿔 자리를 유지한다. 선택·삭제 레코드는 살아 있는
 //! 개체를 가리킬 때만 옮긴다.
+//!
+//! 이스케이프에 나눠 담긴 EMF(META_ESCAPE_ENHANCED_METAFILE, Office·GDI 가 WMF 와 함께 넣는
+//! 고품질 사본)는 모아서 EMF 재조합기로 다시 만든 뒤 같은 모양의 이스케이프로 나눠 쓴다.
+//! 영역(CreateRegion)과 장치 종속 무늬 브러시(CreatePatternBrush)는 구조를 검증해 정규형으로 쓴다.
 
 use super::dib::{self, Dib, DIB_RGB_COLORS};
 use super::{rd, Stats};
@@ -24,6 +28,121 @@ const CREATE_REGION: u16 = 0x06FF;
 const SELECT_OBJECT: u16 = 0x012D;
 const DELETE_OBJECT: u16 = 0x01F0;
 const SELECT_PALETTE: u16 = 0x0234;
+const META_ESCAPE: u16 = 0x0626;
+/// MFCOMMENT 이스케이프, "WMFC" 주석 식별자
+const MFCOMMENT: u16 = 0x000F;
+const WMFC: u32 = 0x4346_4D57;
+/// 내장 EMF 를 나눠 담는 조각 크기 (GDI·LibreOffice 와 같은 8KB)
+const EMF_CHUNK: usize = 0x2000;
+/// 내장 EMF 크기 상한
+const MAX_EMBEDDED_EMF: usize = 64 << 20;
+
+/// 이스케이프 조각으로 모으는 내장 EMF
+#[derive(Default)]
+struct Embedded {
+    /// 첫 조각이 있던 출력 위치
+    at: Option<usize>,
+    count: u32,
+    total: usize,
+    seen: u32,
+    data: Vec<u8>,
+    broken: bool,
+}
+
+impl Embedded {
+    /// META_ESCAPE_ENHANCED_METAFILE 이면 조각을 모으고 true
+    fn take(&mut self, params: &[u8], out_len: usize) -> bool {
+        let (Some(esc), Some(id)) = (rd::u16(params, 0), rd::u32(params, 4)) else {
+            return false;
+        };
+        if esc != MFCOMMENT || id != WMFC {
+            return false;
+        }
+        let fields = (
+            rd::u32(params, 8),
+            rd::u32(params, 12),
+            rd::u32(params, 22),
+            rd::u32(params, 26),
+            rd::u32(params, 34),
+        );
+        let (Some(1), Some(0x0001_0000), Some(count), Some(cur), Some(total)) = fields else {
+            self.broken = true;
+            return true;
+        };
+        let (cur, total) = (cur as usize, total as usize);
+        let Some(chunk) = rd::slice(params, 38, cur) else {
+            self.broken = true;
+            return true;
+        };
+        if self.at.is_none() {
+            self.at = Some(out_len);
+            self.count = count;
+            self.total = total;
+            if total > MAX_EMBEDDED_EMF || count == 0 {
+                self.broken = true;
+            }
+        } else if self.count != count || self.total != total {
+            self.broken = true;
+        }
+        if !self.broken {
+            self.seen += 1;
+            self.data.extend_from_slice(chunk);
+            if self.data.len() > self.total || self.seen > self.count {
+                self.broken = true;
+            }
+        }
+        true
+    }
+
+    fn complete(&self) -> bool {
+        self.at.is_some()
+            && !self.broken
+            && self.seen == self.count
+            && self.data.len() == self.total
+    }
+}
+
+/// EMF 를 META_ESCAPE_ENHANCED_METAFILE 레코드들로 나눈다. 검사합은 EMF 의 16비트 워드 합이
+/// 0 이 되게 하는 값을 첫 조각에 쓴다 (나머지 조각은 0)
+fn embedded_records(emf: &[u8]) -> Vec<Vec<u8>> {
+    let sum = emf
+        .chunks(2)
+        .map(|w| u16::from_le_bytes([w[0], *w.get(1).unwrap_or(&0)]))
+        .fold(0u16, u16::wrapping_add);
+    let count = emf.len().div_ceil(EMF_CHUNK) as u32;
+    let mut remaining = emf.len();
+    let mut out = Vec::new();
+    for (i, chunk) in emf.chunks(EMF_CHUNK).enumerate() {
+        remaining -= chunk.len();
+        let mut v = Vec::with_capacity(chunk.len() + 44);
+        v.extend(MFCOMMENT.to_le_bytes());
+        v.extend(((34 + chunk.len()) as u16).to_le_bytes());
+        v.extend(WMFC.to_le_bytes());
+        v.extend(1u32.to_le_bytes());
+        v.extend(0x0001_0000u32.to_le_bytes());
+        v.extend((if i == 0 { sum.wrapping_neg() } else { 0 }).to_le_bytes());
+        v.extend(0u32.to_le_bytes());
+        v.extend(count.to_le_bytes());
+        v.extend((chunk.len() as u32).to_le_bytes());
+        v.extend((remaining as u32).to_le_bytes());
+        v.extend((emf.len() as u32).to_le_bytes());
+        v.extend(chunk);
+        out.push(v);
+    }
+    out
+}
+
+/// 레코드 하나 (크기·함수·매개변수)
+fn wmf_record(f: u16, body: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(body.len() + 7);
+    v.extend(((3 + body.len().div_ceil(2)) as u32).to_le_bytes());
+    v.extend(f.to_le_bytes());
+    v.extend(body);
+    if body.len() % 2 == 1 {
+        v.push(0);
+    }
+    v
+}
 
 pub fn is_wmf(d: &[u8]) -> bool {
     if rd::u32(d, 0) == Some(PLACEABLE_KEY) {
@@ -138,6 +257,17 @@ pub fn rebuild(
     budget: &mut PixelBudget,
     stats: &mut Stats,
 ) -> Result<Vec<u8>> {
+    rebuild_nested(data, policy, budget, stats, 0)
+}
+
+/// `depth` 는 다른 메타파일 안에 들어 있는 깊이
+pub(super) fn rebuild_nested(
+    data: &[u8],
+    policy: &Policy,
+    budget: &mut PixelBudget,
+    stats: &mut Stats,
+    depth: usize,
+) -> Result<Vec<u8>> {
     let mut out = Vec::with_capacity(data.len().min(1 << 24));
     let base = if rd::u32(data, 0) == Some(PLACEABLE_KEY) {
         let Some(ph) = rd::slice(data, 0, 22) else {
@@ -172,6 +302,7 @@ pub fn rebuild(
     let mut table = Objects::new(objects);
     let mut max_record = 3usize;
     let mut bitmaps = 0u64;
+    let mut embedded = Embedded::default();
     let mut p = base + 18;
     while let (Some(words), Some(f)) = (rd::u32(data, p), rd::u16(data, p + 4)) {
         let size = (words as usize).saturating_mul(2);
@@ -185,6 +316,9 @@ pub fn rebuild(
             break;
         }
         stats.records += 1;
+        if f == META_ESCAPE && embedded.take(params, out.len()) {
+            continue;
+        }
         let creates = matches!(
             f,
             CREATE_PEN
@@ -204,11 +338,7 @@ pub fn rebuild(
                 Some(body) => Some((f, body)),
                 None => {
                     // 자리를 유지하도록 빈 브러시(BS_NULL)로 바꾼다
-                    if matches!(f, CREATE_PATTERN_BRUSH | CREATE_REGION) {
-                        stats.removed += 1;
-                    } else {
-                        stats.invalid += 1;
-                    }
+                    stats.invalid += 1;
                     Some((CREATE_BRUSH, [1u16, 0, 0, 0].map(u16::to_le_bytes).concat()))
                 }
             }
@@ -231,6 +361,37 @@ pub fn rebuild(
         out.extend((words as u32).to_le_bytes());
         out.extend(f.to_le_bytes());
         out.extend(body);
+    }
+    // 내장 EMF: 다시 만들어 첫 조각이 있던 자리에 넣는다
+    if let Some(at) = embedded.at {
+        let rebuilt = if embedded.complete() && depth < super::MAX_NESTED {
+            let mut s = Stats::default();
+            match super::emf::rebuild_nested(&embedded.data, policy, budget, &mut s, depth + 1) {
+                Ok(emf) => {
+                    s.nested += 1;
+                    stats.add(&s);
+                    Some(emf)
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        match rebuilt {
+            Some(emf) => {
+                let recs: Vec<u8> = embedded_records(&emf)
+                    .iter()
+                    .map(|b| {
+                        let r = wmf_record(META_ESCAPE, b);
+                        max_record = max_record.max(r.len() / 2);
+                        r
+                    })
+                    .collect::<Vec<_>>()
+                    .concat();
+                out.splice(at..at, recs);
+            }
+            None => stats.removed += embedded.seen.max(1) as u64,
+        }
     }
     out.extend(3u32.to_le_bytes());
     out.extend(META_EOF.to_le_bytes());
@@ -301,9 +462,88 @@ fn create(
                 None => None,
             }
         }
-        // CreatePatternBrush(장치 종속 비트맵), CreateRegion 은 옮기지 않는다
+        CREATE_PATTERN_BRUSH => pattern_brush(b, budget)?,
+        CREATE_REGION => region(b),
         _ => None,
     })
+}
+
+/// CreatePatternBrush: Bitmap16(14바이트, 비트 포인터 무시) + 예약 18바이트 + 무늬 비트
+fn pattern_brush(b: &[u8], budget: &mut PixelBudget) -> Result<Option<Vec<u8>>> {
+    let (Some(width), Some(height), Some(stride)) = (rd::u16(b, 2), rd::u16(b, 4), rd::u16(b, 6))
+    else {
+        return Ok(None);
+    };
+    let (width, height) = (width as i16, height as i16);
+    let (planes, bpp) = (b.get(8).copied(), b.get(9).copied());
+    if width <= 0
+        || height <= 0
+        || planes != Some(1)
+        || !matches!(bpp, Some(1 | 4 | 8 | 16 | 24 | 32))
+    {
+        return Ok(None);
+    }
+    let bpp = bpp.unwrap_or(1) as usize;
+    let min_stride = (width as usize * bpp).div_ceil(16) * 2;
+    if (stride as usize) < min_stride || stride % 2 != 0 {
+        return Ok(None);
+    }
+    let Some(bits) = rd::slice(b, 32, stride as usize * height as usize) else {
+        return Ok(None);
+    };
+    budget.charge_pixels(width as u64 * height as u64)?;
+    let mut v = vec![0u8; 32];
+    v[2..10].copy_from_slice(&b[2..10]);
+    v.extend(bits);
+    Ok(Some(v))
+}
+
+/// CreateRegion: 머리글(22바이트) + 스캔(개수, 위, 아래, (왼쪽, 오른쪽)…, 개수)
+fn region(b: &[u8]) -> Option<Vec<u8>> {
+    const MAX_SCANS: usize = 16_384;
+    if rd::u16(b, 2)? != 6 {
+        return None;
+    }
+    let scans = rd::u16(b, 10)? as usize;
+    if scans > MAX_SCANS {
+        return None;
+    }
+    let bounds = rd::slice(b, 14, 8)?;
+    let mut body: Vec<u8> = Vec::new();
+    let mut max_scan = 0u16;
+    let mut p = 22;
+    for _ in 0..scans {
+        let count = rd::u16(b, p)?;
+        let (top, bottom) = (rd::u16(b, p + 2)? as i16, rd::u16(b, p + 4)? as i16);
+        if count % 2 != 0 || top > bottom {
+            return None;
+        }
+        let lines = rd::slice(b, p + 6, count as usize * 2)?;
+        if rd::u16(b, p + 6 + count as usize * 2)? != count {
+            return None;
+        }
+        for pair in lines.as_chunks::<4>().0 {
+            let l = i16::from_le_bytes([pair[0], pair[1]]);
+            let r = i16::from_le_bytes([pair[2], pair[3]]);
+            if l > r {
+                return None;
+            }
+        }
+        max_scan = max_scan.max(count / 2);
+        body.extend(&b[p..p + 6 + count as usize * 2 + 2]);
+        p += 6 + count as usize * 2 + 2;
+    }
+    let size = u16::try_from(22 + body.len()).ok()?;
+    let mut v = Vec::with_capacity(22 + body.len());
+    v.extend(0u16.to_le_bytes()); // nextInChain
+    v.extend(6u16.to_le_bytes()); // 형식: 영역
+    v.extend(0u32.to_le_bytes()); // ObjectCount
+    v.extend(size.to_le_bytes());
+    v.extend((scans as u16).to_le_bytes());
+    v.extend(max_scan.to_le_bytes());
+    v.extend(bounds);
+    v.extend(body);
+    Some(v)
 }
 
 fn record(
