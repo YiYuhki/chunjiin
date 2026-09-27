@@ -691,7 +691,11 @@ fn limit_filter_region(el: &mut Element, ctx: &mut Ctx) {
         ctx.stats.limited += 1;
         for (name, v) in [(pos, lo), (size, hi - lo)] {
             let value = fmt_num(v);
-            match el.attrs.iter_mut().find(|a| a.ns.is_empty() && a.local == name) {
+            match el
+                .attrs
+                .iter_mut()
+                .find(|a| a.ns.is_empty() && a.local == name)
+            {
                 Some(a) => a.value = value,
                 None => el.attrs.push(Attr {
                     qname: name.into(),
@@ -801,7 +805,11 @@ fn limit_viewport(root: &mut Element, stats: &mut Stats) {
     for (name, v) in [("width", w), ("height", h)] {
         if let Some(v) = v {
             let value = fmt_num((v * s).max(1e-6));
-            if let Some(a) = root.attrs.iter_mut().find(|a| a.ns.is_empty() && a.local == name) {
+            if let Some(a) = root
+                .attrs
+                .iter_mut()
+                .find(|a| a.ns.is_empty() && a.local == name)
+            {
                 a.value = value;
             }
         }

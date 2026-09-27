@@ -179,7 +179,7 @@ impl Engine {
                 }
                 crate::svg::reassemble(data, &self.policy, findings)
             }
-            FileType::Ics | FileType::Vcf => crate::ical::reassemble(data, findings),
+            FileType::Ics | FileType::Vcf => crate::ical::reassemble(data, &self.policy, findings),
             FileType::Text => text::reassemble(data, text::Kind::Text, findings),
             FileType::Csv => text::reassemble(data, text::Kind::Delimited(','), findings),
             FileType::Tsv => text::reassemble(data, text::Kind::Delimited('\t'), findings),

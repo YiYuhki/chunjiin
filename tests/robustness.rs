@@ -157,6 +157,24 @@ fn mutate_cfb(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
     legacy::cfb(&refs)
 }
 
+/// 일정의 반복 패턴·시간대 스트림만 변조한다
+fn mutate_recurrence(rng: &mut Rng, data: &[u8]) -> Vec<u8> {
+    let mut streams = legacy::read_cfb(data);
+    let targets: Vec<usize> = streams
+        .iter()
+        .enumerate()
+        .filter(|(_, (n, _))| n.ends_with("80030102") || n.ends_with("80040102"))
+        .map(|(i, _)| i)
+        .collect();
+    let i = targets[rng.below(targets.len())];
+    streams[i].1 = mutate_bytes(rng, &streams[i].1);
+    let refs: Vec<(&str, &[u8])> = streams
+        .iter()
+        .map(|(n, d)| (n.as_str(), d.as_slice()))
+        .collect();
+    legacy::cfb(&refs)
+}
+
 fn iterations() -> usize {
     std::env::var("CDR_FUZZ_ITERS")
         .ok()
@@ -231,6 +249,19 @@ fn fuzz_legacy() {
     run("a.hwp", 7, legacy::malicious_hwp(1 | 8), mutate_cfb);
     run("a.msg", 28, common::msg::malicious_msg(), mutate_cfb);
     run("c.msg", 32, common::msg::appointment_msg(), mutate_cfb);
+    run(
+        "d.msg",
+        33,
+        common::msg::recurring_meeting_msg(),
+        mutate_cfb,
+    );
+    run("e.msg", 34, common::msg::contact_msg(), mutate_cfb);
+    run(
+        "f.msg",
+        35,
+        common::msg::recurring_meeting_msg(),
+        mutate_recurrence,
+    );
     run("b.msg", 29, common::msg::rtf_html_msg(), mutate_cfb);
     run("b.hwp", 8, legacy::malicious_hwp(0), mutate_cfb);
     run("a.doc", 9, legacy::malicious_doc(1 << 9), mutate_cfb);

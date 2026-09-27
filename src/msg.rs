@@ -15,6 +15,7 @@ use cfb::CompoundFile;
 use crate::engine::Engine;
 use crate::error::{blocked, Result};
 use crate::mail::{clean_header, encoded_word, RawAttachment, RawMail};
+use crate::policy::Policy;
 use crate::report::{Findings, Severity};
 
 /// 내장 메시지 중첩 한도
@@ -42,6 +43,7 @@ struct Reader<'a> {
     /// 파일 크기보다 훨씬 많이 읽히게 할 수 있다
     budget: usize,
     over_budget: bool,
+    policy: Policy,
     /// 명명 속성 (속성 집합 GUID, 번호) → 속성 ID
     named: Option<HashMap<([u8; 16], u32), u16>>,
 }
@@ -50,6 +52,7 @@ struct Reader<'a> {
 const PSETID_APPOINTMENT: [u8; 16] = psetid(0x02);
 const PSETID_TASK: [u8; 16] = psetid(0x03);
 const PSETID_ADDRESS: [u8; 16] = psetid(0x04);
+const PSETID_COMMON: [u8; 16] = psetid(0x08);
 
 /// {0006200x-0000-0000-C000-000000000046}
 const fn psetid(x: u8) -> [u8; 16] {
@@ -186,6 +189,16 @@ impl Reader<'_> {
         self.string(p, id)
     }
 
+    fn named_binary(&mut self, p: &Props, guid: [u8; 16], lid: u32) -> Option<Vec<u8>> {
+        let id = self.named(guid, lid)?;
+        self.binary(p, id)
+    }
+
+    fn named_u32(&mut self, p: &Props, guid: [u8; 16], lid: u32) -> Option<u32> {
+        let id = self.named(guid, lid)?;
+        p.u32(id)
+    }
+
     fn named_u64(&mut self, p: &Props, guid: [u8; 16], lid: u32) -> Option<u64> {
         let id = self.named(guid, lid)?;
         p.u64(id).filter(|&v| v > 0)
@@ -288,6 +301,7 @@ pub fn reassemble(
         limit: engine.policy.max_stream_size,
         budget: data.len().saturating_mul(2).saturating_add(16 << 20),
         over_budget: false,
+        policy: engine.policy.clone(),
         named: None,
     };
     let raw = message(&mut r, "", 32, 0, findings)?;
@@ -346,6 +360,7 @@ fn message<'a>(
     push(&mut raw, "From", from);
 
     let (mut to, mut cc) = (Vec::new(), Vec::new());
+    let mut attendees = Vec::new();
     for (i, rb) in r
         .children(base, "__recip_version1.0_#")
         .into_iter()
@@ -359,6 +374,16 @@ fn message<'a>(
             .into_iter()
             .find_map(|id| r.string(&rp, id).filter(|e| e.contains('@')));
         let name = r.string(&rp, 0x3001);
+        let kind = rp.u32(0x0C15).unwrap_or(1);
+        // 일정 참석자 (주최자 표시가 붙은 수신자는 뺀다)
+        if rp.u32(0x5FFD).unwrap_or(0) & 0x2 == 0 {
+            attendees.push(crate::msgitem::Attendee {
+                name: name.clone().filter(|n| !n.trim().is_empty()),
+                email: email.clone(),
+                kind,
+                status: rp.u32(0x5FFF).unwrap_or(0),
+            });
+        }
         let m = match email {
             Some(e) => mailbox(name.as_deref(), &e),
             None => match name.as_deref().and_then(name_only) {
@@ -366,7 +391,7 @@ fn message<'a>(
                 None => continue,
             },
         };
-        match rp.u32(0x0C15).unwrap_or(1) {
+        match kind {
             2 => cc.push(m),
             // 숨은 참조(3)는 옮기지 않는다
             3 => {}
@@ -443,7 +468,15 @@ fn message<'a>(
         .extend(html.map(|h| h.trim_end_matches('\0').to_string()));
 
     // 일정·작업·연락처: 항목 정보를 본문 앞 요약과 .ics/.vcf 첨부로
-    if let Some(item) = item(r, &p, sender_name.as_deref(), raw.texts.first()) {
+    let mut item = item(
+        r,
+        &p,
+        sender_name.as_deref(),
+        sender_email.as_deref(),
+        attendees,
+        raw.texts.first(),
+    );
+    if let Some(item) = &item {
         let summary = item.summary();
         if !summary.is_empty() {
             match raw.texts.first_mut() {
@@ -458,18 +491,6 @@ fn message<'a>(
                     .replace('\n', "<br>");
                 h.insert_str(0, &format!("<p>{esc}</p>"));
             }
-        }
-        let stamp = p.u64(0x0039).filter(|&t| t > 0);
-        if let Some(g) = item.attachment(stamp) {
-            findings.count("msg_items_converted", 1);
-            raw.attachments.push(RawAttachment {
-                name: g.name,
-                content_id: None,
-                inline_hint: false,
-                signature: false,
-                generated: Some(g.content_type),
-                data: g.data.into(),
-            });
         }
     }
 
@@ -505,6 +526,15 @@ fn message<'a>(
                     raw.attachments.extend(inner.attachments);
                     raw.removed.extend(inner.removed);
                     continue;
+                }
+                // 연락처 사진 (PidTagAttachmentContactPhoto): 화소만 재인코딩해 .vcf 에 넣는다
+                if let Some(crate::msgitem::Item::Contact(c)) = item.as_mut() {
+                    if ap.u32(0x7FFF).is_some_and(|v| v & 0xFF != 0) && c.photo.is_none() {
+                        c.photo = contact_photo(&data, &r.policy);
+                        if c.photo.is_some() {
+                            continue;
+                        }
+                    }
                 }
                 let name = name.unwrap_or_else(|| format!("attachment-{}", i + 1));
                 let cid = r.string(&ap, 0x3712).filter(|c| !c.trim().is_empty());
@@ -565,7 +595,33 @@ fn message<'a>(
             }
         }
     }
+    if let Some(g) = item.and_then(|it| it.attachment(p.u64(0x0039).filter(|&t| t > 0))) {
+        findings.count("msg_items_converted", 1);
+        raw.attachments.push(RawAttachment {
+            name: g.name,
+            content_id: None,
+            inline_hint: false,
+            signature: false,
+            generated: Some(g.content_type),
+            data: g.data.into(),
+        });
+    }
     Ok(raw)
+}
+
+/// 연락처 사진을 재인코딩한다 (vCard TYPE 과 함께)
+fn contact_photo(data: &[u8], policy: &Policy) -> Option<(Vec<u8>, &'static str)> {
+    use crate::imaging::{self, ImageKind};
+    let kind = ImageKind::sniff(data)?;
+    let mut budget = crate::legacy::blip::PixelBudget::new(policy);
+    budget.charge(data, kind).ok()?;
+    let (img, out) = imaging::reencode(data, kind, policy).ok()?;
+    let t = match out {
+        ImageKind::Jpeg => "JPEG",
+        ImageKind::Gif => "GIF",
+        _ => "PNG",
+    };
+    Some((img, t))
 }
 
 /// 메시지 클래스에 따라 일정·작업·연락처 정보를 꺼낸다
@@ -573,12 +629,18 @@ fn item(
     r: &mut Reader,
     p: &Props,
     sender: Option<&str>,
+    sender_email: Option<&str>,
+    attendee_list: Vec<crate::msgitem::Attendee>,
     body: Option<&String>,
 ) -> Option<crate::msgitem::Item> {
-    use crate::msgitem::{Contact, Event, Item, Task};
+    use crate::msgitem::{Contact, Event, Item, Recur, Task, Tz};
     let class = r.string(p, 0x001A)?.to_ascii_uppercase();
     let subject = r.string(p, 0x0037).unwrap_or_default();
     let description = body.cloned().unwrap_or_default();
+    // PidLidReminderSet (PT_BOOLEAN)
+    let reminder_set = r
+        .named_u32(p, PSETID_COMMON, 0x8503)
+        .is_some_and(|v| v & 0xFF != 0);
     if class.starts_with("IPM.APPOINTMENT") || class.starts_with("IPM.SCHEDULE.MEETING") {
         // PidLidAppointmentStartWhole / EndWhole, 없으면 PidTagStartDate / EndDate
         let start = r
@@ -591,14 +653,53 @@ fn item(
             .into_iter()
             .filter_map(|id| r.string(p, id).filter(|s| !s.trim().is_empty()))
             .collect::<Vec<_>>();
+        // 반복 패턴 (PidLidAppointmentRecur). 8비트 문자열은 메시지 코드 페이지로
+        let cp = p.codepage;
+        let ansi = move |b: &[u8]| encoding(cp).decode(b).0.into_owned();
+        let recur = r
+            .named_binary(p, PSETID_APPOINTMENT, 0x8216)
+            .and_then(|b| Recur::parse(&b, &ansi));
+        // 시간대: 반복 일정은 PidLidTimeZoneStruct 기준, 아니면 표시용 TZDEFINITION 우선
+        let tz_struct = |r: &mut Reader| {
+            let name = r
+                .named_string(p, PSETID_APPOINTMENT, 0x8234)
+                .unwrap_or_default();
+            r.named_binary(p, PSETID_APPOINTMENT, 0x8233)
+                .and_then(|b| Tz::from_struct(&b, &name))
+        };
+        let tz_def = |r: &mut Reader| {
+            r.named_binary(p, PSETID_APPOINTMENT, 0x825E)
+                .and_then(|b| Tz::from_definition(&b))
+        };
+        let tz = if recur.is_some() {
+            tz_struct(r).or_else(|| tz_def(r))
+        } else {
+            tz_def(r).or_else(|| tz_struct(r))
+        };
+        // PidLidReminderDelta (분)
+        let reminder = reminder_set
+            .then(|| r.named_u32(p, PSETID_COMMON, 0x8501))
+            .flatten()
+            .map(|m| m.min(60 * 24 * 365));
         return Some(Item::Event(Event {
             summary: subject,
             start,
             end,
             location: r.named_string(p, PSETID_APPOINTMENT, 0x8208),
             organizer: sender.map(str::to_string),
+            organizer_email: sender_email.map(str::to_string),
             attendees: (!attendees.is_empty()).then(|| attendees.join("; ")),
+            attendee_list,
             description,
+            tz,
+            recur,
+            // PidLidAppointmentSubType
+            all_day: r
+                .named_u32(p, PSETID_APPOINTMENT, 0x8215)
+                .is_some_and(|v| v & 0xFF != 0),
+            reminder,
+            // PidLidBusyStatus: 0 한가함
+            busy: r.named_u32(p, PSETID_APPOINTMENT, 0x8205).map(|v| v != 0),
         }));
     }
     if class.starts_with("IPM.TASK") {
@@ -613,6 +714,10 @@ fn item(
             due: r.named_u64(p, PSETID_TASK, 0x8105),
             percent,
             description,
+            // PidLidReminderTime
+            reminder: reminder_set
+                .then(|| r.named_u64(p, PSETID_COMMON, 0x8502))
+                .flatten(),
         }));
     }
     if class.starts_with("IPM.CONTACT") {

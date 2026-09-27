@@ -1,7 +1,9 @@
 mod common;
 
 use cdr::{Engine, Status};
-use common::msg::{appointment_msg, malicious_msg, rtf_bomb_msg, rtf_html_msg};
+use common::msg::{
+    appointment_msg, contact_msg, malicious_msg, recurring_meeting_msg, rtf_bomb_msg, rtf_html_msg,
+};
 use mail_parser::MimeHeaders;
 
 fn parse(eml: &[u8]) -> mail_parser::Message<'_> {
@@ -172,7 +174,7 @@ fn appointment_becomes_ics() {
         .find(|a| a.attachment_name() == Some("event.ics"))
         .expect("event.ics");
     let ics = String::from_utf8_lossy(ics.contents());
-    assert!(ics.contains("DTSTART:20240102T030405Z") && ics.contains("SUMMARY:분기 회의"));
+    assert!(ics.contains("DTSTART:20240102T030400Z") && ics.contains("SUMMARY:분기 회의"));
     // 장소 값에 끼워 넣은 줄바꿈은 이스케이프되어 새 구성 요소가 되지 않는다
     assert!(
         ics.contains("LOCATION:3층 회의실\\nBEGIN:VALARM\\nACTION:PROCEDURE"),
@@ -207,4 +209,99 @@ fn standalone_calendar_is_rebuilt() {
     assert!(!String::from_utf8(r.output.unwrap())
         .unwrap()
         .contains("evil"));
+}
+
+fn attachment_text(m: &mail_parser::Message, name: &str) -> String {
+    let a = m
+        .attachments()
+        .find(|a| a.attachment_name() == Some(name))
+        .unwrap_or_else(|| panic!("{name} 없음"));
+    String::from_utf8_lossy(a.contents()).replace("\r\n ", "")
+}
+
+#[test]
+fn recurring_meeting_keeps_timezone_recurrence_and_attendees() {
+    let r = Engine::default().process(&recurring_meeting_msg(), "주간.msg");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let out = r.output.clone().unwrap();
+    let m = parse(&out);
+    let body = m.body_text(0).unwrap();
+    for want in [
+        "시작: 2024-03-04 10:00 (UTC-05:00 (UTC-05.00) Eastern Time (US & Canada))",
+        "반복: 매주 월·수요일, 6회",
+        "참석자: 이영희(수락), Park, Minsu(선택, 거절), 회의실A(자원)",
+        "알림: 15분 전",
+    ] {
+        assert!(body.contains(want), "{want}\n{body}");
+    }
+    let ics = attachment_text(&m, "event.ics");
+    let tz = r#"TZID="(UTC-05.00) Eastern Time (US & Canada)""#;
+    for want in [
+        "BEGIN:VTIMEZONE\r\nTZID:(UTC-05.00) Eastern Time (US & Canada)\r\n".to_string(),
+        "BEGIN:DAYLIGHT\r\nDTSTART:16010311T020000\r\nTZOFFSETFROM:-0500\r\nTZOFFSETTO:-0400\r\nRRULE:FREQ=YEARLY;BYMONTH=3;BYDAY=2SU".into(),
+        "RRULE:FREQ=YEARLY;BYMONTH=11;BYDAY=1SU".into(),
+        format!("DTSTART;{tz}:20240304T100000"),
+        format!("DTEND;{tz}:20240304T110000"),
+        "RRULE:FREQ=WEEKLY;BYDAY=MO,WE;COUNT=6;WKST=SU".into(),
+        // 지운 회차만 제외하고, 옮긴 회차는 따로 쓴다
+        format!("EXDATE;{tz}:20240306T100000\r\n"),
+        format!("RECURRENCE-ID;{tz}:20240311T100000\r\nDTSTART;{tz}:20240311T140000\r\nDTEND;{tz}:20240311T150000\r\nSUMMARY:주간 회의(변경)"),
+        "ORGANIZER;CN=\"김철수\":mailto:kim@example.com".into(),
+        "ATTENDEE;CN=\"이영희\";ROLE=REQ-PARTICIPANT;PARTSTAT=ACCEPTED:mailto:lee@example.com".into(),
+        "ATTENDEE;CN=\"Park, Minsu\";ROLE=OPT-PARTICIPANT;PARTSTAT=DECLINED:mailto:park@example.com".into(),
+        "ATTENDEE;CN=\"회의실A\";CUTYPE=RESOURCE;ROLE=NON-PARTICIPANT;PARTSTAT=NEEDS-ACTION:mailto:room-a@example.com".into(),
+        "BEGIN:VALARM\r\nACTION:DISPLAY\r\nTRIGGER:-PT15M\r\nDESCRIPTION:주간 회의\r\nEND:VALARM".into(),
+        "TRANSP:OPAQUE".into(),
+    ] {
+        assert!(ics.contains(&want), "{want}\n{ics}");
+    }
+    // 주최자 자신은 참석자로 넣지 않는다
+    assert_eq!(ics.matches("ATTENDEE").count(), 3, "{ics}");
+    // 헤더의 숨은 참조(자원)는 메일 헤더에 나오지 않는다
+    assert!(!String::from_utf8_lossy(&out).contains("Bcc"));
+
+    // .ics 는 정제기를 그대로 통과한다 (고정점, 발견 없음)
+    let again = Engine::default().process(ics.as_bytes(), "event.ics");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+    let again = Engine::default().process(&out, "주간.eml");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
+
+#[test]
+fn contact_photo_is_reencoded_into_vcard() {
+    let r = Engine::default().process(&contact_msg(), "김철수.msg");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let out = r.output.clone().unwrap();
+    let m = parse(&out);
+    // 사진은 별도 첨부가 아니라 vCard 안에
+    assert!(m
+        .attachments()
+        .all(|a| a.attachment_name() != Some("ContactPicture.png")));
+    let vcf = attachment_text(&m, "contact.vcf");
+    let b64 = vcf
+        .split("PHOTO;ENCODING=b;TYPE=PNG:")
+        .nth(1)
+        .and_then(|s| s.split("\r\n").next())
+        .unwrap_or_else(|| panic!("{vcf}"));
+    use base64::Engine as _;
+    let png = base64::engine::general_purpose::STANDARD
+        .decode(b64)
+        .unwrap();
+    assert!(!png.windows(5).any(|w| w == b"<?php"));
+    image::load_from_memory(&png).expect("재인코딩된 사진");
+    assert!(vcf.contains("ORG:예시\\, 주식회사;"));
+    let again = Engine::default().process(&out, "김철수.eml");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }

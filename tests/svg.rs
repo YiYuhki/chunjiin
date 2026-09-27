@@ -254,7 +254,13 @@ fn svg_rendering_cost_is_limited() {
   <path class="e" d="M0 0L9 9" stroke-dasharray="5 5" filter="url(#u)"/>
 </svg>"##;
     let r = Engine::default().process(svg.as_bytes(), "a.svg");
-    assert_eq!(r.status, Status::Sanitized, "{} {:#?}", r.reason, r.findings);
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
     assert!(
         r.findings
             .iter()
