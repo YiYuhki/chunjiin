@@ -798,9 +798,8 @@ impl<'a> Copier<'a> {
             );
             return Ok(None);
         };
-        dict.set("BitsPerComponent", Object::Integer(1));
         *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
-        Ok(Some(Stream::new(dict, bits)))
+        Ok(Some(bilevel(dict, bits, w, h)))
     }
 
     /// 필터 매개변수 사전 (배열이면 마지막 필터 것)
@@ -833,9 +832,8 @@ impl<'a> Copier<'a> {
         };
         dict.set("Width", Object::Integer(w as i64));
         dict.set("Height", Object::Integer(h as i64));
-        dict.set("BitsPerComponent", Object::Integer(1));
         *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
-        Some(Stream::new(dict, bits))
+        Some(bilevel(dict, bits, w, h))
     }
 
     /// 사전 색 공간의 성분 수와 Indexed 여부
@@ -899,7 +897,23 @@ impl<'a> Copier<'a> {
                     4 => b"DeviceCMYK",
                     _ => return drop(self, "성분 수를 알 수 없는"),
                 };
-                dict.set("ColorSpace", Object::Name(name.to_vec()));
+                // JP2 에 든 ICC 프로필이 있으면 ICCBased 색 공간으로 (대체 색 공간은 Device)
+                match img.icc.take() {
+                    Some(profile) => {
+                        let mut d = Dictionary::new();
+                        d.set("N", Object::Integer(img.components as i64));
+                        d.set("Alternate", Object::Name(name.to_vec()));
+                        let id = self.dst.add_object(Object::Stream(Stream::new(d, profile)));
+                        dict.set(
+                            "ColorSpace",
+                            Object::Array(vec![
+                                Object::Name(b"ICCBased".to_vec()),
+                                Object::Reference(id),
+                            ]),
+                        );
+                    }
+                    None => dict.set("ColorSpace", Object::Name(name.to_vec())),
+                }
             }
         }
         let smask_in_data = s
@@ -930,6 +944,23 @@ impl<'a> Copier<'a> {
             dict.set("SMask", Object::Reference(id));
         }
         *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
+        // 손실 압축이던 회색·RGB 이미지는 JPEG 으로 다시 압축한다 (원시 표본보다 훨씬 작다)
+        if img.lossy && !indexed && matches!(img.components, 1 | 3) {
+            let (w, h) = (img.width as u32, img.height as u32);
+            let dynimg = if img.components == 1 {
+                image::GrayImage::from_raw(w, h, img.samples.clone())
+                    .map(image::DynamicImage::ImageLuma8)
+            } else {
+                image::RgbImage::from_raw(w, h, img.samples.clone())
+                    .map(image::DynamicImage::ImageRgb8)
+            };
+            let mut out = std::io::Cursor::new(Vec::new());
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92);
+            if dynimg.is_some_and(|i| i.write_with_encoder(enc).is_ok()) {
+                dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+                return Some(Stream::new(dict, out.into_inner()).with_compression(false));
+            }
+        }
         Some(Stream::new(dict, img.samples))
     }
 
@@ -1426,9 +1457,12 @@ fn build_page(
         _ => HashSet::new(),
     };
     let mut ops = content::filter(ops, Some(&xobject_names), &mut c.dropped_ops);
-    // 원본 콘텐츠의 그래픽 상태가 주석 평면화에 영향을 주지 않도록 감싼다
-    ops.insert(0, Operation::new("q", vec![]));
-    ops.push(Operation::new("Q", vec![]));
+    // 원본 콘텐츠의 그래픽 상태가 주석 평면화에 영향을 주지 않도록 감싼다.
+    // 이미 한 겹으로 감싸져 있으면(재조합 결과를 다시 넣은 경우) 그대로 둔다
+    if !wrapped_once(&ops) {
+        ops.insert(0, Operation::new("q", vec![]));
+        ops.push(Operation::new("Q", vec![]));
+    }
 
     // 주석: 링크 재생성, 나머지는 외형 평면화
     let mut links: Vec<Object> = Vec::new();
@@ -1804,4 +1838,47 @@ fn build_outline_level(
         c.dst.objects.insert(id, Object::Dictionary(d));
     }
     Some((ids[0], *ids.last().unwrap(), total))
+}
+
+/// 1비트 이미지 스트림. 직접 다시 압축한 CCITT G4 가 Flate 보다 작으면 G4 로 쓴다
+/// (흑백 문서 스캔은 G4 가 훨씬 작다). 같은 표본이면 같은 바이트가 나온다
+fn bilevel(mut dict: Dictionary, bits: Vec<u8>, w: usize, h: usize) -> Stream {
+    use std::io::Write;
+    dict.set("BitsPerComponent", Object::Integer(1));
+    let flate_len = {
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&bits).ok();
+        z.finish().map_or(usize::MAX, |v| v.len())
+    };
+    match codecs::g4(&bits, w, h) {
+        Some(g4) if g4.len() < flate_len => {
+            dict.set("Filter", Object::Name(b"CCITTFaxDecode".to_vec()));
+            let mut p = Dictionary::new();
+            p.set("K", Object::Integer(-1));
+            p.set("Columns", Object::Integer(w as i64));
+            p.set("Rows", Object::Integer(h as i64));
+            dict.set("DecodeParms", Object::Dictionary(p));
+            Stream::new(dict, g4).with_compression(false)
+        }
+        _ => Stream::new(dict, bits),
+    }
+}
+
+/// 연산 전체가 바깥 `q … Q` 한 쌍으로 감싸져 있는지 (중간에 깊이가 0 으로 돌아오지 않음)
+fn wrapped_once(ops: &[Operation]) -> bool {
+    if ops.len() < 2 || ops[0].operator != "q" || ops[ops.len() - 1].operator != "Q" {
+        return false;
+    }
+    let mut depth = 0i64;
+    for (i, op) in ops.iter().enumerate() {
+        match op.operator.as_str() {
+            "q" => depth += 1,
+            "Q" => depth -= 1,
+            _ => {}
+        }
+        if depth <= 0 && i + 1 < ops.len() {
+            return false;
+        }
+    }
+    depth == 0
 }

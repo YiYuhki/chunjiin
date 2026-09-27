@@ -144,7 +144,31 @@ pub fn jbig2_segment(n: u32, t: u8, data: &[u8]) -> Vec<u8> {
 
 /// 무늬 (x+2y)%5==0 이 검정인 w×h 그림을 JBIG2(MMR 일반 영역)로: (페이지 정보, 영역+끝, 기대 1비트 표본)
 pub fn jbig2_parts(w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
-    let black = |x: u32, y: u32| (x + 2 * y).is_multiple_of(5);
+    jbig2_parts_with(w, h, |x, y| (x + 2 * y).is_multiple_of(5))
+}
+
+/// 문서 스캔 같은 무늬(줄마다 흩어진 글자 모양)의 JBIG2
+pub fn jbig2_text_parts(w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    jbig2_parts_with(w, h, |x, y| {
+        let (cx, cy) = (x / 9, y / 14);
+        let seed = cx.wrapping_mul(2_654_435_761) ^ cy.wrapping_mul(40_503);
+        let (gx, gy) = (x % 9, y % 14);
+        // 획(세로·가로 막대)으로 된 글자 모양이 칸마다 있거나 없다
+        let stroke = match seed % 4 {
+            0 => gx < 2,
+            1 => !(2..=7).contains(&gy),
+            2 => gx < 2 || gy < 2,
+            _ => gx > 4 || gy > 7,
+        };
+        cy % 2 == 0 && gy < 10 && gx < 7 && seed % 5 != 0 && stroke
+    })
+}
+
+pub fn jbig2_parts_with(
+    w: u32,
+    h: u32,
+    black: impl Fn(u32, u32) -> bool,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let mut info = Vec::new();
     for v in [w, h, 0, 0] {
         info.extend(v.to_be_bytes());

@@ -4,7 +4,7 @@ mod common;
 
 use cdr::{Engine, Status};
 use common::pdf_inline::{
-    inline_image_content, jbig2_parts, pdf_with_content, unhex, JPX_RGB, JPX_RGBA,
+    inline_image_content, jbig2_parts, jbig2_text_parts, pdf_with_content, unhex, JPX_RGB, JPX_RGBA,
 };
 use lopdf::{Document, Stream};
 
@@ -149,6 +149,34 @@ fn pdf_with_image(image: Stream) -> Vec<u8> {
     out
 }
 
+/// 이미지 표본. CCITT G4 로 다시 압축된 1비트 이미지는 풀어서 (검정 = 0)
+fn samples(img: &Stream) -> Vec<u8> {
+    if img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"CCITTFaxDecode") {
+        return img.get_plain_content().unwrap();
+    }
+    let int = |k: &[u8]| img.dict.get(k).unwrap().as_i64().unwrap() as u32;
+    let (w, h) = (int(b"Width"), int(b"Height"));
+    let stride = w.div_ceil(8) as usize;
+    let mut out = Vec::new();
+    fax::decoder::decode_g4(img.content.iter().copied(), w, Some(h), |t| {
+        let mut row = vec![0xFFu8; stride];
+        let mut black = false;
+        let mut x = 0u32;
+        for &p in t.iter().chain(std::iter::once(&w)) {
+            if black {
+                for k in x..p.min(w) {
+                    row[k as usize / 8] &= !(0x80 >> (k % 8));
+                }
+            }
+            x = p;
+            black = !black;
+        }
+        out.extend(row);
+    })
+    .unwrap();
+    out
+}
+
 fn output_image(pdf: &[u8]) -> Stream {
     let doc = Document::load_mem(pdf).unwrap();
     doc.objects
@@ -220,9 +248,20 @@ fn image_xobject_codecs_are_reencoded() {
     let r = Engine::default().process(&pdf_with_image(s), "b.pdf");
     assert_ne!(r.status, Status::Blocked, "{}", r.reason);
     let img = output_image(r.output.as_ref().unwrap());
-    let plain = img.get_plain_content().unwrap();
-    assert!(img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"CCITTFaxDecode"));
-    assert_eq!(plain, [0b1110_0111, 0b1110_0111]);
+    // 직접 다시 압축한 G4 (원본 G3 데이터가 아님)
+    assert_eq!(
+        img.dict
+            .get(b"DecodeParms")
+            .unwrap()
+            .as_dict()
+            .unwrap()
+            .get(b"K")
+            .unwrap()
+            .as_i64()
+            .unwrap(),
+        -1
+    );
+    assert_eq!(samples(&img), [0b1110_0111, 0b1110_0111]);
     let again = Engine::default().process(r.output.as_ref().unwrap(), "b.pdf");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
@@ -275,7 +314,7 @@ fn jbig2_and_jpx_images_are_decoded() {
     assert_ne!(r.status, Status::Blocked, "{} {:#?}", r.reason, r.findings);
     let img = output_image(r.output.as_ref().unwrap());
     assert!(img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"JBIG2Decode"));
-    assert_eq!(img.get_plain_content().unwrap(), bits);
+    assert_eq!(samples(&img), bits);
     assert_eq!(r.stats.get("pdf_images_reencoded"), Some(&1));
     let again = Engine::default().process(r.output.as_ref().unwrap(), "a.pdf");
     assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
@@ -309,6 +348,35 @@ fn jbig2_and_jpx_images_are_decoded() {
         r.findings
     );
     assert!(img.dict.get(b"DecodeParms").is_err());
+
+    // 큰 흑백 이미지: G4 와 Flate 중 작은 쪽으로 다시 압축한다
+    let (info, body, bits) = jbig2_text_parts(400, 300);
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 400, "Height" => 300,
+            "ImageMask" => true, "Filter" => "JBIG2Decode",
+        },
+        [info, body].concat(),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "g.pdf");
+    let img = output_image(r.output.as_ref().unwrap());
+    assert_eq!(samples(&img), bits);
+    let flate = {
+        use std::io::Write;
+        let mut z = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        z.write_all(&bits).unwrap();
+        z.finish().unwrap().len()
+    };
+    assert!(
+        img.content.len() <= flate,
+        "{} > {flate}",
+        img.content.len()
+    );
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "g.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+    let third = Engine::default().process(again.output.as_ref().unwrap(), "g.pdf");
+    assert_eq!(third.output, again.output, "고정점");
 
     // JPX XObject (색 공간 없음, Decode 는 JPX 에서 무시되므로 뺌) → 8비트 DeviceRGB
     let s = Stream::new(
@@ -474,4 +542,69 @@ fn ycck_jpeg_becomes_raw_cmyk() {
             }
         }
     }
+}
+
+/// 4×2 RGB JP2 (colr 상자에 sRGB ICC 프로필). 화소 (x, y) = (60x, 100y, 200)
+const JPX_ICC: &str = "0000000c6a5020200d0a870a00000014667479706a703220000000006a703220000002756a7032680000001669686472000000020000000400030707000000000257636f6c720200000000024c6c636d73044000006d6e74725247422058595a2007ea0009001b0009000d0003616373704150504c0000000000000000000000000000000000000000000000000000f6d6000100000000d32d6c636d7300000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000b64657363000001080000003663707274000001400000004c777470740000018c0000001463686164000001a00000002c7258595a000001cc000000146258595a000001e0000000146758595a000001f4000000147254524300000208000000206754524300000208000000206254524300000208000000206368726d00000228000000246d6c756300000000000000010000000c656e55530000001a0000001c00730052004700420020006200750069006c0074002d0069006e00006d6c756300000000000000010000000c656e5553000000300000001c004e006f00200063006f0070007900720069006700680074002c002000750073006500200066007200650065006c007958595a20000000000000f6d6000100000000d32d736633320000000000010c42000005defffff325000007930000fd90fffffba1fffffda2000003dc0000c06e58595a200000000000006fa0000038f50000039058595a20000000000000249f00000f840000b6c358595a2000000000000062970000b787000018d9706172610000000000030000000266660000f2a700000d59000013d000000a5b6368726d00000000000300000000a3d70000547b00004ccd0000999a0000266600000f5c000000aa6a703263ff4fff51002f000000000004000000020000000000000000000000040000000200000000000000000003070101070101070101ff52000c00000001000104040001ff5c00074040484850ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a00000000002f0001ff93df80180771bfcfb40c091fefcfb40c02659fc3ea03000b137fa3ed030001c79f80ffd9";
+
+#[test]
+fn jpx_icc_profile_becomes_iccbased() {
+    use lopdf::dictionary;
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 4, "Height" => 2,
+            "Filter" => "JPXDecode",
+        },
+        unhex(JPX_ICC),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "icc.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let doc = Document::load_mem(r.output.as_ref().unwrap()).unwrap();
+    let img = output_image(r.output.as_ref().unwrap());
+    let cs = img.dict.get(b"ColorSpace").unwrap().as_array().unwrap();
+    assert_eq!(cs[0].as_name().unwrap(), b"ICCBased");
+    let icc = doc
+        .get_object(cs[1].as_reference().unwrap())
+        .unwrap()
+        .as_stream()
+        .unwrap();
+    assert_eq!(icc.dict.get(b"N").unwrap().as_i64().unwrap(), 3);
+    assert_eq!(&icc.get_plain_content().unwrap()[36..40], b"acsp");
+    let expect: Vec<u8> = (0..2)
+        .flat_map(|y| (0..4).flat_map(move |x| [60 * x, 100 * y, 200]))
+        .collect();
+    assert_eq!(samples(&img), expect);
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "icc.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
+
+/// 16×8 단색(40, 160, 220) 손실(9-7) JPEG 2000 코드스트림
+const JPX_LOSSY: &str = "ff4fff51002f000000000010000000080000000000000000000000100000000800000000000000000003070101070101070101ff52000c00000001000304040000ff5c001742673867506750676850055005504757d357d35762ff640025000143726561746564206279204f70656e4a5045472076657273696f6e20322e352e34ff90000a0000000000290001ff93c7ec06090958c3f303027943c7ec0601d46b808080808080808080ffd9";
+
+#[test]
+fn lossy_jpx_becomes_jpeg() {
+    use lopdf::dictionary;
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 16, "Height" => 8,
+            "ColorSpace" => "DeviceRGB", "Filter" => "JPXDecode",
+        },
+        unhex(JPX_LOSSY),
+    )
+    .with_compression(false);
+    let r = Engine::default().process(&pdf_with_image(s), "l.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let img = output_image(r.output.as_ref().unwrap());
+    assert_eq!(
+        img.dict.get(b"Filter").unwrap().as_name().unwrap(),
+        b"DCTDecode"
+    );
+    let px = image::load_from_memory(&img.content).unwrap().to_rgb8();
+    assert_eq!((px.width(), px.height()), (16, 8));
+    assert!(px.pixels().all(|p| (i32::from(p[0]) - 40).abs() < 8
+        && (i32::from(p[1]) - 160).abs() < 8
+        && (i32::from(p[2]) - 220).abs() < 8));
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "l.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
