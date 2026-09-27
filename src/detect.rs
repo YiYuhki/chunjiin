@@ -37,6 +37,9 @@ pub enum FileType {
     Wmf,
     /// SVG 벡터 그림 (허용 확장자일 때만, 엔진이 확장자로 결정)
     Svg,
+    /// iCalendar / vCard (허용 확장자일 때만)
+    Ics,
+    Vcf,
     /// 텍스트 (허용 확장자일 때만, 엔진이 확장자로 결정)
     Text,
     Csv,
@@ -68,6 +71,8 @@ impl FileType {
             FileType::Emf => "emf",
             FileType::Wmf => "wmf",
             FileType::Svg => "svg",
+            FileType::Ics => "ics",
+            FileType::Vcf => "vcf",
             FileType::Text => "text",
             FileType::Csv => "csv",
             FileType::Tsv => "tsv",
@@ -105,6 +110,8 @@ impl FileType {
             FileType::Emf => Some("emf"),
             FileType::Wmf => Some("wmf"),
             FileType::Svg => Some("svg"),
+            FileType::Ics => Some("ics"),
+            FileType::Vcf => Some("vcf"),
             _ => None,
         }
     }
@@ -133,6 +140,8 @@ impl FileType {
             FileType::Emf => &["emf"],
             FileType::Wmf => &["wmf"],
             FileType::Svg => &["svg"],
+            FileType::Ics => &["ics"],
+            FileType::Vcf => &["vcf", "vcard"],
             FileType::Text => &["txt", "log"],
             FileType::Csv => &["csv"],
             FileType::Tsv => &["tsv", "tab"],
@@ -162,6 +171,16 @@ pub fn detect_named(data: &[u8], filename: &str, allow_text: bool) -> FileType {
             if extension_of(filename) == "svg" && crate::svg::looks_like_svg(data) =>
         {
             FileType::Svg
+        }
+        FileType::Unknown
+            if matches!(extension_of(filename).as_str(), "ics" | "vcf" | "vcard")
+                && crate::ical::looks_like(data) =>
+        {
+            if extension_of(filename) == "ics" {
+                FileType::Ics
+            } else {
+                FileType::Vcf
+            }
         }
         FileType::Unknown
             if allow_text && !data.starts_with(b"MZ") && !data.starts_with(b"\x7fELF") =>

@@ -171,3 +171,40 @@ pub fn rtf_bomb_msg(compressed_len: usize) -> Vec<u8> {
     let refs: Vec<(&str, &[u8])> = e.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
     cfb(&refs)
 }
+
+/// 일정 항목: 시작·종료·장소가 명명 속성에 들어 있다
+pub fn appointment_msg() -> Vec<u8> {
+    let appt = [
+        0x02, 0x20, 0x06, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46,
+    ];
+    let mut entries = Vec::new();
+    for (i, lid) in [0x820Du32, 0x820E, 0x8208].into_iter().enumerate() {
+        entries.extend(lid.to_le_bytes());
+        entries.extend(6u16.to_le_bytes()); // GUID 색인 3, 번호 이름
+        entries.extend((i as u16).to_le_bytes());
+    }
+    let start = (1_704_164_645u64 + 11_644_473_600) * 10_000_000;
+    let e: Vec<(String, Vec<u8>)> = vec![
+        (
+            "__properties_version1.0".into(),
+            props_stream(
+                32,
+                &[
+                    (0x8000, 0x0040, start),
+                    (0x8001, 0x0040, start + 36_000_000_000),
+                ],
+            ),
+        ),
+        (
+            "__nameid_version1.0/__substg1.0_00020102".into(),
+            appt.to_vec(),
+        ),
+        ("__nameid_version1.0/__substg1.0_00030102".into(), entries),
+        string_prop("", 0x001A, "IPM.Appointment"),
+        string_prop("", 0x0037, "분기 회의"),
+        string_prop("", 0x1000, "안건: 예산"),
+        string_prop("", 0x8002, "3층 회의실\r\nBEGIN:VALARM\r\nACTION:PROCEDURE"),
+    ];
+    let refs: Vec<(&str, &[u8])> = e.iter().map(|(n, d)| (n.as_str(), d.as_slice())).collect();
+    cfb(&refs)
+}

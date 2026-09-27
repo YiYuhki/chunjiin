@@ -179,6 +179,7 @@ impl Engine {
                 }
                 crate::svg::reassemble(data, &self.policy, findings)
             }
+            FileType::Ics | FileType::Vcf => crate::ical::reassemble(data, findings),
             FileType::Text => text::reassemble(data, text::Kind::Text, findings),
             FileType::Csv => text::reassemble(data, text::Kind::Delimited(','), findings),
             FileType::Tsv => text::reassemble(data, text::Kind::Delimited('\t'), findings),
@@ -199,7 +200,13 @@ impl Engine {
     fn verify(&self, output: &[u8], ftype: FileType) -> Option<String> {
         // 텍스트는 내용만으로 판별되지 않으므로 같은 형식으로 다시 해석한다
         let out_type = match ftype {
-            FileType::Text | FileType::Csv | FileType::Tsv | FileType::Eml | FileType::Svg => ftype,
+            FileType::Text
+            | FileType::Csv
+            | FileType::Tsv
+            | FileType::Eml
+            | FileType::Svg
+            | FileType::Ics
+            | FileType::Vcf => ftype,
             // 결과는 EML (내용만으로는 메일로 판별하지 않는다)
             FileType::Msg => FileType::Eml,
             _ => detect::detect(output),

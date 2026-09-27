@@ -1,7 +1,7 @@
 mod common;
 
 use cdr::{Engine, Status};
-use common::msg::{malicious_msg, rtf_bomb_msg, rtf_html_msg};
+use common::msg::{appointment_msg, malicious_msg, rtf_bomb_msg, rtf_html_msg};
 use mail_parser::MimeHeaders;
 
 fn parse(eml: &[u8]) -> mail_parser::Message<'_> {
@@ -150,4 +150,61 @@ fn compressed_rtf_bomb_is_blocked() {
     // 작은 메시지의 압축 RTF 는 여유분 안에서 풀린다
     let r = Engine::default().process(&rtf_bomb_msg(64 << 10), "a.msg");
     assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+}
+
+#[test]
+fn appointment_becomes_ics() {
+    let r = Engine::default().process(&appointment_msg(), "회의.msg");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let out = r.output.clone().unwrap();
+    let m = parse(&out);
+    let body = m.body_text(0).unwrap();
+    assert!(body.contains("시작: 2024-01-02 03:04 (UTC)"), "{body}");
+    assert!(body.contains("종료: 2024-01-02 04:04 (UTC)") && body.contains("안건: 예산"));
+    let ics = m
+        .attachments()
+        .find(|a| a.attachment_name() == Some("event.ics"))
+        .expect("event.ics");
+    let ics = String::from_utf8_lossy(ics.contents());
+    assert!(ics.contains("DTSTART:20240102T030405Z") && ics.contains("SUMMARY:분기 회의"));
+    // 장소 값에 끼워 넣은 줄바꿈은 이스케이프되어 새 구성 요소가 되지 않는다
+    assert!(
+        ics.contains("LOCATION:3층 회의실\\nBEGIN:VALARM\\nACTION:PROCEDURE"),
+        "{ics}"
+    );
+    assert!(!ics.contains("\r\nBEGIN:VALARM"));
+    let again = Engine::default().process(&out, "회의.eml");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
+}
+
+#[test]
+fn standalone_calendar_is_rebuilt() {
+    let ics = "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a@b\r\nDTSTART:20240102T030405Z\r\nSUMMARY:회의\r\nATTACH;VALUE=BINARY;ENCODING=BASE64:TVqQAAMAAAA=\r\nBEGIN:VALARM\r\nACTION:PROCEDURE\r\nATTACH:file:///bin/sh\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n";
+    let r = Engine::default().process(ics.as_bytes(), "a.ics");
+    assert_eq!(
+        r.status,
+        Status::Sanitized,
+        "{} {:#?}",
+        r.reason,
+        r.findings
+    );
+    let out = String::from_utf8(r.output.unwrap()).unwrap();
+    assert!(!out.contains("ATTACH") && !out.contains("VALARM") && out.contains("SUMMARY:회의"));
+    // 확장자가 .ics 여도 내용이 달력이 아니면 받지 않는다
+    assert_eq!(
+        Engine::default().process(b"MZ\x90\x00", "a.ics").status,
+        Status::Blocked
+    );
+    let vcf = "BEGIN:VCARD\nVERSION:3.0\nFN:Kim\nURL:http://evil.example\nEND:VCARD\n";
+    let r = Engine::default().process(vcf.as_bytes(), "a.vcf");
+    assert_eq!(r.status, Status::Sanitized);
+    assert!(!String::from_utf8(r.output.unwrap())
+        .unwrap()
+        .contains("evil"));
 }

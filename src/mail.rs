@@ -103,6 +103,8 @@ pub(crate) struct RawAttachment<'a> {
     pub inline_hint: bool,
     /// S/MIME 분리 서명 (재조합하면 맞지 않으므로 뺀다)
     pub signature: bool,
+    /// 엔진이 직접 만든 첨부의 MIME 형식 (재조합 없이 싣는다)
+    pub generated: Option<&'static str>,
     pub data: Cow<'a, [u8]>,
 }
 
@@ -220,6 +222,7 @@ pub(crate) fn parse(data: &[u8], findings: &mut Findings) -> Result<RawMail<'sta
             content_id: part.content_id().map(str::to_string),
             inline_hint: part.content_disposition().is_none_or(|d| d.is_inline()),
             signature,
+            generated: None,
             data: Cow::Owned(bytes.into_owned()),
         });
     }
@@ -252,6 +255,16 @@ pub(crate) fn rebuild(
     for a in raw.attachments {
         if a.signature {
             signatures += 1;
+            continue;
+        }
+        if let Some(ct) = a.generated {
+            attachments.push(Attachment {
+                name: a.name,
+                content_type: ct.to_string(),
+                content_id: None,
+                inline: false,
+                data: a.data.into_owned(),
+            });
             continue;
         }
         let bytes = a.data;
@@ -384,7 +397,7 @@ pub(crate) fn serialize_raw(raw: RawMail) -> Vec<u8> {
         .into_iter()
         .filter(|a| !a.signature)
         .map(|a| {
-            let content_type = mime_for(&a.name).to_string();
+            let content_type = a.generated.unwrap_or(mime_for(&a.name)).to_string();
             let content_id = a
                 .content_id
                 .map(|c| clean_header(&c).trim_matches(['<', '>']).to_string())
@@ -576,6 +589,8 @@ fn mime_for(name: &str) -> &'static str {
         "jpg" | "jpeg" => "image/jpeg",
         "gif" => "image/gif",
         "svg" => "image/svg+xml",
+        "ics" => "text/calendar; charset=utf-8",
+        "vcf" | "vcard" => "text/vcard; charset=utf-8",
         "emf" => "image/x-emf",
         "wmf" => "image/x-wmf",
         "csv" => "text/csv",

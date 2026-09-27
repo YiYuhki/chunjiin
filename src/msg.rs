@@ -42,6 +42,18 @@ struct Reader<'a> {
     /// 파일 크기보다 훨씬 많이 읽히게 할 수 있다
     budget: usize,
     over_budget: bool,
+    /// 명명 속성 (속성 집합 GUID, 번호) → 속성 ID
+    named: Option<HashMap<([u8; 16], u32), u16>>,
+}
+
+/// 명명 속성 집합 (GUID 는 저장 형식인 리틀 엔디언 배치)
+const PSETID_APPOINTMENT: [u8; 16] = psetid(0x02);
+const PSETID_TASK: [u8; 16] = psetid(0x03);
+const PSETID_ADDRESS: [u8; 16] = psetid(0x04);
+
+/// {0006200x-0000-0000-C000-000000000046}
+const fn psetid(x: u8) -> [u8; 16] {
+    [x, 0x20, 0x06, 0, 0, 0, 0, 0, 0xC0, 0, 0, 0, 0, 0, 0, 0x46]
 }
 
 /// 저장소 하나(메시지·첨부·수신자)의 속성
@@ -132,6 +144,51 @@ impl Reader<'_> {
 
     fn binary(&mut self, p: &Props, id: u16) -> Option<Vec<u8>> {
         self.stream(&format!("{}/__substg1.0_{id:04X}0102", p.base))
+    }
+
+    /// 명명 속성의 실제 속성 ID (__nameid_version1.0 매핑)
+    fn named(&mut self, guid: [u8; 16], lid: u32) -> Option<u16> {
+        if self.named.is_none() {
+            let guids = self
+                .stream("/__nameid_version1.0/__substg1.0_00020102")
+                .unwrap_or_default();
+            let entries = self
+                .stream("/__nameid_version1.0/__substg1.0_00030102")
+                .unwrap_or_default();
+            let mut map = HashMap::new();
+            for e in entries.as_chunks::<8>().0 {
+                let id = u32::from_le_bytes([e[0], e[1], e[2], e[3]]);
+                let kind = u16::from_le_bytes([e[4], e[5]]);
+                let index = u16::from_le_bytes([e[6], e[7]]);
+                // 문자열 이름은 쓰지 않는다
+                if kind & 1 != 0 {
+                    continue;
+                }
+                let g = usize::from(kind >> 1);
+                let Some(gb) = g
+                    .checked_sub(3)
+                    .and_then(|i| guids.get(i * 16..i * 16 + 16))
+                else {
+                    continue;
+                };
+                let mut key = [0u8; 16];
+                key.copy_from_slice(gb);
+                map.entry((key, id))
+                    .or_insert(0x8000u16.wrapping_add(index));
+            }
+            self.named = Some(map);
+        }
+        self.named.as_ref()?.get(&(guid, lid)).copied()
+    }
+
+    fn named_string(&mut self, p: &Props, guid: [u8; 16], lid: u32) -> Option<String> {
+        let id = self.named(guid, lid)?;
+        self.string(p, id)
+    }
+
+    fn named_u64(&mut self, p: &Props, guid: [u8; 16], lid: u32) -> Option<u64> {
+        let id = self.named(guid, lid)?;
+        p.u64(id).filter(|&v| v > 0)
     }
 
     fn children(&self, base: &str, prefix: &str) -> Vec<String> {
@@ -231,6 +288,7 @@ pub fn reassemble(
         limit: engine.policy.max_stream_size,
         budget: data.len().saturating_mul(2).saturating_add(16 << 20),
         over_budget: false,
+        named: None,
     };
     let raw = message(&mut r, "", 32, 0, findings)?;
     if r.over_budget {
@@ -384,6 +442,37 @@ fn message<'a>(
     raw.htmls
         .extend(html.map(|h| h.trim_end_matches('\0').to_string()));
 
+    // 일정·작업·연락처: 항목 정보를 본문 앞 요약과 .ics/.vcf 첨부로
+    if let Some(item) = item(r, &p, sender_name.as_deref(), raw.texts.first()) {
+        let summary = item.summary();
+        if !summary.is_empty() {
+            match raw.texts.first_mut() {
+                Some(t) => t.insert_str(0, &summary),
+                None => raw.texts.push(summary.clone()),
+            }
+            if let Some(h) = raw.htmls.first_mut() {
+                let esc = summary
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('\n', "<br>");
+                h.insert_str(0, &format!("<p>{esc}</p>"));
+            }
+        }
+        let stamp = p.u64(0x0039).filter(|&t| t > 0);
+        if let Some(g) = item.attachment(stamp) {
+            findings.count("msg_items_converted", 1);
+            raw.attachments.push(RawAttachment {
+                name: g.name,
+                content_id: None,
+                inline_hint: false,
+                signature: false,
+                generated: Some(g.content_type),
+                data: g.data.into(),
+            });
+        }
+    }
+
     // 첨부
     let html_body = raw.htmls.join("");
     for (i, ab) in r
@@ -428,6 +517,7 @@ fn message<'a>(
                     content_id: cid,
                     inline_hint: hidden || referenced,
                     signature: false,
+                    generated: None,
                     data: data.into(),
                 });
             }
@@ -453,6 +543,7 @@ fn message<'a>(
                     content_id: None,
                     inline_hint: false,
                     signature: false,
+                    generated: None,
                     data: serialize(child).into(),
                 });
             }
@@ -475,6 +566,84 @@ fn message<'a>(
         }
     }
     Ok(raw)
+}
+
+/// 메시지 클래스에 따라 일정·작업·연락처 정보를 꺼낸다
+fn item(
+    r: &mut Reader,
+    p: &Props,
+    sender: Option<&str>,
+    body: Option<&String>,
+) -> Option<crate::msgitem::Item> {
+    use crate::msgitem::{Contact, Event, Item, Task};
+    let class = r.string(p, 0x001A)?.to_ascii_uppercase();
+    let subject = r.string(p, 0x0037).unwrap_or_default();
+    let description = body.cloned().unwrap_or_default();
+    if class.starts_with("IPM.APPOINTMENT") || class.starts_with("IPM.SCHEDULE.MEETING") {
+        // PidLidAppointmentStartWhole / EndWhole, 없으면 PidTagStartDate / EndDate
+        let start = r
+            .named_u64(p, PSETID_APPOINTMENT, 0x820D)
+            .or_else(|| p.u64(0x0060).filter(|&t| t > 0));
+        let end = r
+            .named_u64(p, PSETID_APPOINTMENT, 0x820E)
+            .or_else(|| p.u64(0x0061).filter(|&t| t > 0));
+        let attendees = [0x0E04, 0x0E03]
+            .into_iter()
+            .filter_map(|id| r.string(p, id).filter(|s| !s.trim().is_empty()))
+            .collect::<Vec<_>>();
+        return Some(Item::Event(Event {
+            summary: subject,
+            start,
+            end,
+            location: r.named_string(p, PSETID_APPOINTMENT, 0x8208),
+            organizer: sender.map(str::to_string),
+            attendees: (!attendees.is_empty()).then(|| attendees.join("; ")),
+            description,
+        }));
+    }
+    if class.starts_with("IPM.TASK") {
+        let percent = r
+            .named(PSETID_TASK, 0x8102)
+            .and_then(|id| p.u64(id))
+            .map(f64::from_bits)
+            .filter(|v| v.is_finite() && (0.0..=1.0).contains(v));
+        return Some(Item::Task(Task {
+            summary: subject,
+            start: r.named_u64(p, PSETID_TASK, 0x8104),
+            due: r.named_u64(p, PSETID_TASK, 0x8105),
+            percent,
+            description,
+        }));
+    }
+    if class.starts_with("IPM.CONTACT") {
+        let mut s = |id: u16| r.string(p, id).filter(|v| !v.trim().is_empty());
+        let mut c = Contact {
+            display: s(0x3001),
+            given: s(0x3A06),
+            surname: s(0x3A11),
+            company: s(0x3A16),
+            department: s(0x3A18),
+            title: s(0x3A17),
+            address: [s(0x3A29), s(0x3A27), s(0x3A28), s(0x3A2A), s(0x3A26)],
+            ..Default::default()
+        };
+        for (kind, id) in [("회사", 0x3A08), ("휴대", 0x3A1C), ("집", 0x3A09)] {
+            if let Some(v) = r.string(p, id).filter(|v| !v.trim().is_empty()) {
+                c.phones.push((kind, v));
+            }
+        }
+        // PidLidEmail1·2·3EmailAddress
+        for lid in [0x8083, 0x8093, 0x80A3] {
+            if let Some(e) = r
+                .named_string(p, PSETID_ADDRESS, lid)
+                .filter(|e| e.contains('@'))
+            {
+                c.emails.push(e);
+            }
+        }
+        return Some(Item::Contact(c));
+    }
+    None
 }
 
 /// 헤더 블록을 (이름, 값) 목록으로 (접힌 줄을 잇는다)

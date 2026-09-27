@@ -230,6 +230,7 @@ fn mutate_inline_content(rng: &mut Rng, _: &[u8]) -> Vec<u8> {
 fn fuzz_legacy() {
     run("a.hwp", 7, legacy::malicious_hwp(1 | 8), mutate_cfb);
     run("a.msg", 28, common::msg::malicious_msg(), mutate_cfb);
+    run("c.msg", 32, common::msg::appointment_msg(), mutate_cfb);
     run("b.msg", 29, common::msg::rtf_html_msg(), mutate_cfb);
     run("b.hwp", 8, legacy::malicious_hwp(0), mutate_cfb);
     run("a.doc", 9, legacy::malicious_doc(1 << 9), mutate_cfb);
@@ -284,6 +285,10 @@ fn fuzz_archive_and_images() {
     run("a.wmf", 26, common::metafile::malicious_wmf(), mutate_bytes);
     let svg = br##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" onload="x()"><style>rect{fill:url(#g)}</style><defs><linearGradient id="g"/></defs><rect width="5" height="5" style="fill:red"/><use xlink:href="#g"/><image href="data:image/gif;base64,R0lGODlhAQABAAAAACw="/><script>a()</script><a href="http://e/"><text>t</text></a></svg>"##.to_vec();
     run("a.svg", 27, svg, mutate_bytes);
+    let ics = b"BEGIN:VCALENDAR\r\nVERSION:2.0\r\nBEGIN:VEVENT\r\nUID:a@b\r\nDTSTART;TZID=\"Asia/Seoul\":20240102T030405\r\nSUMMARY:x\\, y\r\n z\r\nORGANIZER;CN=\"K\":mailto:k@e\r\nBEGIN:VALARM\r\nACTION:DISPLAY\r\nEND:VALARM\r\nEND:VEVENT\r\nEND:VCALENDAR\r\n".to_vec();
+    run("a.ics", 33, ics, mutate_bytes);
+    let vcf = b"BEGIN:VCARD\nVERSION:3.0\nFN:K\nN:K;J;;;\nitem1.EMAIL;TYPE=INTERNET:k@e\nADR:;;s;c;;1;k\nEND:VCARD\n".to_vec();
+    run("a.vcf", 34, vcf, mutate_bytes);
 }
 
 #[test]
