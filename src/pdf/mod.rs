@@ -13,6 +13,7 @@
 //!    첨부 파일, XFA/AcroForm, 포트폴리오, 메타데이터, 증분 업데이트, 은닉 객체,
 //!    파일 끝 덧붙은 데이터는 새 문서에 존재하지 않는다.
 
+mod ccitt;
 mod content;
 mod font;
 mod inline;
@@ -25,6 +26,7 @@ use lopdf::content::{Content, Operation};
 use lopdf::{Dictionary, Document, LoadOptions, Object, ObjectId, Stream, StringFormat};
 
 use crate::error::{blocked, Result};
+use crate::imaging::{self, ImageKind};
 use crate::policy::Policy;
 use crate::report::{Findings, Severity};
 
@@ -617,6 +619,10 @@ impl<'a> Copier<'a> {
             );
             return Ok(None);
         }
+        // 이미지는 코덱 데이터를 옮기지 않고 화소로 풀어 다시 쓴다 (재검증 단계는 형식만 확인)
+        if is_image && !self.policy.media_passthrough {
+            return self.reencode_image(s, dict, &codec, &raw);
+        }
         dict.set("Filter", Object::Name(codec.clone()));
         if codec == b"CCITTFaxDecode" {
             if let Ok(parms) = s.dict.get(b"DecodeParms") {
@@ -630,6 +636,99 @@ impl<'a> Copier<'a> {
             }
         }
         Ok(Some(Stream::new(dict, raw).with_compression(false)))
+    }
+
+    /// JPEG(DCT)·CCITT 이미지를 화소로 풀어 다시 쓴다. JPEG 은 JPEG 으로 다시 압축하고
+    /// (CMYK 는 끝까지 디코딩해 검증한 뒤 원본 유지), CCITT 는 1비트 표본(저장 시 Flate)으로 옮긴다
+    fn reencode_image(
+        &mut self,
+        s: &Stream,
+        mut dict: Dictionary,
+        codec: &[u8],
+        raw: &[u8],
+    ) -> Result<Option<Stream>> {
+        let int = |k: &[u8]| {
+            s.dict
+                .get(k)
+                .ok()
+                .and_then(|o| self.deref(o))
+                .and_then(|o| o.as_i64().ok())
+                .filter(|v| *v > 0)
+                .map(|v| v as usize)
+        };
+        let (Some(w), Some(h)) = (int(b"Width"), int(b"Height")) else {
+            self.findings
+                .add("image", Severity::Low, "크기가 없는 이미지 제외", "");
+            return Ok(None);
+        };
+        if codec == b"DCTDecode" {
+            let Ok(img) = imaging::decode(raw, ImageKind::Jpeg, self.policy) else {
+                self.findings.add(
+                    "image",
+                    Severity::Medium,
+                    "디코딩할 수 없는 JPEG 이미지 제외",
+                    "",
+                );
+                return Ok(None);
+            };
+            // CMYK(Adobe) JPEG 은 뷰어마다 반전 규칙을 따로 적용해 RGB 로 바꾸면 색이 달라진다.
+            // 끝까지 디코딩해 형식을 검증한 뒤 원본을 옮긴다
+            if jpeg_components(raw) == Some(4) {
+                dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+                *self
+                    .font_stats
+                    .entry("pdf_cmyk_jpeg_validated")
+                    .or_default() += 1;
+                return Ok(Some(
+                    Stream::new(dict, raw.to_vec()).with_compression(false),
+                ));
+            }
+            // 사전의 크기와 다르면 JPEG 의 실제 크기를 쓴다 (뷰어의 동작과 같게)
+            if img.width() as usize != w || img.height() as usize != h {
+                dict.set("Width", Object::Integer(i64::from(img.width())));
+                dict.set("Height", Object::Integer(i64::from(img.height())));
+            }
+            let gray = img.color().channel_count() == 1;
+            let mut out = std::io::Cursor::new(Vec::new());
+            let enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut out, 92);
+            let r = if gray {
+                image::DynamicImage::ImageLuma8(img.to_luma8()).write_with_encoder(enc)
+            } else {
+                image::DynamicImage::ImageRgb8(img.to_rgb8()).write_with_encoder(enc)
+            };
+            if r.is_err() {
+                return Ok(None);
+            }
+            dict.set("BitsPerComponent", Object::Integer(8));
+            dict.set("Filter", Object::Name(b"DCTDecode".to_vec()));
+            *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
+            return Ok(Some(
+                Stream::new(dict, out.into_inner()).with_compression(false),
+            ));
+        }
+        // CCITT
+        let parms = s
+            .dict
+            .get(b"DecodeParms")
+            .ok()
+            .and_then(|p| self.deref(p))
+            .cloned();
+        let nfilters = s.filters().map(|f| f.len()).unwrap_or(1).max(1);
+        let decoded = inline::ccitt_params(parms.as_ref(), nfilters, w)
+            .filter(|_| w.saturating_mul(h) as u64 <= self.policy.max_image_pixels)
+            .and_then(|p| inline::ccitt_decode(raw, &p, w, h));
+        let Some((bits, _)) = decoded else {
+            self.findings.add(
+                "image",
+                Severity::Medium,
+                "디코딩할 수 없는 CCITT 이미지 제외",
+                "",
+            );
+            return Ok(None);
+        };
+        dict.set("BitsPerComponent", Object::Integer(1));
+        *self.font_stats.entry("pdf_images_reencoded").or_default() += 1;
+        Ok(Some(Stream::new(dict, bits)))
     }
 
     /// 글꼴 프로그램 스트림. TrueType 과 CFF 기반 OpenType 은 새로 조립하고, CFF(Type1C 등)와
@@ -935,6 +1034,27 @@ fn rebuild(data: &[u8], policy: &Policy, findings: &mut Findings) -> Result<Vec<
 }
 
 /// 페이지 트리에서 상속되는 속성을 찾는다.
+/// JPEG 프레임 머리(SOF)의 색 성분 수
+fn jpeg_components(d: &[u8]) -> Option<u8> {
+    let mut i = 2;
+    while i + 4 <= d.len() {
+        if d[i] != 0xFF {
+            return None;
+        }
+        let m = d[i + 1];
+        if m == 0xFF {
+            i += 1;
+            continue;
+        }
+        let len = u16::from_be_bytes([d[i + 2], d[i + 3]]) as usize;
+        if matches!(m, 0xC0..=0xCF) && !matches!(m, 0xC4 | 0xC8 | 0xCC) {
+            return d.get(i + 9).copied();
+        }
+        i += 2 + len;
+    }
+    None
+}
+
 fn inherited<'a>(src: &'a Document, page_id: ObjectId, key: &[u8]) -> Option<&'a Object> {
     let mut cur = src.get_dictionary(page_id).ok()?;
     for _ in 0..64 {

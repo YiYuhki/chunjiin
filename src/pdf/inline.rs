@@ -6,8 +6,8 @@
 //! 표본으로 바꾼 이미지 스트림을 만든 뒤 자리에 자리표시 연산자(`n CdrInlineImage`)를 둔다.
 //! 해석 후 [`restore`] 가 자리표시를 `BI` 연산으로 되돌린다.
 //! - 풀 수 있는 필터: ASCIIHex, ASCII85, LZW, Flate, RunLength, DCT(JPEG 는 화소로 디코딩),
-//!   CCITT 팩스(G4·G3 1차원, 1비트 표본으로 디코딩)
-//! - JBIG2·JPX·Crypt, CCITT G3 2차원과 변환할 수 없는 색 공간(Separation·DeviceN·Lab·Pattern)은 뺀다
+//!   CCITT 팩스(G4·G3, 1비트 표본으로 디코딩)
+//! - JBIG2·JPX·Crypt 와 변환할 수 없는 색 공간(Separation·DeviceN·Lab·Pattern)은 뺀다
 //! - Indexed 색 공간은 기준 색 공간의 8비트 표본으로 펼친다
 
 use lopdf::content::{Content, Operation};
@@ -459,7 +459,7 @@ fn image(
         let fax_parms = if fax {
             match ccitt_params(parms.as_ref(), filters.len(), w) {
                 Some(p) => Some(p),
-                None => return (Err("지원하지 않는 CCITT 매개변수"), None),
+                None => return (Err("CCITT 폭 불일치"), None),
             }
         } else {
             None
@@ -602,12 +602,9 @@ fn image(
 }
 
 /// CCITT 매개변수 (K, BlackIs1)
-struct Ccitt {
-    k: i64,
-    black_is_1: bool,
-}
+pub(super) type Ccitt = super::ccitt::Params;
 
-fn ccitt_params(parms: Option<&Object>, nfilters: usize, w: usize) -> Option<Ccitt> {
+pub(super) fn ccitt_params(parms: Option<&Object>, nfilters: usize, w: usize) -> Option<Ccitt> {
     let d = match parms {
         None | Some(Object::Null) => None,
         Some(Object::Dictionary(d)) => Some(d),
@@ -627,52 +624,20 @@ fn ccitt_params(parms: Option<&Object>, nfilters: usize, w: usize) -> Option<Cci
             .and_then(|o| o.as_bool().ok())
             .unwrap_or(false)
     };
-    let k = int(b"K", 0);
-    // 폭은 이미지 폭과 같아야 하고, G3 2차원(K>0)과 바이트 정렬은 지원하지 않는다
-    if int(b"Columns", 1728) != w as i64 || k > 0 || flag(b"EncodedByteAlign") {
+    // 폭은 이미지 폭과 같아야 한다
+    if int(b"Columns", 1728) != w as i64 {
         return None;
     }
     Some(Ccitt {
-        k,
+        k: int(b"K", 0),
         black_is_1: flag(b"BlackIs1"),
+        byte_align: flag(b"EncodedByteAlign"),
     })
 }
 
 /// CCITT 데이터를 1비트 표본(행마다 바이트 정렬)으로 푼다. 반환: (표본, 실제로 디코딩한 줄 수)
-fn ccitt_decode(data: &[u8], p: &Ccitt, w: usize, h: usize) -> Option<(Vec<u8>, usize)> {
-    let stride = w.div_ceil(8);
-    let mut out = vec![0u8; stride * h];
-    let mut lines = 0usize;
-    // 흰색 비트: BlackIs1 이 아니면 1
-    let white_bit = !p.black_is_1;
-    let mut put = |transitions: &[u32]| {
-        if lines >= h {
-            return;
-        }
-        let row = &mut out[lines * stride..(lines + 1) * stride];
-        for (x, c) in fax::decoder::pels(transitions, w as u32).enumerate() {
-            let bit = (c == fax::Color::White) == white_bit;
-            if bit {
-                row[x / 8] |= 0x80 >> (x % 8);
-            }
-        }
-        lines += 1;
-    };
-    let ok = if p.k < 0 {
-        fax::decoder::decode_g4(data.iter().copied(), w as u32, None, &mut put)
-    } else {
-        fax::decoder::decode_g3(data.iter().copied(), &mut put)
-    };
-    if ok.is_none() && lines == 0 {
-        return None;
-    }
-    // 모자란 줄은 흰색으로
-    if lines < h && white_bit {
-        for b in &mut out[lines * stride..] {
-            *b = 0xFF;
-        }
-    }
-    Some((out, lines))
+pub(super) fn ccitt_decode(data: &[u8], p: &Ccitt, w: usize, h: usize) -> Option<(Vec<u8>, usize)> {
+    super::ccitt::decode(data, p, w, h)
 }
 
 /// 스트림의 필터를 푼다. `DecodeParms` 가 배열(필터마다 매개변수)이면 필터를 하나씩 적용한다.
@@ -785,6 +750,7 @@ mod tests {
                 let p = Ccitt {
                     k,
                     black_is_1: n % 2 == 0,
+                    byte_align: false,
                 };
                 if let Some((bits, _)) = ccitt_decode(&data, &p, w, 5) {
                     assert_eq!(bits.len(), w.div_ceil(8) * 5);

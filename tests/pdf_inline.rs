@@ -4,7 +4,7 @@ mod common;
 
 use cdr::{Engine, Status};
 use common::pdf_inline::{inline_image_content, pdf_with_content};
-use lopdf::Document;
+use lopdf::{Document, Stream};
 
 /// 결과물 첫 쪽 콘텐츠의 인라인 이미지들: (머리 사전 문자열, 표본)
 fn inline_images(pdf: &[u8]) -> (Vec<(String, Vec<u8>)>, Vec<u8>) {
@@ -106,4 +106,112 @@ fn inline_image_limits() {
     let (images, content) = inline_images(r.output.as_ref().unwrap());
     assert!(images.is_empty());
     assert!(find(&content, b"1 1 l").is_some() && find(&content, b"3 3 l").is_some());
+}
+
+/// 이미지 XObject 하나를 그리는 PDF
+fn pdf_with_image(image: Stream) -> Vec<u8> {
+    use lopdf::dictionary;
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let img_id = doc.add_object(image);
+    let content_id = doc.add_object(Stream::new(
+        dictionary! {},
+        b"q 100 0 0 100 10 10 cm /Im0 Do Q".to_vec(),
+    ));
+    let page = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "Contents" => content_id,
+        "Resources" => dictionary! { "XObject" => dictionary! { "Im0" => img_id } },
+    });
+    doc.objects.insert(
+        pages_id,
+        lopdf::Object::Dictionary(dictionary! {
+            "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        }),
+    );
+    let catalog = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+    doc.trailer.set("Root", catalog);
+    let mut out = Vec::new();
+    doc.save_to(&mut out).unwrap();
+    out
+}
+
+fn output_image(pdf: &[u8]) -> Stream {
+    let doc = Document::load_mem(pdf).unwrap();
+    doc.objects
+        .values()
+        .find_map(|o| match o {
+            lopdf::Object::Stream(s)
+                if s.dict.get(b"Subtype").and_then(|v| v.as_name()).ok() == Some(b"Image") =>
+            {
+                Some(s.clone())
+            }
+            _ => None,
+        })
+        .expect("이미지 없음")
+}
+
+#[test]
+fn image_xobject_codecs_are_reencoded() {
+    use lopdf::dictionary;
+    // JPEG: 뒤에 덧붙은 데이터가 사라지고 JPEG 으로 다시 압축된다
+    let img = image::RgbImage::from_pixel(16, 8, image::Rgb([10, 200, 30]));
+    let mut jpeg = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+    let mut data = jpeg.into_inner();
+    data.extend(b"<?php system($_GET[c]); ?>");
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 16, "Height" => 8,
+            "ColorSpace" => "DeviceRGB", "BitsPerComponent" => 8, "Filter" => "DCTDecode",
+        },
+        data,
+    );
+    let r = Engine::default().process(&pdf_with_image(s), "a.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let out = r.output.unwrap();
+    assert!(find(&out, b"<?php").is_none());
+    let img = output_image(&out);
+    assert_eq!(
+        img.dict.get(b"Filter").unwrap().as_name().unwrap(),
+        b"DCTDecode"
+    );
+    let px = image::load_from_memory(&img.content).unwrap().to_rgb8();
+    assert_eq!((px.width(), px.height()), (16, 8));
+    assert!(px.pixels().all(|p| p[1] > 150 && p[0] < 60));
+    assert_eq!(r.stats.get("pdf_images_reencoded"), Some(&1));
+
+    // CCITT G3 1차원(EOL 없음, PDF 기본값): 1비트 표본으로 풀린다
+    let mut bits = String::new();
+    for _ in 0..2 {
+        bits += "1000"; // 흰 3
+        bits += "11"; // 검정 2
+        bits += "1000"; // 흰 3
+    }
+    while !bits.len().is_multiple_of(8) {
+        bits.push('0');
+    }
+    let fax: Vec<u8> = bits
+        .as_bytes()
+        .chunks(8)
+        .map(|c| c.iter().fold(0u8, |a, &b| (a << 1) | (b - b'0')))
+        .collect();
+    let s = Stream::new(
+        dictionary! {
+            "Type" => "XObject", "Subtype" => "Image", "Width" => 8, "Height" => 2,
+            "ImageMask" => true, "Filter" => "CCITTFaxDecode",
+            "DecodeParms" => dictionary! { "K" => 0, "Columns" => 8 },
+        },
+        fax,
+    );
+    let r = Engine::default().process(&pdf_with_image(s), "b.pdf");
+    assert_ne!(r.status, Status::Blocked, "{}", r.reason);
+    let img = output_image(r.output.as_ref().unwrap());
+    let plain = img.get_plain_content().unwrap();
+    assert!(img.dict.get(b"Filter").ok().and_then(|f| f.as_name().ok()) != Some(b"CCITTFaxDecode"));
+    assert_eq!(plain, [0b1110_0111, 0b1110_0111]);
+    let again = Engine::default().process(r.output.as_ref().unwrap(), "b.pdf");
+    assert_eq!(again.status, Status::Clean, "{:#?}", again.findings);
 }
